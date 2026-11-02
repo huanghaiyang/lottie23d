@@ -176,7 +176,9 @@ pub fn transform_matrix(ks: &Value, frame: f32) -> Affine {
 
     let mut m = Affine::translate(p[0], p.get(1).copied().unwrap_or(0.0));
     if r != 0.0 {
-        m = m.mul(Affine::rotate(-r.to_radians()));
+        // lottie-web builds its matrix for row vectors and calls `rotate(-r)`.
+        // `Affine` is the transposed (column vector) form, so the sign flips.
+        m = m.mul(Affine::rotate(r.to_radians()));
     }
     if sk != 0.0 {
         let axis = sa.to_radians();

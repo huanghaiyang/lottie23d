@@ -67,7 +67,7 @@ pub fn eval_path_property(ks: &Value, frame: f32) -> Option<PathData> {
     let animated = ks.get("a").and_then(Value::as_i64).unwrap_or(0) != 0;
     let k = ks.get("k").unwrap_or(ks);
     if !animated {
-        return parse_path(k);
+        return parse_path_value(k);
     }
     let list = k.as_array()?;
     if list.is_empty() {
@@ -105,7 +105,8 @@ pub fn eval_path_property(ks: &Value, frame: f32) -> Option<PathData> {
     };
     let held = start.get("h").and_then(Value::as_i64).unwrap_or(0) == 1;
     let a = key_path(start);
-    let b = key_path(next);
+    // lottie-web: `nextKeyData.s ? nextKeyData.s[0] : keyData.e[0]`.
+    let b = key_path(next).or_else(|| end_path(start));
     if held {
         return a;
     }
@@ -156,8 +157,21 @@ fn key_time(key: &Value) -> f32 {
     key.get("t").and_then(Value::as_f64).unwrap_or(0.0) as f32
 }
 
+/// Animated shape keyframes wrap the path in a one-element array (`s[0]`),
+/// while static properties store the path object directly.
+fn parse_path_value(value: &Value) -> Option<PathData> {
+    match value {
+        Value::Array(items) => items.first().and_then(parse_path),
+        other => parse_path(other),
+    }
+}
+
 fn key_path(key: &Value) -> Option<PathData> {
-    key.get("s").and_then(parse_path)
+    key.get("s").and_then(parse_path_value)
+}
+
+fn end_path(key: &Value) -> Option<PathData> {
+    key.get("e").and_then(parse_path_value)
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
