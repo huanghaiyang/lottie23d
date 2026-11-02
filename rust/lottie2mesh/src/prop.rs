@@ -1,14 +1,24 @@
-//! Lottie property evaluation.
+//! Lottie 属性求值，语义对齐 lottie-web 的 `PropertyFactory`。
 //!
-//! Mirrors the semantics of lottie-web's `PropertyFactory`:
-//! * static values (`a = 0`) are returned as-is;
-//! * keyframed values (`a = 1`) are eased with a cubic-bezier timing function;
-//! * spatial keyframes (`to` / `ti`) follow a cubic path in position space and
-//!   are sampled by arc length, exactly like `bez.buildBezierData`.
+//! 模块职责：把 `{ a, k }` 形式的属性对象在指定帧上求值为 f32 分量数组，
+//! 供 `shape`（变换、颜色、trim 等）与 `path`（形状路径）复用。
+//!
+//! 关键语义：
+//! * 静态值（`a = 0`）原样返回；
+//! * 关键帧值（`a = 1`）用 cubic-bezier 时间曲线缓动；
+//! * 空间关键帧（含 `to` / `ti`）在位置空间走三次贝塞尔，并按**弧长**采样，
+//!   与 lottie-web 的 `bez.buildBezierData` 一致；
+//! * `h === 1` 的关键帧保持起始值不插值。
+//!
+//! 单位约定：`frame` 为帧号；返回值各分量保持属性的原始单位（位置为像素、
+//! 透明度为 0..100、缩放为百分比），由调用方负责归一化。
 
 use serde_json::Value;
 
-/// Evaluate a Lottie property object `{ a, k }` at the given frame.
+/// 求值一个 Lottie 属性对象 `{ a, k }`。
+///
+/// `frame` 为帧号；`a != 0` 走关键帧分支，否则按静态值解析。
+/// 返回值分量顺序与 Lottie 定义一致（如位置为 x, y, z）。
 pub fn eval(value: &Value, frame: f32) -> Vec<f32> {
     let animated = value
         .get("a")
@@ -23,7 +33,7 @@ pub fn eval(value: &Value, frame: f32) -> Vec<f32> {
     }
 }
 
-/// Evaluate a property found under `key` inside `parent`, falling back to `fallback`.
+/// 求值 `parent[key]`；字段缺失或求值为空时返回 `fallback` 的拷贝。
 pub fn eval_in(parent: &Value, key: &str, frame: f32, fallback: &[f32]) -> Vec<f32> {
     match parent.get(key) {
         Some(value) => {
@@ -38,7 +48,7 @@ pub fn eval_in(parent: &Value, key: &str, frame: f32, fallback: &[f32]) -> Vec<f
     }
 }
 
-/// Evaluate a property and return only its first component.
+/// 求值并只取第一个分量（用于透明度、线宽等标量属性）。
 pub fn eval_scalar(parent: &Value, key: &str, frame: f32, fallback: f32) -> f32 {
     eval_in(parent, key, frame, &[fallback])
         .first()
@@ -46,6 +56,7 @@ pub fn eval_scalar(parent: &Value, key: &str, frame: f32, fallback: f32) -> f32 
         .unwrap_or(fallback)
 }
 
+/// 解析静态值：支持数字、数字数组、梯度 stop 对象及 `{ v }` / `{ s }` 包装。
 fn eval_static(k: &Value) -> Vec<f32> {
     match k {
         Value::Number(n) => vec![n.as_f64().unwrap_or(0.0) as f32],
@@ -74,6 +85,11 @@ fn eval_static(k: &Value) -> Vec<f32> {
     }
 }
 
+/// 关键帧求值主流程。
+///
+/// 边界行为与 lottie-web 一致：首帧之前返回首帧值；末帧之后返回末帧值
+/// （优先 `s`，为空再用 `e`）；区间内先算线性进度 `progress`，再经
+/// cubic-bezier 缓冲曲线得到缓动进度。
 fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
     let Some(list) = frames.as_array() else {
         return eval_static(frames);
@@ -91,7 +107,7 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
         return key_start(&list[0]);
     }
 
-    // Find the segment containing the frame.
+    // 找到包含当前帧的区间：取最后一个 `t <= frame` 的关键帧。
     let mut index = 0usize;
     for i in 0..list.len() - 1 {
         if frame >= time_of(&list[i]) {
@@ -117,6 +133,8 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
         0.0
     };
 
+    // 区间起点 keyframe 的 `s` 为起始值；区间终点优先用下一帧的 `s`
+    // （Lottie 关键帧链用下一帧 `s` 作为本段终值），缺失时退回本帧 `e`。
     let s = key_start(start);
     let e = {
         let next_start = key_start(next);
@@ -126,13 +144,14 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
             next_start
         }
     };
-    // lottie-web holds when `h === 1`; ordinary keyframes omit it.
+    // lottie-web 在 `h === 1` 时保持当前值；普通关键帧省略该字段。
     let held = start.get("h").and_then(Value::as_i64).unwrap_or(0) == 1;
 
     if held {
         return if s.is_empty() { e } else { s };
     }
 
+    // 空间关键帧：`to` / `ti` 是相对起终点的控制点偏移，走三维贝塞尔。
     if let (Some(to), Some(ti)) = (start.get("to"), start.get("ti")) {
         let to = as_points(to);
         let ti = as_points(ti);
@@ -142,6 +161,7 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
         }
     }
 
+    // 普通（非空间）关键帧：逐分量按各自维度的缓动曲线做标量插值。
     let mut out = vec![0.0f32; s.len().min(e.len())];
     let dims = out.len();
     for i in 0..dims {
@@ -151,10 +171,12 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
     out
 }
 
+/// 读取关键帧的 `t`（帧号），缺失时按 0 处理。
 fn time_of(key: &Value) -> f32 {
     key.get("t").and_then(Value::as_f64).unwrap_or(0.0) as f32
 }
 
+/// 取关键帧起始值：优先 `s`，为空时退回 `e`。
 fn key_start(key: &Value) -> Vec<f32> {
     key.get("s")
         .map(eval_static)
@@ -163,10 +185,12 @@ fn key_start(key: &Value) -> Vec<f32> {
         .unwrap_or_default()
 }
 
+/// 取关键帧结束值 `e`，缺失时返回空数组。
 fn key_end(key: &Value) -> Vec<f32> {
     key.get("e").map(eval_static).unwrap_or_default()
 }
 
+/// 把 `[x, y, ...]` 形式的 JSON 数组解析为 f32 向量。
 fn as_points(value: &Value) -> Vec<f32> {
     value
         .as_array()
@@ -174,7 +198,10 @@ fn as_points(value: &Value) -> Vec<f32> {
         .unwrap_or_default()
 }
 
-/// Resolve the cubic-bezier control points for a given dimension.
+/// 解析某个维度的 cubic-bezier 控制点（出/入切线）。
+///
+/// `o` / `i` 的 `x` / `y` 既可能是标量也可能是按维度展开的数组；
+/// 缺省值取 lottie-web 的 `(0.333, 0, 0.667, 1)`。
 fn ease_for_dim(key: &Value, dim: usize, progress: f32) -> f32 {
     let out_x = component(key.get("o"), "x", dim, 0.333);
     let out_y = component(key.get("o"), "y", dim, 0.0);
@@ -183,6 +210,7 @@ fn ease_for_dim(key: &Value, dim: usize, progress: f32) -> f32 {
     cubic_ease(out_x, out_y, in_x, in_y, progress)
 }
 
+/// 读取缓动对象的某个轴分量；数组按 `dim` 取，越界时退回第 0 项。
 fn component(ease: Option<&Value>, axis: &str, dim: usize, fallback: f32) -> f32 {
     let Some(ease) = ease else { return fallback };
     let Some(value) = ease.get(axis) else { return fallback };
@@ -200,7 +228,10 @@ fn component(ease: Option<&Value>, axis: &str, dim: usize, fallback: f32) -> f32
     fallback
 }
 
-/// Cubic-bezier timing function, solved on the X axis (same as lottie-web).
+/// cubic-bezier 时间曲线：先在 X 轴二分求解 `x(u) = t`，再返回 `y(u)`。
+///
+/// 与 lottie-web 相同，用 18 次二分逼近，保证单调且无需解三次方程；
+/// `t` 超出 `[0, 1]` 时钳制到端点。
 pub fn cubic_ease(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
     if t <= 0.0 {
         return 0.0;
@@ -223,17 +254,22 @@ pub fn cubic_ease(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
     sample_bezier(y1, y2, mid)
 }
 
+/// 一维三次贝塞尔分量：固定端点 0 / 1，控制点为 `p1`、`p2`。
 fn sample_bezier(p1: f32, p2: f32, t: f32) -> f32 {
     let it = 1.0 - t;
     3.0 * it * it * t * p1 + 3.0 * it * t * t * p2 + t * t * t
 }
 
-/// Sample the spatial cubic through `s -> e` at the eased arc length.
-/// lottie-web uses 150 curve segments by default, so match that resolution.
+/// 在空间三次贝塞尔 `s -> e` 上按缓动后的**弧长比例**取点。
+///
+/// 控制点 `c1 = s + to`、`c2 = e + ti`；先按 150 段折线近似曲线并累加
+/// 弦长，再按 `progress` 找到对应弧长处线性插值。lottie-web 默认就是
+/// 150 段，这里保持同样分辨率。返回值维度取 `s`/`e` 的较小者，最多 3 维。
 fn spatial_value(s: &[f32], e: &[f32], to: &[f32], ti: &[f32], progress: f32) -> Vec<f32> {
     const STEPS: usize = 150;
     let dims = s.len().min(e.len()).min(3);
     let mut points = [[0.0f32; 3]; STEPS + 1];
+    // 逐段采样三次贝塞尔， Bernstein 基函数权重 b0..b3。
     for (step, point) in points.iter_mut().enumerate() {
         let t = step as f32 / STEPS as f32;
         let it = 1.0 - t;
@@ -248,7 +284,7 @@ fn spatial_value(s: &[f32], e: &[f32], to: &[f32], ti: &[f32], progress: f32) ->
         }
     }
 
-    // Build cumulative arc lengths.
+    // 累加相邻采样点的欧氏距离，得到弧长表。
     let mut lengths = [0.0f32; STEPS + 1];
     for i in 1..=STEPS {
         let mut d = 0.0f32;
@@ -262,6 +298,7 @@ fn spatial_value(s: &[f32], e: &[f32], to: &[f32], ti: &[f32], progress: f32) ->
     if total <= 1e-6 {
         return points[0][..dims].to_vec();
     }
+    // 目标弧长 = 总长 * progress；定位到所在折线段后做局部线性插值。
     let target = total * progress;
     let mut i = 1usize;
     while i < lengths.len() && lengths[i] < target {

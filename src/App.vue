@@ -10,6 +10,12 @@ import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
 import { AXIS_LABELS, Stage, type StageNode, type ViewAxis } from './scene/stage';
 
+// 页面级数据流：
+// Lottie JSON → converter.convert() 得到二进制模型 → Stage.setModel() 建立网格；
+// 左侧 lottie-web 原画与右侧 three.js 由同一条 rAF 时钟驱动、按进度比例同步；
+// 只有“边缘平滑 / 采样帧率”需要重转换（90ms 防抖），厚度与层深在渲染期即时生效。
+
+/** 顶栏可切换的动画来源；`demo:` 前缀表示从 public/animations 拉取。 */
 const SOURCES = [
   { id: 'orbit', label: '星轨' },
   { id: 'pulse', label: '脉冲' },
@@ -19,10 +25,12 @@ const SOURCES = [
   { id: 'pick', label: '导入 JSON', accent: true },
 ];
 
+// ---- 挂载点 ----
 const lottieHost = ref<HTMLDivElement | null>(null);
 const threeHost = ref<HTMLDivElement | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
 
+// ---- 播放与视图状态 ----
 const ready = ref(false);
 const playing = ref(true);
 const speed = ref(1);
@@ -33,11 +41,18 @@ const sampleFps = ref(30);
 const autoRotate = ref(false);
 const axisLock = ref(false);
 const activeAxis = ref<ViewAxis | null>(null);
+// ---- 节点列表与多选 ----
+/** 当前模型的节点快照（按渲染顺序，id = meshes 下标）。 */
 const nodes = ref<StageNode[]>([]);
+/** 选中节点 id；Shift 范围选择依赖 selectionAnchor 作为锚点。 */
 const selectedIds = ref<number[]>([]);
+/** 总柔光开关：开启时所有节点默认发光。 */
 const softGlow = ref(false);
+/** 单节点柔光覆盖：true 强制发光，false 强制排除（与总开关组合）。 */
 const nodeGlow = reactive<Record<number, boolean>>({});
+/** 单节点显隐，缺省（undefined）视为可见。 */
 const nodeVisible = reactive<Record<number, boolean>>({});
+/** Shift 范围选择的起点节点 id；-1 表示无锚点。 */
 let selectionAnchor = -1;
 const progress = ref(0);
 const frameLabel = ref('000 / 000');
@@ -48,6 +63,7 @@ const rightMeta = ref('--');
 const toastText = ref('');
 const toastVisible = ref(false);
 const dropVisible = ref(false);
+/** 顶栏统计（转换耗时 / 帧数 / 几何规模 / 文件大小）。 */
 const stats = reactive({
   conversion: '等待转换',
   frames: '-- 帧',
@@ -55,28 +71,36 @@ const stats = reactive({
   size: '--',
 });
 
+// ---- 非响应式的运行时对象 ----
 let stage: Stage | null = null;
 let converter: Converter | null = null;
 let animation: AnimationItem | null = null;
 let model: Model | null = null;
 let currentData: LottieData | null = null;
+// 时间轴状态（单位：秒 / 源帧）。
 let duration = 1;
 let ip = 0;
 let op = 0;
 let frameRate = 30;
+/** 当前播放时间（秒），由 rAF 时钟推进或拖动进度条直接设置。 */
 let time = 0;
 let lastTick = 0;
 let rafId = 0;
 let toastTimer = 0;
+/** 上次刷新 HUD 的时间戳，用于把 Vue 更新节流到约 8 次/秒。 */
 let lastSceneHud = 0;
 let draggingTimeline = false;
+/** 拖动进度条前是否在播放；松手后据此决定是否恢复。 */
 let resumeAfterDrag = false;
 let fpsAccumulator = 0;
 let fpsWindowStart = 0;
+/** 拖拽进入/离开计数，避免子元素抖动导致遮罩闪烁。 */
 let dragDepth = 0;
+/** 重转换防抖定时器与上次转换的参数键。 */
 let reconvertTimer = 0;
 let convertKey = '';
 
+/** 把字节数格式化成 KB / MB，用于顶栏统计。 */
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) {
     return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -84,6 +108,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024).toFixed(0)} KB`;
 }
 
+/** 顶栏 / 底部提示：显示 3.2 秒，重复调用会重置计时。 */
 function showToast(message: string): void {
   toastText.value = message;
   toastVisible.value = true;
@@ -93,20 +118,27 @@ function showToast(message: string): void {
   }, 3200);
 }
 
+/** 统一的播放状态入口（后续可在此扩展暂停 / 恢复逻辑）。 */
 function setPlaying(next: boolean): void {
   playing.value = next;
 }
 
+/** 空格键与播放按钮共用的切换逻辑。 */
 function togglePlay(): void {
   setPlaying(!playing.value);
 }
 
+/** 销毁左侧 lottie-web 实例并清空容器，切换动画 / 卸载页面时调用。 */
 function disposeAnimation(): void {
   animation?.destroy();
   animation = null;
   lottieHost.value?.replaceChildren();
 }
 
+/**
+ * 创建左侧原画实例（canvas 渲染器，不自动播放，由外部时钟 seek）。
+ * dpr 限制在 1–1.5，避免原画面板在高分屏上浪费填充率。
+ */
 function createAnimation(data: LottieData): AnimationItem {
   disposeAnimation();
   return lottie.loadAnimation({
@@ -123,18 +155,28 @@ function createAnimation(data: LottieData): AnimationItem {
   });
 }
 
+/**
+ * 双侧同步的核心：以归一化进度 ratio 为唯一真值，
+ * 左侧 lottie-web 定位到源帧 ip + ratio * (op - ip)，
+ * 右侧 three.js 定位到烘焙帧 round(ratio * (frameCount - 1))。
+ * 两侧帧率与帧数不同，但都在同一进度上，因此视觉节奏一致。
+ *
+ * @param forceHud 为 true 时立即刷新进度 / 帧号（拖动、切换动画时需要）
+ */
 function syncScene(forceHud = false): void {
   if (model == null) {
     return;
   }
   const ratio = duration > 0 ? Math.min(1, Math.max(0, time / duration)) : 0;
+  // 原画取 op - 0.01 作为上限，避免落在尾帧之外导致空白。
   if (animation) {
     animation.goToAndStop(Math.min(op - 0.01, ip + ratio * (op - ip)), true);
   }
   const frameIndex = Math.round(ratio * (model.frameCount - 1));
   stage?.setFrame(frameIndex);
 
-  // Keep Vue updates off the hot path: refresh the readouts ~8 times a second.
+  // 热路径上避免频繁触发 Vue 更新：HUD 最多约 8 次/秒；
+  // 拖动进度条时不要反向写 progress，否则会与用户输入打架。
   const now = performance.now();
   if (forceHud || now - lastSceneHud > 120) {
     lastSceneHud = now;
@@ -145,6 +187,7 @@ function syncScene(forceHud = false): void {
   }
 }
 
+/** 进度条回调：value 为 0–1000 的整数，换算成时间后强制刷新两侧。 */
 function onSeek(value: number): void {
   if (duration <= 0) {
     return;
@@ -154,12 +197,14 @@ function onSeek(value: number): void {
   syncScene(true);
 }
 
+/** 开始拖动进度条：暂停播放并记住原状态，松手后按需恢复。 */
 function onDragStart(): void {
   draggingTimeline = true;
   resumeAfterDrag = playing.value;
   setPlaying(false);
 }
 
+/** 结束拖动：若拖动前在播放则恢复播放。 */
 function onDragEnd(): void {
   if (!draggingTimeline) {
     return;
@@ -170,13 +215,17 @@ function onDragEnd(): void {
   }
 }
 
+/** 重置视角：同时解除轴向高亮与视角锁定。 */
 function resetView(): void {
   activeAxis.value = null;
   axisLock.value = false;
   stage?.resetView();
 }
 
-/** Clicking a gizmo axis snaps the camera and locks the orbit for inspection. */
+/**
+ * 点击 gizmo 轴向：相机已由 Stage 补间过去，这里同步 UI 状态——
+ * 关闭自动环绕并锁定环绕，避免用户误拖把视角带偏。
+ */
 function onAxisPick(axis: ViewAxis): void {
   activeAxis.value = axis;
   autoRotate.value = false;
@@ -185,10 +234,12 @@ function onAxisPick(axis: ViewAxis): void {
   stage?.setRotationLock(true);
 }
 
+/** 模型切换后重建节点列表，并清空选择、柔光与显隐等逐节点临时状态。 */
 function syncNodes(): void {
   nodes.value = model?.nodes ? [...model.nodes] : [];
   selectedIds.value = [];
   selectionAnchor = -1;
+  // 节点 id 在新模型中会被复用，旧标记必须清掉，否则语义串到别的图层。
   for (const key of Object.keys(nodeGlow)) {
     delete nodeGlow[Number(key)];
   }
@@ -199,9 +250,11 @@ function syncNodes(): void {
 }
 
 /**
- * Plain click selects one node, Shift extends a range from the anchor and
- * Alt (or Ctrl) toggles the node inside a multi-selection. Clicking the
- * already selected single node clears the selection.
+ * 节点列表的点击选择规则（与 InspectorPanel 的修饰键映射一一对应）：
+ * - 单击：只选中该节点；若它本来就是唯一选中项，则再点一次取消选择；
+ * - Shift：以最近一次点击的锚点做区间选择（按列表渲染顺序取连续段）；
+ * - Alt / Ctrl：在已选集合中切换该节点的选中状态，可累积多选。
+ * 结果统一写回 `selectedIds`，再交给 Stage 刷新线框。
  */
 function onNodeSelect(
   id: number,
@@ -236,15 +289,22 @@ function onNodeSelect(
 }
 
 /**
- * Per-node glow follows the same rule as the stage: with the master switch on
- * a node glows unless explicitly excluded, with it off only explicitly enabled
- * nodes glow. Alt+click solos the node.
+ * 单节点是否发光，与 Stage 的判定保持一致（两者必须同源，否则 UI 圆点会与实际渲染不符）：
+ * - 总开关开：默认全部发光，只有显式标记为 `false` 的节点被排除；
+ * - 总开关关：默认全部不发光，只有显式标记为 `true` 的节点发光。
+ * Alt 点击（solo）走单独的“只留一个”分支。
  */
 function nodeGlowActive(id: number): boolean {
   return softGlow.value ? nodeGlow[id] !== false : nodeGlow[id] === true;
 }
 
+/**
+ * 切换单节点柔光。
+ * @param id 节点 id
+ * @param solo 为 true 时执行“独奏”：只保留该节点发光、其余全部关闭
+ */
 function toggleNodeGlow(id: number, solo: boolean): void {
+  // 独奏需要逐节点写入显式标记，否则总开关开启时其它节点会被默认点亮。
   if (solo) {
     for (const node of nodes.value) {
       const enabled = node.id === id;
@@ -258,27 +318,34 @@ function toggleNodeGlow(id: number, solo: boolean): void {
   stage?.setNodeGlow(id, next);
 }
 
-/** Eye toggle in the node list; nodes default to visible. */
+/** 节点列表的“眼睛”开关：切换手动显隐；未记录过的节点默认可见。 */
 function toggleNodeVisibility(id: number): void {
   const next = nodeVisible[id] === false;
   nodeVisible[id] = next;
   stage?.setNodeVisible(id, next);
 }
 
+/**
+ * 把 UI 参数换算成 Rust 转换选项。
+ * 只有 `edge_radius` 需要换算：滑块给的是“占半厚度的百分比”，
+ * 而 ABI 期望的是像素值，所以要乘上第 0 个网格已烘焙的 `halfThickness`。
+ */
 function convertOptions(): ConvertOptions {
   const options: ConvertOptions = { fps: sampleFps.value };
   const half = model?.meshes[0]?.halfThickness ?? 0;
-  // Edge rounding is expressed as a ratio of the baked half-thickness.
+  // 圆角半径以半厚度百分比表示，避免不同尺寸图层看起来圆角不一致。
   if (edgeRatio.value > 0 && half > 0) {
     options.edge_radius = (edgeRatio.value / 100) * half;
   }
   return options;
 }
 
+/** 转换选项指纹：与上一次一致说明无需重转换。 */
 function optionsKey(): string {
   return `${sampleFps.value}|${edgeRatio.value}`;
 }
 
+/** 把本次转换结果的统计写入各面板标签（耗时、帧数、三角形数、二进制体积）。 */
 function applyStats(converted: Model, elapsed: number): void {
   rightMeta.value = `${converted.meshCount} 网格 · ${converted.totalVertices.toLocaleString()} 顶点 · ${(converted.totalIndices / 3).toLocaleString()} 三角形`;
   stats.conversion = `转换 ${elapsed.toFixed(1)} ms`;
@@ -287,7 +354,11 @@ function applyStats(converted: Model, elapsed: number): void {
   stats.size = formatBytes(converted.totalSize);
 }
 
-/** Rebuild the mesh with the current conversion options, keeping playback time. */
+/**
+ * 用当前转换选项重建网格，并保持播放进度。
+ * 重转换会生成全新的 Model（顶点/拓扑都可能变化），因此必须重设 Stage 模型并重建节点列表；
+ * 时间按“完成度比例”映射到新时长上，避免参数一改画面就跳回开头。
+ */
 function reconvert(): void {
   if (converter == null || currentData == null) {
     return;
@@ -310,11 +381,13 @@ function reconvert(): void {
   model = converted;
   stage?.setModel(converted);
   syncNodes();
+  // 先同步模型再写时间，最后强制刷新一帧让新几何立即上屏。
   time = ratio * duration;
   syncScene(true);
   applyStats(converted, elapsed);
 }
 
+/** 合并连续的参数拖动：90ms 内多次改动只触发一次重转换，避免拖动滑块时反复编译。 */
 function scheduleReconvert(): void {
   if (currentData == null) {
     return;
@@ -323,6 +396,11 @@ function scheduleReconvert(): void {
   reconvertTimer = window.setTimeout(reconvert, 90);
 }
 
+/**
+ * 载入一份 Lottie 文档：先确定时间模型，再调 Rust 转换，最后重建动画与场景。
+ * @param data 原始 Lottie JSON（Bodymovin 导出）
+ * @param id 数据源标识（示例 id、`demo:名称` 或 `file:文件名`），用于高亮顶部来源
+ */
 async function loadDocument(data: LottieData, id: string): Promise<void> {
   if (!converter) {
     showToast('转换器尚未就绪');
@@ -330,6 +408,7 @@ async function loadDocument(data: LottieData, id: string): Promise<void> {
   }
 
   currentData = data;
+  // 时长按源帧率换算成秒；缺失 ip/op 时兜底为 3 秒，避免除零或空动画。
   frameRate = Math.max(1, Number(data.fr) || 30);
   ip = Number.isFinite(data.ip) ? Number(data.ip) : 0;
   op = Number.isFinite(data.op) && Number(data.op) > ip ? Number(data.op) : ip + frameRate * 3;
@@ -337,6 +416,7 @@ async function loadDocument(data: LottieData, id: string): Promise<void> {
     op = ip + frameRate * 3;
   }
   duration = Math.max(0.001, (op - ip) / frameRate);
+  // 默认按源帧率采样，并限制在 ABI 允许的 6–120 区间；换文档时圆角归零，其余滑块保持不变。
   sampleFps.value = Math.min(120, Math.max(6, Math.round(frameRate)));
   edgeRatio.value = 0;
 
@@ -363,9 +443,11 @@ async function loadDocument(data: LottieData, id: string): Promise<void> {
   applyStats(converted, elapsed);
   activeSource.value = id;
   ready.value = true;
+  // 新文档加载完自动开始播放（若用户之前手动暂停，这里也会重新开始）。
   setPlaying(true);
 }
 
+/** 载入内置示例：在 SAMPLES 中按 id 查找。 */
 async function loadSample(id: string): Promise<void> {
   const sample = SAMPLES.find((item) => item.id === id);
   if (sample) {
@@ -373,7 +455,9 @@ async function loadSample(id: string): Promise<void> {
   }
 }
 
+/** 载入 `public/animations/*.json` 下的外部示例（浏览器 fetch）。 */
 async function loadDemo(name: string): Promise<void> {
+  // 用 baseURI 拼相对路径，兼容部署在子目录下的情况。
   const url = new URL(`animations/${name}.json`, document.baseURI);
   try {
     const response = await fetch(url);
@@ -387,6 +471,7 @@ async function loadDemo(name: string): Promise<void> {
   }
 }
 
+/** 读取用户本地文件（拖拽或文件选择）并解析为 Lottie JSON。 */
 async function loadFile(file: File): Promise<void> {
   try {
     const text = await file.text();
@@ -397,6 +482,7 @@ async function loadFile(file: File): Promise<void> {
   }
 }
 
+/** 顶部数据源切换：`demo:` 前缀走外部 JSON，否则当作内置示例 id。 */
 function onSelectSource(id: string): void {
   if (id.startsWith('demo:')) {
     void loadDemo(id.slice(5));
@@ -405,10 +491,12 @@ function onSelectSource(id: string): void {
   }
 }
 
+/** 触发隐藏的 file input，由其在 change 事件里真正读取文件。 */
 function pickFile(): void {
   fileInput.value?.click();
 }
 
+/** 文件选择回调；清空 value 以便下次选择同名文件时仍能触发 change。 */
 function onFileChange(event: Event): void {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -418,6 +506,7 @@ function onFileChange(event: Event): void {
   input.value = '';
 }
 
+/** 空格播放/暂停；仅当焦点不在输入控件（target 为 body）时响应，避免抢输入框的按键。 */
 function onKeyDown(event: KeyboardEvent): void {
   if (event.code === 'Space' && event.target === document.body) {
     event.preventDefault();
@@ -425,12 +514,17 @@ function onKeyDown(event: KeyboardEvent): void {
   }
 }
 
+/**
+ * 拖入计数：dragenter/dragleave 会随子元素冒泡反复触发，
+ * 用 dragDepth 计数可以保证只有真正离开窗口时才隐藏遮罩。
+ */
 function onDragEnter(event: DragEvent): void {
   event.preventDefault();
   dragDepth += 1;
   dropVisible.value = true;
 }
 
+/** 必须阻止默认行为，否则浏览器会直接打开被拖入的 JSON 文件。 */
 function onDragOver(event: DragEvent): void {
   event.preventDefault();
 }
@@ -442,6 +536,7 @@ function onDragLeave(): void {
   }
 }
 
+/** 释放文件：取第一个文件交给 loadFile，并重置遮罩状态。 */
 function onDrop(event: DragEvent): void {
   event.preventDefault();
   dragDepth = 0;
@@ -452,6 +547,7 @@ function onDrop(event: DragEvent): void {
   }
 }
 
+/** 帧率 HUD：每 500ms 统计一个窗口，顺带把平均帧率交给 Stage 做分辨率自适应。 */
 function updateHud(now: number): void {
   fpsAccumulator += 1;
   if (now - fpsWindowStart >= 500) {
@@ -463,12 +559,19 @@ function updateHud(now: number): void {
   }
 }
 
+/**
+ * 全局播放时钟（rAF 驱动）。
+ * `time` 以秒为单位，是本页面唯一的时间源；每帧先推进时间再 syncScene，把时间同步给
+ * lottie-web 原画与 three.js 舞台，最后调 Stage 渲染。
+ */
 function tick(now: number): void {
+  // 单帧步长上限 0.1s：标签页切回或掉帧时避免动画直接跳一大段。
   const delta = lastTick === 0 ? 0 : Math.min(0.1, (now - lastTick) / 1000);
   lastTick = now;
 
   if (playing.value && duration > 0) {
     time += delta * speed.value;
+    // 播放到头后取模循环；用 % 而不是清零，可保住高倍速下越界的余量。
     if (time >= duration) {
       time %= duration;
     }
@@ -479,6 +582,7 @@ function tick(now: number): void {
   rafId = requestAnimationFrame(tick);
 }
 
+/** 启动流程：先加载 wasm 转换器，成功后载入默认示例。 */
 async function boot(): Promise<void> {
   try {
     converter = await loadConverter();
@@ -489,27 +593,31 @@ async function boot(): Promise<void> {
   await loadSample('orbit');
 }
 
+// 层深/厚度只改矩阵增量，无需重转换，直接即时生效。
 watch(depth, (value) => stage?.setDepthScale(value));
 watch(thickness, (value) => stage?.setThicknessScale(value));
+// 自动环绕与视角锁定互斥：必须先解锁，否则 Stage 的 setAutoRotate 会因锁定而忽略请求。
 watch(autoRotate, (value) => {
   if (value && axisLock.value) {
     axisLock.value = false;
-    // Unlock first: setAutoRotate ignores the request while still locked.
+    // 先解除锁定，再开启自动环绕。
     stage?.setRotationLock(false);
   }
   stage?.setAutoRotate(value);
 });
+// 锁定视角时自动关闭环绕（反向约束，避免两个开关同时为真）。
 watch(axisLock, (value) => {
   if (value) {
     autoRotate.value = false;
   }
   stage?.setRotationLock(value);
 });
+// 这两个参数会改变几何/采样，需要重新跑 Rust 转换（经过 90ms 防抖）。
 watch(edgeRatio, scheduleReconvert);
 watch(sampleFps, scheduleReconvert);
+// 柔光总开关：一次性把标记铺到所有节点，保证 UI 圆点与 Stage 判定一致。
+// 之后仍可单独覆盖某个节点，即使总开关保持关闭。
 watch(softGlow, (value) => {
-  // The master switch drives every node at once; individual dots can still
-  // override it afterwards, even while the master switch stays off.
   for (const node of nodes.value) {
     nodeGlow[node.id] = value;
   }
@@ -517,6 +625,7 @@ watch(softGlow, (value) => {
   stage?.setSoftGlow(value);
 });
 
+// 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
 onMounted(() => {
   stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick });
   stage.setDepthScale(depth.value);
@@ -534,6 +643,7 @@ onMounted(() => {
   void boot();
 });
 
+// 卸载：停掉时钟、摘除事件监听、清理定时器并释放 three.js / lottie 资源。
 onBeforeUnmount(() => {
   cancelAnimationFrame(rafId);
   window.removeEventListener('keydown', onKeyDown);

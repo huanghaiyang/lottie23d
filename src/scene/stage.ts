@@ -2,14 +2,16 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Model, MeshModel } from '../../sdk/index.mjs';
 
-/** Six Blender-style view directions: +X, -X, +Y, -Y, +Z, -Z. */
+/** 六个 Blender 风格观察方向：+X、-X、+Y、-Y、+Z、-Z。 */
 export type ViewAxis = 'x' | '-x' | 'y' | '-y' | 'z' | '-z';
 
+/** Stage 向外抛的回调；目前只有点击 gizmo 轴向时触发。 */
 export interface StageCallbacks {
+  /** 用户点击 gizmo 的某个轴后回调（参数为对应的视角方向）。 */
   onAxisPick?: (axis: ViewAxis) => void;
 }
 
-/** One selectable mesh as exposed to the UI / external API. */
+/** 暴露给 UI / 外部 API 的可选节点（与 SDK 的 NodeModel 同构，按渲染顺序 id 排列）。 */
 export interface StageNode {
   id: number;
   name: string;
@@ -19,6 +21,7 @@ export interface StageNode {
   indexCount: number;
 }
 
+/** 轴向在 gizmo 与提示文案中显示的短标签。 */
 export const AXIS_LABELS: Record<ViewAxis, string> = {
   x: '+X',
   '-x': '-X',
@@ -28,6 +31,7 @@ export const AXIS_LABELS: Record<ViewAxis, string> = {
   '-z': '-Z',
 };
 
+/** gizmo 的固定绘制 / 拾取顺序（正轴在前，负轴在后）。 */
 const AXIS_ORDER: ViewAxis[] = ['x', '-x', 'y', '-y', 'z', '-z'];
 
 const AXIS_VECTORS: Record<ViewAxis, THREE.Vector3> = {
@@ -39,6 +43,7 @@ const AXIS_VECTORS: Record<ViewAxis, THREE.Vector3> = {
   '-z': new THREE.Vector3(0, 0, -1),
 };
 
+/** 每个轴向的 gizmo 颜色：正轴亮、负轴暗，便于区分朝向。 */
 const AXIS_COLORS: Record<ViewAxis, number> = {
   x: 0xff6b6b,
   '-x': 0x9c4a52,
@@ -48,14 +53,19 @@ const AXIS_COLORS: Record<ViewAxis, number> = {
   '-z': 0x466a9f,
 };
 
-/** Default view: straight on +Z (Blender front view). */
+/** 默认视角：正对 +Z（Blender 的正视图），相机距离原点 7.2。 */
 const AXIS_HOME = new THREE.Vector3(0, 0, 7.2);
+/** 轴向切换的补间时长（毫秒）。 */
 const VIEW_TWEEN_MS = 320;
 
+/** 选中线框颜色（蓝色）。 */
 const SELECTION_COLOR = 0x3d8bff;
+/** 柔光渲染目标相对主画布的缩放：1/4 分辨率即可，模糊后叠加。 */
 const GLOW_SCALE = 0.25;
+/** 柔光合成透明度。 */
 const GLOW_OPACITY = 0.8;
 
+/** 全屏四边形顶点着色器：直接把裁剪空间坐标铺满，只传 uv 给片元。 */
 const FULLSCREEN_VERTEX = `
 varying vec2 vUv;
 void main() {
@@ -64,6 +74,10 @@ void main() {
 }
 `;
 
+/**
+ * 9 抽样一维高斯模糊（5 个权重位置，左右对称）。
+ * 两遍分别沿 X / Y 方向执行，即可近似二维高斯；direction 由 JS 每遍设置。
+ */
 const GAUSSIAN_BLUR = `
 uniform sampler2D source;
 uniform vec2 direction;
@@ -78,27 +92,37 @@ void main() {
 }
 `;
 
+/** 一个网格对应的全部运行时对象；数组下标即节点 id。 */
 interface Entry {
+  /** SDK 的网格模型（只读数据源）。 */
   data: MeshModel;
   mesh: THREE.Mesh;
   geometry: THREE.BufferGeometry;
   material: THREE.MeshLambertMaterial;
-  /** Constant base matrix for statically transformed layers. */
+  /** 静态变换层的固定基矩阵（第 0 帧拷贝，避免每帧从轨道读取）。 */
   base: THREE.Matrix4;
+  /** 逐帧变换轨道（frameCount × 16，列主序）；无轨道时为 null。 */
   track: Float32Array | null;
+  /** 该轨道是否全程不变（只上传一次矩阵）。 */
   transformStatic: boolean;
+  /** 逐帧颜色轨道（frameCount × 4）或 null。 */
   colors: Float32Array | null;
+  /** 顶点属性（动画网格为 DynamicDrawUsage）。 */
   position: THREE.BufferAttribute;
+  /** 是否需要逐帧拷贝顶点。 */
   positionsAnimated: boolean;
-  /** One index buffer per topology bucket (always at least one). */
+  /** 每个拓扑桶一份索引属性（至少一项；0 与静态 indices 相同）。 */
   indexAttributes: THREE.BufferAttribute[];
-  /** Bucket currently bound to the geometry (drives the index attribute). */
+  /** 当前绑定到 geometry 的桶下标，用于跳过重复 setIndex。 */
   currentBucket: number;
-  /** Visibility derived from the base alpha, before manual hiding. */
+  /** 由基础 alpha 推导的可见性（尚未叠加手动隐藏）。 */
   staticVisible: boolean;
 }
 
-/** Tracks that never change only need one matrix upload, not one per frame. */
+/**
+ * 判断一条变换轨道是否整段不变（逐帧比较 16 个矩阵元素）。
+ * 常量轨道只需上传一次矩阵，播放时完全跳过矩阵写入。
+ */
 function isConstantTrack(track: Float32Array, frameCount: number): boolean {
   if (frameCount <= 1) {
     return true;
@@ -115,44 +139,68 @@ function isConstantTrack(track: Float32Array, frameCount: number): boolean {
 }
 
 /**
- * three.js stage for the Rust-compiled model.
+ * 基于 Rust 编译结果的 three.js 舞台。
  *
- * Every mesh keeps a fixed BufferGeometry; per frame we only copy baked vertex
- * positions (animated shapes) and write the world matrix directly, skipping
- * any parent multiplication or work on layers that never move.
+ * 关键设计：每个网格只创建一次固定的 BufferGeometry；逐帧只做两件事——
+ * 1. 动画网格：把烘焙好的顶点切片拷贝进 position 数组并标记 needsUpdate；
+ * 2. 所有网格：直接把世界矩阵写进 `mesh.matrixWorld`（关闭自动更新，
+ *    图层都挂在场景根下，因此无需父级乘法，也不会触发矩阵失效）。
+ * 其余（三角化、关键帧求值、深度烘焙）全部在转换阶段完成。
+ *
+ * 此外还负责：节点选择线框、逐节点显隐、柔光后处理、轴向 gizmo。
  */
 export class Stage {
+  // ---- 渲染基础设施 ----
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.PerspectiveCamera;
   private readonly controls: OrbitControls;
   private readonly host: HTMLElement;
+
+  // ---- 模型与逐帧状态 ----
+  /** 已加载的所有网格运行时对象，下标 = 节点 id。 */
   private readonly entries: Entry[] = [];
+  /** 当前模型；为 null 表示尚未加载。 */
   private model: Model | null = null;
+  /** 已应用的帧下标；-1 表示还没写过任何帧。 */
   private frameIndex = -1;
+  /** 脏标记：仅相机移动或有数据改动时才真正重绘（脏渲染）。 */
   private dirty = true;
+  /** “层深”滑块倍率；实际只给矩阵 Z 平移追加增量。 */
   private depthAmount = 1;
+  /** “厚度”滑块倍率；实际等价于矩阵后乘 scale(1, 1, thickness)。 */
   private thicknessAmount = 1;
+  /** 渲染像素比；低帧时会自适应下调。 */
   private pixelRatio = 1.5;
+  /** 连续低帧窗口计数，达到阈值才降一次分辨率。 */
   private lowFpsWindows = 0;
   private readonly observer: ResizeObserver;
   private readonly callbacks: StageCallbacks;
+  /** 对外暴露的节点列表（渲染顺序）。 */
   private readonly nodes: StageNode[] = [];
 
-  /** Per-node selection wires (blue 1px cuboids). */
+  // ---- 选中线框 ----
+  /** 每个被选节点一条蓝色 1px 包围盒线框（Box3Helper）。 */
   private readonly selectionBoxes = new Map<number, THREE.Box3Helper>();
+  /** 复用的临时包围盒，避免每次更新都分配 Three 对象。 */
   private readonly boxScratch = new THREE.Box3();
 
-  /** Node ids hidden from the scene through the node list. */
+  /** 通过节点列表隐藏的节点 id；隐藏后跳过逐帧计算与绘制。 */
   private readonly hiddenNodes = new Set<number>();
 
-  /** Soft glow: per-node silhouettes blurred and added over the main image. */
+  // ---- 柔光后处理 ----
+  /** 总柔光开关：开启时默认所有节点都发光，关闭时仅显式开启的节点发光。 */
   private softGlow = false;
+  /** 单节点覆盖标记（显式开 / 关），与总开关组合出最终语义。 */
   private readonly glowFlags = new Map<number, boolean>();
+  /** 参与柔光的节点 → 借用主网格 geometry 的“外壳”网格（只换纯色材质）。 */
   private readonly glowMeshes = new Map<number, THREE.Mesh>();
+  /** 独立的柔光场景：只渲染发光外壳，避免主场景被重复遍历。 */
   private readonly glowScene = new THREE.Scene();
+  /** 双缓冲渲染目标：读 → 写做横向模糊，再写回读做纵向模糊。 */
   private glowRead: THREE.WebGLRenderTarget | null = null;
   private glowWrite: THREE.WebGLRenderTarget | null = null;
+  /** 当前柔光目标的像素尺寸（变化时重建 RT）。 */
   private glowWidth = 0;
   private glowHeight = 0;
   private glowCompositeMaterial: THREE.MeshBasicMaterial | null = null;
@@ -171,7 +219,8 @@ export class Stage {
     depthWrite: false,
   });
 
-  /** Blender-style orientation gizmo rendered in the top-left corner. */
+  // ---- 左上角 Blender 风格朝向 gizmo ----
+  /** gizmo 用独立的正交相机 + 小场景，以视口（scissor）叠加在主画面左上角。 */
   private readonly gizmoScene = new THREE.Scene();
   private readonly gizmoCamera = new THREE.OrthographicCamera(-1.6, 1.6, 1.6, -1.6, 0.1, 20);
   private readonly gizmoBalls = new Map<ViewAxis, THREE.Mesh>();
@@ -183,10 +232,17 @@ export class Stage {
   private selectedAxis: ViewAxis | null = null;
   private rotationLocked = false;
   private viewTween: { from: THREE.Vector3; to: THREE.Vector3; started: number } | null = null;
+  /** 按下时的指针位置（用于区分“点击”与拖拽）；null 表示未在 gizmo 内按下。 */
   private gizmoPointerDown: { x: number; y: number } | null = null;
+  /** gizmo 距容器左上角的边距（CSS px）。 */
   private readonly gizmoMargin = 12;
+  /** 复用向量：保存相机相对目标的方向，避免每帧分配。 */
   private readonly gizmoDirection = new THREE.Vector3();
 
+  /**
+   * 捕获阶段监听 pointerdown：只有点在 gizmo 区域内才接管事件，
+   * 从而在 OrbitControls 的拖拽逻辑之前处理“点击轴向”。
+   */
   private readonly onGizmoPointerDown = (event: PointerEvent): void => {
     if (event.button !== 0) {
       return;
@@ -200,6 +256,7 @@ export class Stage {
     this.gizmoPointerDown = point;
   };
 
+  /** 抬起时若位移小于 6px 视为点击，再做轴向拾取；拖动超过该距离则忽略。 */
   private readonly onGizmoPointerUp = (event: PointerEvent): void => {
     const start = this.gizmoPointerDown;
     if (start == null) {
@@ -220,24 +277,33 @@ export class Stage {
     this.callbacks.onAxisPick?.(axis);
   };
 
+  /**
+   * @param host 承载 WebGL canvas 的容器（尺寸变化由 ResizeObserver 自动跟随）
+   * @param callbacks 可选回调（例如 gizmo 轴向点击）
+   */
   constructor(host: HTMLElement, callbacks: StageCallbacks = {}) {
     this.host = host;
     this.callbacks = callbacks;
+    // alpha + 透明清屏色：让页面背景的渐变透出来。
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: true,
       powerPreference: 'high-performance',
     });
+    // 限制 DPR，避免高分屏 4K 画布带来 4 倍以上填充率开销。
     this.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
     this.renderer.setPixelRatio(this.pixelRatio);
     this.renderer.setClearColor(0x000000, 0);
+    // 手动清屏：主画面、柔光、gizmo 分多趟绘制。
     this.renderer.autoClear = false;
     this.renderer.domElement.className = 'three-canvas';
     host.appendChild(this.renderer.domElement);
 
+    // 40° 透视，默认站在 +Z 方向（AXIS_HOME）。
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 60);
     this.camera.position.copy(AXIS_HOME);
 
+    // 环绕控制：阻尼 + 距离限制，关闭自动旋转（由 UI 开关控制）。
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0, 0, 0);
     this.controls.enableDamping = true;
@@ -251,6 +317,7 @@ export class Stage {
       this.dirty = true;
     });
 
+    // 固定三点布光 + 环境光：突出挤出薄板的体积感与正面颜色。
     const ambient = new THREE.AmbientLight(0xffffff, 1.25);
     const key = new THREE.DirectionalLight(0xdfe9ff, 2.4);
     key.position.set(2.4, 3.2, 4.2);
@@ -261,13 +328,15 @@ export class Stage {
     this.scene.add(ambient, key, rim, fill);
 
     this.buildGizmo();
+    // 全屏四边形始终充满视口，不能被视锥剔除。
     this.glowQuad.frustumCulled = false;
     this.glowQuadScene.add(this.glowQuad);
-    // Capture on the container so the gizmo click is handled before
-    // OrbitControls' canvas listeners start a drag.
+    // 在容器上用**捕获阶段**监听 pointerdown/up，确保 gizmo 的点击早于
+    // OrbitControls 画布监听器启动拖拽，避免点击轴向时同时触发旋转。
     host.addEventListener('pointerdown', this.onGizmoPointerDown, true);
     host.addEventListener('pointerup', this.onGizmoPointerUp, true);
 
+    // 容器尺寸变化时同步 renderer / camera 纵横比。
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(host);
     this.resize();
@@ -277,6 +346,11 @@ export class Stage {
     return this.host;
   }
 
+  /**
+   * 载入新模型：为每个网格建立固定的 geometry / material / 索引桶，
+   * 初始化节点列表并立即应用第 0 帧。
+   * 同一模型的网格按 renderOrder 排序，因此这里的下标就是节点 id。
+   */
   setModel(model: Model): void {
     this.clear();
     this.model = model;
@@ -284,25 +358,29 @@ export class Stage {
     this.nodes.length = 0;
     this.glowFlags.clear();
 
-    // Meshes of the same layer share a transform track; detect statically
-    // transformed layers only once per track.
+    // 同一图层的多个 drawable 共享一条变换轨道；常量轨道检测按轨道去重，
+    // 避免对几千条相同轨道重复逐帧比较。
     const staticTracks = new Map<number, boolean>();
 
     for (const [id, data] of model.meshes.entries()) {
+      // 动画网格必须独占一份顶点缓冲（会逐帧覆盖）；静态网格可直接引用 SDK 的数组。
       const positionsAnimated = data.animated && data.framePositions != null;
       const positions = positionsAnimated
         ? new Float32Array(data.positions)
         : data.positions;
 
+      // 每个网格只建一次 geometry；顶点数取“跨桶最大值”，因此任何桶都能复用。
       const geometry = new THREE.BufferGeometry();
       const position = new THREE.BufferAttribute(positions, 3);
       position.setUsage(positionsAnimated ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
       geometry.setAttribute('position', position);
+      // 每个拓扑桶一份索引属性；默认绑定桶 0，逐帧按 frameBuckets 切换。
       const indexAttributes = data.buckets.map(
         (bucket) => new THREE.BufferAttribute(bucket.indices, 1),
       );
       geometry.setIndex(indexAttributes[0]);
 
+      // 变换轨道：同层共享；track 为 null 时退化为单位矩阵（base 保持默认）。
       const track = model.transforms[data.transformIndex] ?? null;
       let transformStatic = staticTracks.get(data.transformIndex);
       if (transformStatic === undefined) {
@@ -310,10 +388,11 @@ export class Stage {
         staticTracks.set(data.transformIndex, transformStatic);
       }
 
+      // 初始颜色 / 透明度：有逐帧颜色轨道时取第 0 帧，否则用静态颜色。
       const colors = data.colors;
       const alpha = colors ? colors[3] : data.color[3];
-      // Lottie colours are sRGB; convert once here so static and animated
-      // colours share the same linear-space representation as three.js.
+      // Lottie 颜色是 sRGB；这里显式按 SRGBColorSpace 构造颜色，让静态与动画颜色
+      // 都进入 three.js 的线性空间，光照计算才一致。
       const baseColor = new THREE.Color().setRGB(
         data.color[0],
         data.color[1],
@@ -322,23 +401,28 @@ export class Stage {
       );
       const material = new THREE.MeshLambertMaterial({
         color: baseColor,
+        // 平面着色：挤出薄板的每个面亮度独立，轮廓更“硬”。
         flatShading: true,
         side: THREE.DoubleSide,
-        // Opaque constant colours skip blending and per-frame sorting entirely.
+        // 常量且不透明的颜色直接关闭透明混合，省掉排序与 overdraw。
         transparent: colors != null || alpha < 0.999,
         opacity: Math.max(0, Math.min(1, alpha)),
       });
 
+      // 关闭全部矩阵自动更新：世界矩阵由 applyFrame 直接写入。
+      // 同时关闭视锥剔除，避免整批网格在相机边缘被跳过（模型尺寸已归一化）。
       const mesh = new THREE.Mesh(geometry, material);
       mesh.matrixAutoUpdate = false;
       mesh.matrixWorldAutoUpdate = false;
       mesh.matrixWorldNeedsUpdate = false;
       mesh.frustumCulled = false;
       mesh.renderOrder = 0;
+      // alpha 低于 0.4% 视为完全不可见，直接不绘制。
       const staticVisible = alpha >= 0.004;
       mesh.visible = staticVisible;
       this.scene.add(mesh);
 
+      // 静态基矩阵：取轨道第 0 帧；无常量轨道时保持单位矩阵。
       const base = new THREE.Matrix4();
       if (track) {
         base.fromArray(track, 0);
@@ -369,17 +453,22 @@ export class Stage {
       });
     }
 
+    // 立即写入第 0 帧，保证加载完成即可见。
     this.applyFrame(0);
     this.syncGlowMeshes();
     this.dirty = true;
   }
 
-  /** Node list in render order; ids match `setSelection` ids. */
+  /** 返回按渲染顺序排列的节点列表；其 id 与 setSelection 等接口使用的 id 一致。 */
   getNodes(): readonly StageNode[] {
     return this.nodes;
   }
 
-  /** Selected node ids; also drives the blue wire cuboids. */
+  /**
+   * 设置选中节点集合（内部会校验 id 范围）。
+   * 只为新增的节点创建蓝色线框，移除的节点立即释放几何与材质，
+   * 然后统一刷新包围盒。
+   */
   setSelection(ids: readonly number[]): void {
     const wanted = new Set<number>();
     for (const id of ids) {
@@ -388,6 +477,7 @@ export class Stage {
       }
     }
 
+    // 取消选中的节点：移出场景并释放线框资源，避免频繁多选时泄漏。
     for (const [id, helper] of this.selectionBoxes) {
       if (!wanted.has(id)) {
         this.scene.remove(helper);
@@ -397,6 +487,7 @@ export class Stage {
       }
     }
 
+    // 新选中的节点：创建深度测试关闭的线框，保证被模型挡住时仍可见。
     for (const id of wanted) {
       if (this.selectionBoxes.has(id)) {
         continue;
@@ -413,7 +504,10 @@ export class Stage {
     this.dirty = true;
   }
 
-  /** Toggle the global soft-glow pass. */
+  /**
+   * 切换总柔光。开启后默认所有节点参与柔光，单节点仍可用 setNodeGlow 排除；
+   * 关闭后只有显式开启的节点继续发光（见 isNodeGlowEnabled）。
+   */
   setSoftGlow(enabled: boolean): void {
     if (this.softGlow === enabled) {
       return;
@@ -423,7 +517,11 @@ export class Stage {
     this.dirty = true;
   }
 
-  /** Enable / disable glow for a single node. */
+  /**
+   * 单独开启 / 关闭某个节点的柔光（覆盖总开关的默认行为）。
+   * @param id 节点 id（= entries 下标）
+   * @param enabled 是否发光
+   */
   setNodeGlow(id: number, enabled: boolean): void {
     if (this.glowFlags.get(id) === enabled) {
       return;
@@ -433,7 +531,10 @@ export class Stage {
     this.dirty = true;
   }
 
-  /** Apply the master switch to every node at once. */
+  /**
+   * 把总开关的取值一次性写进所有节点的覆盖标记。
+   * 这样“关总开关”时不会残留旧的 true，之后单节点仍可自行开启。
+   */
   setAllNodeGlow(enabled: boolean): void {
     let changed = false;
     for (let id = 0; id < this.entries.length; id += 1) {
@@ -449,7 +550,10 @@ export class Stage {
     this.dirty = true;
   }
 
-  /** Show or hide one node; hidden nodes also drop their selection wire. */
+  /**
+   * 显示 / 隐藏单个节点。隐藏节点会跳过逐帧计算，其选中线框也会同步隐藏；
+   * 状态变化后立刻重放当前帧，使可见性即时生效。
+   */
   setNodeVisible(id: number, visible: boolean): void {
     const hidden = !visible;
     if (id < 0 || id >= this.entries.length || this.hiddenNodes.has(id) === hidden) {
@@ -465,6 +569,10 @@ export class Stage {
     this.dirty = true;
   }
 
+  /**
+   * 跳转到指定帧（会四舍五入并 clamp 到 [0, frameCount - 1]）。
+   * 帧未变化时直接返回，避免拖动时间轴时重复写顶点与矩阵。
+   */
   setFrame(frame: number): void {
     if (this.model == null) {
       return;
@@ -477,6 +585,10 @@ export class Stage {
     this.dirty = true;
   }
 
+  /**
+   * “层深”倍率：不重新转换，只按当前帧重放矩阵并追加 Z 平移增量。
+   * @param value 1 表示原始烘焙深度
+   */
   setDepthScale(value: number): void {
     this.depthAmount = value;
     if (this.model != null) {
@@ -485,6 +597,10 @@ export class Stage {
     }
   }
 
+  /**
+   * “厚度”倍率：同样不重新转换，只改写矩阵的 Z 轴缩放分量。
+   * @param value 1 表示原始挤出厚度
+   */
   setThicknessScale(value: number): void {
     this.thicknessAmount = value;
     if (this.model != null) {
@@ -493,12 +609,13 @@ export class Stage {
     }
   }
 
+  /** 开关自动环绕；视角锁定时忽略（两者互斥）。 */
   setAutoRotate(enabled: boolean): void {
     this.controls.autoRotate = enabled && !this.rotationLocked;
     this.dirty = true;
   }
 
-  /** Lock orbiting while keeping pan / zoom and axis switching available. */
+  /** 锁定环绕，但保留平移 / 缩放与轴向切换，便于固定角度看细节。 */
   setRotationLock(locked: boolean): void {
     this.rotationLocked = locked;
     this.controls.enableRotate = !locked;
@@ -509,12 +626,15 @@ export class Stage {
     this.dirty = true;
   }
 
-  /** Snap the camera to one of the six Blender-style view directions. */
+  /**
+   * 平滑地把相机吸附到六个正交视角之一，并保持当前观察距离。
+   * @param axis 目标轴向（+X/-X/+Y/-Y/+Z/-Z）
+   */
   viewAxis(axis: ViewAxis): void {
     const distance = Math.max(2.4, this.camera.position.distanceTo(this.controls.target));
     const to = this.controls.target.clone().add(AXIS_VECTORS[axis].clone().multiplyScalar(distance));
-    // OrbitControls' spherical conversion degenerates exactly on the Y pole,
-    // so top / bottom views get a fraction of a degree of tilt.
+    // OrbitControls 的球坐标转换在 Y 轴极点会退化，因此顶视图 / 底视图
+    // 给 Z 方向加一点点偏移（约 0.23°），避免 up 向量与视线共线。
     if (Math.abs(AXIS_VECTORS[axis].y) > 0.5) {
       to.z += distance * 0.004;
     }
@@ -529,9 +649,11 @@ export class Stage {
   }
 
   /**
-   * Lower the render resolution when playback keeps missing the frame budget.
-   * Called from the FPS readout, so it reacts within a few seconds and never
-   * costs anything while the scene is smooth.
+   * 根据 FPS 读数自适应降低渲染分辨率：连续 6 个低帧窗口（< 45fps）
+   * 才降一次 pixelRatio（×0.8，下限 0.75）；流畅时清零计数。
+   * 由 App 的 FPS 统计每 0.5s 调用一次，因此在几秒内收敛。
+   *
+   * @param fps 最近一个统计窗口的平均帧率
    */
   adaptQuality(fps: number): void {
     if (fps >= 45 || this.pixelRatio <= 0.8) {
@@ -548,6 +670,7 @@ export class Stage {
     this.resize();
   }
 
+  /** 回到默认 +Z 视角（同时取消轴向高亮与未完成的补间）。 */
   resetView(): void {
     this.selectedAxis = null;
     this.viewTween = null;
@@ -558,8 +681,14 @@ export class Stage {
     this.dirty = true;
   }
 
+  /**
+   * 每帧调用一次（由 App 的 rAF 时钟驱动）。
+   * 有视角补间时先推进插值；随后只有“相机移动或 dirty”才真正绘制，
+   * 暂停且视角静止时不产生任何 GPU 开销。
+   */
   render(): void {
     const now = performance.now();
+    // 轴向切换补间：三次缓出，320ms 内插值到目标位置。
     if (this.viewTween) {
       const t = Math.min(1, (now - this.viewTween.started) / VIEW_TWEEN_MS);
       const eased = 1 - (1 - t) ** 3;
@@ -570,6 +699,7 @@ export class Stage {
       this.dirty = true;
     }
 
+    // OrbitControls.update() 返回是否发生了移动（含阻尼惯性）。
     const moved = this.controls.update();
     if (!moved && !this.dirty) {
       return;
@@ -578,6 +708,7 @@ export class Stage {
     const width = Math.max(1, this.host.clientWidth);
     const height = Math.max(1, this.host.clientHeight);
     this.updateSelectionBoxes();
+    // 主场景：先铺满视口清屏，再绘制；柔光与 gizmo 叠加在其上。
     this.renderer.setViewport(0, 0, width, height);
     this.renderer.setScissorTest(false);
     this.renderer.clear();
@@ -587,6 +718,7 @@ export class Stage {
     this.dirty = false;
   }
 
+  /** 释放所有 GPU / DOM 资源；调用后 Stage 不可再用。 */
   dispose(): void {
     this.observer.disconnect();
     this.host.removeEventListener('pointerdown', this.onGizmoPointerDown, true);
@@ -599,13 +731,21 @@ export class Stage {
     this.renderer.domElement.remove();
   }
 
+  /**
+   * 逐帧核心：写世界矩阵、颜色、顶点与索引桶。
+   * 只做内存拷贝和少量标量运算，不做任何几何计算。
+   *
+   * @param frame 目标帧（调用方已保证在 [0, frameCount - 1] 内）
+   */
   private applyFrame(frame: number): void {
     if (this.model == null) {
       return;
     }
     this.frameIndex = frame;
     const frameCount = this.model.frameCount;
+    // 每条轨道是帧连续的 16 float 块，这里算好当前帧的起点。
     const trackOffset = Math.min(frame, frameCount - 1) * 16;
+    // 层深与厚度都是“倍率”，1 表示保持烘焙值。
     const depthDelta = this.depthAmount - 1;
     const thickness = this.thicknessAmount;
 
@@ -613,14 +753,15 @@ export class Stage {
       const entry = this.entries[id];
       const { data, mesh, material, position, colors, track } = entry;
 
-      // Hidden nodes skip all per-frame work until the eye is toggled back on.
+      // 隐藏节点跳过全部逐帧工作（矩阵、颜色、顶点、索引），直到重新显示。
       if (this.hiddenNodes.has(id)) {
         mesh.visible = false;
         continue;
       }
 
-      // Write the world matrix directly: layers sit under the scene root, so
-      // there is no parent multiply to do and nothing to invalidate.
+      // 直接写 matrixWorld：所有图层都挂在场景根节点下，没有父级矩阵需要相乘，
+      // 也没有 matrixWorldNeedsUpdate 之类的失效传播要维护。
+      // 常量轨道复用预先算好的 base，避免每帧从 Float32Array 重新组装。
       if (entry.transformStatic) {
         mesh.matrixWorld.copy(entry.base);
       } else if (track != null) {
@@ -628,16 +769,18 @@ export class Stage {
       }
       const elements = mesh.matrixWorld.elements;
       if (depthDelta !== 0) {
-        // Depth is baked into the track, so the slider only adds a delta.
+        // 深度已经烘焙进轨道的 Z 平移（列主序第 14 个元素），
+        // 滑块只是在原值上叠加 data.depth * (倍率 - 1) 的增量。
         elements[14] += data.depth * depthDelta;
       }
       if (thickness !== 1) {
-        // Equivalent to post-multiplying by scale(1, 1, thickness).
+        // 等价于在矩阵右侧乘 scale(1, 1, thickness)：只改第三列（Z 基向量）的分量。
         elements[2] *= thickness;
         elements[6] *= thickness;
         elements[10] *= thickness;
       }
 
+      // 逐帧颜色：每帧 4 个 float（RGBA），alpha 过低直接整帧不可见。
       if (colors != null) {
         const colorBase = frame * 4;
         const alpha = colors[colorBase + 3];
@@ -647,6 +790,7 @@ export class Stage {
         }
         mesh.visible = true;
         material.opacity = alpha;
+        // 颜色按 sRGB 输入，交给 three.js 转到线性空间后再参与光照。
         material.color.setRGB(
           colors[colorBase],
           colors[colorBase + 1],
@@ -657,17 +801,20 @@ export class Stage {
         mesh.visible = entry.staticVisible;
       }
 
+      // 逐帧顶点：v2 用 frameOffsets 定位本帧区间；区间单位是 float，不是顶点。
+      // 不同拓扑桶的帧顶点数可以不同，因此不要假设固定长度。
       if (entry.positionsAnimated && data.framePositions) {
         const offsets = data.frameOffsets;
         if (offsets != null) {
           const start = offsets[frame] ?? 0;
           const end = offsets[frame + 1] ?? start;
           if (end > start) {
+            // subarray 是视图，set 会直接写进现有的 position 数组（零临时分配）。
             position.array.set(data.framePositions.subarray(start, end));
             position.needsUpdate = true;
           }
         } else {
-          // Legacy layout: every frame reserves the maximum vertex count.
+          // 兼容旧布局：每帧预留“最大顶点数 × 3”个 float。
           const count = data.vertexCount * 3;
           const offset = frame * count;
           if (offset + count <= data.framePositions.length) {
@@ -677,7 +824,9 @@ export class Stage {
         }
       }
 
-      // Switch the cached index set when the contour topology changes.
+      // 拓扑切换：frameBuckets[frame] 指定本帧使用哪套索引。
+      // 仅在桶变化时才 setIndex（会替换 geometry.index 的绑定），
+      // 桶下标越界时回退到桶 0，保证不会引用到未创建的属性。
       const buckets = entry.indexAttributes;
       if (buckets.length > 1) {
         const bucket = data.frameBuckets?.[frame] ?? 0;
@@ -690,6 +839,7 @@ export class Stage {
     }
   }
 
+  /** 清空所有网格、线框与柔光外壳（切换模型时调用）。 */
   private clear(): void {
     for (const helper of this.selectionBoxes.values()) {
       this.scene.remove(helper);
@@ -710,6 +860,7 @@ export class Stage {
     this.model = null;
   }
 
+  /** 容器尺寸变化：同步画布分辨率（CSS 尺寸由样式控制，故 setSize 第三参为 false）。 */
   private resize(): void {
     const width = Math.max(1, this.host.clientWidth);
     const height = Math.max(1, this.host.clientHeight);
@@ -719,9 +870,17 @@ export class Stage {
     this.dirty = true;
   }
 
-  // ------------------------------------------------------- selection & glow
+  // ------------------------------------------------------- 选择线框与柔光
 
-  /** Tight box over the vertices actually used by the current bucket. */
+  /**
+   * 计算只覆盖“当前桶实际使用顶点”的紧包围盒。
+   * 顶点数组中可能残留其它桶的顶点（缓冲取最大值分配），
+   * 因此必须用 vertexCount 限制扫描范围。
+   *
+   * @param box 输出包围盒（复用对象）
+   * @param array xyz 交错的顶点数组
+   * @param vertexCount 本桶顶点数
+   */
   private setBoxFromPositions(
     box: THREE.Box3,
     array: ArrayLike<number>,
@@ -743,6 +902,10 @@ export class Stage {
     }
   }
 
+  /**
+   * 每次绘制前刷新所有选中线框：顶点数据可能刚被换帧覆盖，
+   * 因此不能只在选择变化时计算一次。
+   */
   private updateSelectionBoxes(): void {
     for (const [id, helper] of this.selectionBoxes) {
       const entry = this.entries[id];
@@ -750,12 +913,14 @@ export class Stage {
         helper.visible = false;
         continue;
       }
+      // 用“当前桶”的顶点数而非全局最大值，避免把上一桶残留的顶点算进包围盒。
       const bucket = entry.data.buckets[entry.currentBucket] ?? entry.data.buckets[0];
       this.setBoxFromPositions(
         this.boxScratch,
         entry.position.array,
         bucket ? bucket.vertexCount : entry.data.vertexCount,
       );
+      // 顶点是局部坐标，需乘上已更新的世界矩阵才是场景空间包围盒。
       this.boxScratch.applyMatrix4(entry.mesh.matrixWorld);
       if (this.boxScratch.isEmpty()) {
         helper.visible = false;
@@ -766,16 +931,21 @@ export class Stage {
     }
   }
 
+  /**
+   * 柔光的“总开关 + 单节点覆盖”语义：
+   * - 总开关开启：除非节点被显式标记 false，否则都发光；
+   * - 总开关关闭：只有显式标记 true 的节点发光（可单点亮）。
+   */
   private isNodeGlowEnabled(id: number): boolean {
-    // With the master pass on every node glows unless it was explicitly
-    // excluded; with it off only nodes explicitly enabled still glow, so a
-    // single node can light up on its own.
     return this.softGlow
       ? this.glowFlags.get(id) !== false
       : this.glowFlags.get(id) === true;
   }
 
-  /** Create / drop glow shells so only enabled nodes take part in the pass. */
+  /**
+   * 按当前发光集合增删外壳网格：只为启用的节点创建，
+   * 关闭的节点立即移出 glowScene 并释放材质（geometry 与主网格共享，不能释放）。
+   */
   private syncGlowMeshes(): void {
     const wanted = new Set<number>();
     for (let id = 0; id < this.entries.length; id += 1) {
@@ -801,6 +971,8 @@ export class Stage {
       if (entry == null) {
         continue;
       }
+      // 外壳材质：叠加混合、关闭深度写入，颜色与透明度每帧从主材质同步。
+      // 复用主网格的 geometry，因此顶点 / 索引桶切换会自动跟主画面保持一致。
       const material = new THREE.MeshBasicMaterial({
         transparent: true,
         blending: THREE.AdditiveBlending,
@@ -819,6 +991,7 @@ export class Stage {
     this.dirty = true;
   }
 
+  /** 移除全部柔光外壳（只释放材质，geometry 仍归主网格）。 */
   private clearGlowMeshes(): void {
     for (const mesh of this.glowMeshes.values()) {
       this.glowScene.remove(mesh);
@@ -827,6 +1000,12 @@ export class Stage {
     this.glowMeshes.clear();
   }
 
+  /**
+   * 按主画布的 1/4 尺寸准备两张渲染目标；尺寸变化时重建。
+   * 不使用深度/模板缓冲，降低显存占用。
+   *
+   * @returns 是否可用（当前实现总会返回 true，便于调用方提前退出）
+   */
   private ensureGlowTargets(width: number, height: number): boolean {
     const targetWidth = Math.max(64, Math.floor(width * GLOW_SCALE));
     const targetHeight = Math.max(64, Math.floor(height * GLOW_SCALE));
@@ -855,11 +1034,13 @@ export class Stage {
   }
 
   /**
-   * Additive soft glow: render only the enabled meshes, blur the result at a
-   * quarter resolution and composite it over the already-rendered scene.
+   * 加性柔光后处理：只渲染发光外壳 → 1/4 分辨率做两遍高斯模糊 → 叠加回主画面。
+   *
+   * 流程：外壳同步矩阵/颜色 → 渲染到 read → 横向模糊到 write
+   *       → 纵向模糊回 read → 以加性混合把 read.texture 铺满视口。
+   * 只要有一个节点发光就会执行，即使总柔光开关关闭。
    */
   private renderGlow(width: number, height: number): void {
-    // Runs whenever at least one node is lit, even if the master pass is off.
     if (this.glowMeshes.size === 0) {
       return;
     }
@@ -870,6 +1051,7 @@ export class Stage {
       return;
     }
 
+    // 外壳与主网格共享 geometry，逐帧只需同步世界矩阵、可见性与颜色。
     for (const [id, mesh] of this.glowMeshes) {
       const entry = this.entries[id];
       if (entry == null) {
@@ -882,12 +1064,14 @@ export class Stage {
       material.opacity = entry.material.opacity;
     }
 
+    // 不透明黑底：先清空颜色缓冲，保证加性叠加时不会残留上一帧的亮度。
     this.renderer.setClearColor(0x000000, 1);
     this.renderer.setScissorTest(false);
     this.renderer.setRenderTarget(read);
     this.renderer.clear(true, false, false);
     this.renderer.render(this.glowScene, this.camera);
 
+    // 第一遍模糊：横向，步长 = 1 / 目标宽度（纹理坐标单位）。
     this.glowQuad.material = this.glowBlurMaterial;
     this.glowBlurMaterial.uniforms.source.value = read.texture;
     (this.glowBlurMaterial.uniforms.direction.value as THREE.Vector2).set(
@@ -898,6 +1082,7 @@ export class Stage {
     this.renderer.clear(true, false, false);
     this.renderer.render(this.glowQuadScene, this.glowQuadCamera);
 
+    // 第二遍模糊：纵向，读第一遍的结果写回 read，避免额外一张纹理。
     this.glowBlurMaterial.uniforms.source.value = write.texture;
     (this.glowBlurMaterial.uniforms.direction.value as THREE.Vector2).set(
       0,
@@ -907,6 +1092,7 @@ export class Stage {
     this.renderer.clear(true, false, false);
     this.renderer.render(this.glowQuadScene, this.glowQuadCamera);
 
+    // 合成材质延迟创建并复用；只更新贴图，避免每帧重编译着色器。
     let composite = this.glowCompositeMaterial;
     if (composite == null) {
       composite = new THREE.MeshBasicMaterial({
@@ -927,15 +1113,18 @@ export class Stage {
       }
     }
 
+    // 回到主画布：只清深度（保留已渲染的颜色），再用加性混合叠加柔光。
     this.renderer.setRenderTarget(null);
     this.renderer.setViewport(0, 0, width, height);
     this.renderer.setScissorTest(false);
     this.renderer.clearDepth();
     this.glowQuad.material = composite;
     this.renderer.render(this.glowQuadScene, this.glowQuadCamera);
+    // 恢复透明清屏色，供下一帧主场景使用。
     this.renderer.setClearColor(0x000000, 0);
   }
 
+  /** 释放柔光相关的 RT、合成材质、全屏四边形与着色器。 */
   private disposeGlow(): void {
     this.clearGlowMeshes();
     this.glowRead?.dispose();
@@ -949,14 +1138,20 @@ export class Stage {
     this.glowQuadScene.clear();
   }
 
-  // -------------------------------------------------------------- axis gizmo
+  // -------------------------------------------------------------- 轴向 gizmo
 
+  /** gizmo 的边长（CSS px）：取容器短边的 28%，限制在 76–128。 */
   private get gizmoSize(): number {
     const shortest = Math.min(this.host.clientWidth, this.host.clientHeight);
     return Math.max(76, Math.min(128, Math.floor(shortest * 0.28)));
   }
 
+  /**
+   * 构建 gizmo：半透明底盘 + 三条轴线 + 六个球 + 方向标签 + 选中环。
+   * 所有资源都压入 gizmoResources / gizmoTextures，dispose 时统一释放。
+   */
   private buildGizmo(): void {
+    // 底盘：径向渐变圆形贴图，弱化背景以突出轴向球。
     const backdrop = new THREE.Sprite(
       new THREE.SpriteMaterial({
         map: this.createBackdropTexture(),
@@ -970,9 +1165,11 @@ export class Stage {
     this.gizmoScene.add(backdrop);
     this.gizmoResources.push(backdrop.material);
 
+    // 六个轴向球共享同一份球体几何，只按轴替换材质。
     const ballGeometry = new THREE.SphereGeometry(0.19, 20, 14);
     this.gizmoResources.push(ballGeometry);
 
+    // 三条轴线：从负轴到正轴各画一条淡色线段。
     const pairs: Array<[ViewAxis, ViewAxis]> = [
       ['x', '-x'],
       ['y', '-y'],
@@ -993,6 +1190,8 @@ export class Stage {
       this.gizmoResources.push(geometry, material);
     }
 
+    // 每个轴向：一个彩色球 + 一个文字标签（Sprite 始终面向相机）。
+    // 负轴用半透明材质，正负方向一眼可辨。
     for (const axis of AXIS_ORDER) {
       const negative = axis.startsWith('-');
       const material = new THREE.MeshBasicMaterial({
@@ -1023,6 +1222,7 @@ export class Stage {
       this.gizmoLabels.set(axis, label);
     }
 
+    // 选中环：默认隐藏，点击 / 切换轴向时套在当前轴上。
     const ring = new THREE.Sprite(
       new THREE.SpriteMaterial({
         map: this.createRingTexture(),
@@ -1040,6 +1240,10 @@ export class Stage {
     this.updateGizmoSelection();
   }
 
+  /**
+   * 刷新 gizmo 的选中反馈：当前轴的球放大到 1.3 倍并套上圆环；
+   * 圆环颜色区分“自由视角”（青）与“视角锁定”（黄）。
+   */
   private updateGizmoSelection(): void {
     for (const axis of AXIS_ORDER) {
       const ball = this.gizmoBalls.get(axis);
@@ -1062,6 +1266,10 @@ export class Stage {
     );
   }
 
+  /**
+   * 用 scissor 把 gizmo 叠加到主画面左上角（注意 WebGL 视口原点在左下角，
+   * 因此 y = height - size - margin）。
+   */
   private renderGizmo(width: number, height: number): void {
     const size = this.gizmoSize;
     const margin = this.gizmoMargin;
@@ -1076,7 +1284,10 @@ export class Stage {
     this.renderer.setViewport(0, 0, width, height);
   }
 
-  /** Keep the gizmo camera aligned with the main view direction. */
+  /**
+   * 让 gizmo 相机跟随主相机：位置沿主视线方向后退 6 个单位，
+   * 朝向与主相机一致，这样轴向球的投影方向与真实视角同步。
+   */
   private syncGizmoCamera(): void {
     const direction = this.gizmoDirection.copy(this.camera.position).sub(this.controls.target);
     if (direction.lengthSq() < 1e-6) {
@@ -1088,11 +1299,13 @@ export class Stage {
     this.gizmoCamera.updateMatrixWorld();
   }
 
+  /** 把指针的页面坐标换算成容器内坐标（左上角为原点，单位 CSS px）。 */
   private localPoint(event: PointerEvent): { x: number; y: number } {
     const rect = this.host.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
 
+  /** 判断容器坐标是否落在左上角 gizmo 的方形区域内。 */
   private inGizmo(point: { x: number; y: number }): boolean {
     const size = this.gizmoSize;
     const margin = this.gizmoMargin;
@@ -1104,8 +1317,16 @@ export class Stage {
     );
   }
 
+  /**
+   * gizmo 轴向拾取：把六个轴向球投影到屏幕坐标，取距离点击点最近且在
+   * 阈值（≥16px 或 20% 尺寸）内的轴；多轴重叠时优先更靠近观察者的一个。
+   *
+   * @param point 容器内点击坐标（CSS px）
+   * @returns 命中的轴向；未命中返回 null
+   */
   private pickGizmoAxis(point: { x: number; y: number }): ViewAxis | null {
     const size = this.gizmoSize;
+    // gizmo 视口中心在容器坐标中的位置。
     const centerX = this.gizmoMargin + size * 0.5;
     const centerY = this.gizmoMargin + size * 0.5;
     const threshold = Math.max(16, size * 0.2);
@@ -1116,17 +1337,19 @@ export class Stage {
     let bestDepth = -Infinity;
 
     for (const axis of AXIS_ORDER) {
+      // 手动做一次 MVP 变换：视空间 z 用于判深度，NDC 坐标用于算像素距离。
       this.gizmoProjection.copy(AXIS_VECTORS[axis]);
       this.gizmoProjection.applyMatrix4(this.gizmoCamera.matrixWorldInverse);
       const depth = this.gizmoProjection.z;
       this.gizmoProjection.applyMatrix4(this.gizmoCamera.projectionMatrix);
+      // NDC → 像素：y 轴需翻转（屏幕向下为正）。
       const px = centerX + this.gizmoProjection.x * size * 0.5;
       const py = centerY - this.gizmoProjection.y * size * 0.5;
       const distance = Math.hypot(px - point.x, py - point.y);
       if (distance > threshold) {
         continue;
       }
-      // Overlapping axes: prefer the one closer to the viewer (larger view z).
+      // 轴向重叠时优先更靠近观察者的轴（视空间 z 更大，即更靠近相机）。
       if (
         best == null ||
         distance < bestDistance - 1 ||
@@ -1140,6 +1363,7 @@ export class Stage {
     return best;
   }
 
+  /** 生成 gizmo 底盘贴图：径向渐变圆 + 一圈细描边（Canvas → CanvasTexture）。 */
   private createBackdropTexture(): THREE.Texture {
     const canvas = document.createElement('canvas');
     canvas.width = 128;
@@ -1166,6 +1390,7 @@ export class Stage {
     return texture;
   }
 
+  /** 生成轴向文字贴图：深色描边 + 白字，保证在任何背景下可读。 */
   private createLabelTexture(text: string): THREE.Texture {
     const canvas = document.createElement('canvas');
     canvas.width = 72;
@@ -1187,6 +1412,7 @@ export class Stage {
     return texture;
   }
 
+  /** 生成选中圆环贴图（白色细环，材质颜色再决定青 / 黄）。 */
   private createRingTexture(): THREE.Texture {
     const canvas = document.createElement('canvas');
     canvas.width = 128;
@@ -1205,6 +1431,7 @@ export class Stage {
     return texture;
   }
 
+  /** 释放 gizmo 的几何/材质/贴图与场景引用。 */
   private disposeGizmo(): void {
     for (const resource of this.gizmoResources) {
       resource.dispose();

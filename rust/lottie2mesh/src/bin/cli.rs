@@ -1,4 +1,13 @@
-//! Command line front-end: `lottie2mesh-cli <input.json> [output.l2d3]`.
+//! 命令行入口：`lottie2mesh-cli <input.json> [output.l2d3]`。
+//!
+//! 参数：
+//! * `--fps=<n>` 采样帧率；
+//! * `--max-frames=<n>` 烘焙帧数上限；
+//! * `--thickness=<px>` 挤出半厚（Lottie 像素）；
+//! * `--edge-radius=<px>` 边缘圆角半径（Lottie 像素）；
+//! * 输入为 `-` 时从 stdin 读取 JSON；省略输出路径时二进制写到 stdout。
+//!
+//! 统计摘要始终输出到 stderr，避免污染 stdout 上的二进制数据。
 
 use std::env;
 use std::fs;
@@ -7,11 +16,14 @@ use std::process::ExitCode;
 
 use lottie2mesh::compile::{RawOptions, compile};
 
+/// 解析参数、读取 JSON、调用 [`compile`] 并写出二进制；返回进程退出码。
 fn main() -> ExitCode {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut options = RawOptions::default();
 
+    // 选项只接受 `--key=value` 形式；按出现顺序，第一个非选项参数为输入，
+    // 第二个为输出路径。
     for arg in env::args().skip(1) {
         if arg == "-h" || arg == "--help" {
             print_help();
@@ -46,6 +58,7 @@ fn main() -> ExitCode {
     };
 
     let json = match input.as_str() {
+        // 输入为 `-` 时从标准输入读取 JSON。
         "-" => read_stdin(),
         _ => fs::read_to_string(&input)
             .map_err(|error| format!("无法读取 {input}: {error}")),
@@ -75,10 +88,12 @@ fn main() -> ExitCode {
             }
         }
         None => {
+            // 省略输出路径时把二进制直接写到 stdout，便于 shell 管道。
             let _ = io::stdout().write_all(&bytes);
         }
     }
 
+    // 统计摘要写到 stderr，stdout 只保留二进制数据。
     let vertices: usize = model
         .meshes
         .iter()
@@ -106,6 +121,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// 读取标准输入的全部文本；失败时返回中文错误信息。
 fn read_stdin() -> Result<String, String> {
     let mut buffer = String::new();
     io::stdin()
@@ -114,6 +130,7 @@ fn read_stdin() -> Result<String, String> {
     Ok(buffer)
 }
 
+/// 把用法说明打印到 stderr。
 fn print_help() {
     eprintln!(
         "lottie2mesh-cli <input.json> [output.l2d3]\n\

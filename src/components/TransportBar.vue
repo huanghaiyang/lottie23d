@@ -1,4 +1,6 @@
 <script setup lang="ts">
+// 底部播放条：播放/暂停、进度拖动、倍速、重置视角。状态全部由 App.vue 注入。
+/** playing 播放状态；progress 为 0–1000 的滑块进度；frameLabel 帧文案；fps 实测帧率。 */
 const props = defineProps<{
   playing: boolean;
   progress: number;
@@ -6,6 +8,7 @@ const props = defineProps<{
   fps: number;
 }>();
 
+// 拖动进度条时先发 drag-start（App 暂停播放），松开发 drag-end 再恢复。
 const emit = defineEmits<{
   (event: 'toggle-play'): void;
   (event: 'seek', value: number): void;
@@ -14,8 +17,10 @@ const emit = defineEmits<{
   (event: 'reset-view'): void;
 }>();
 
+/** 播放倍速（0.25–2），双向绑定回 App 的播放时钟。 */
 const speed = defineModel<number>('speed', { required: true });
 
+/** 把 range 的字符串值转成数字后上抛；进度到时间的换算由 App 负责。 */
 function onSeek(event: Event): void {
   emit('seek', Number((event.target as HTMLInputElement).value));
 }

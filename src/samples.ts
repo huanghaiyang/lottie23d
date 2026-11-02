@@ -7,16 +7,20 @@ import type { LottieData, LottieLayer, LottieProperty } from './lottie/types';
  * 每个示例都刻意使用多个独立图层，方便观察「分层 → 3D」的效果。
  */
 
+/** 源帧率（fps）。 */
 const FRAME_RATE = 60;
+/** 总帧数：180 帧 / 60fps = 3 秒循环。 */
 const TOTAL_FRAMES = 180; // 3 秒循环
 
 type Numeric = number | number[];
 
+/** 三次贝塞尔缓动控制点（x 是时间轴、y 是值轴），逐维度可不同。 */
 interface Ease {
   x: number[];
   y: number[];
 }
 
+/** 单个关键帧：t 为源帧号，s 为该帧取值，i/o 为进/出缓动。 */
 interface Keyframe {
   t: number;
   s: number[];
@@ -24,12 +28,14 @@ interface Keyframe {
   o: Ease;
 }
 
+/** `a = 1` 的动画属性（k 为关键帧数组），与 Lottie 的动画属性结构一致。 */
 interface AnimatedProperty {
   a: 1;
   k: Keyframe[];
   ix?: number;
 }
 
+/** 图层变换的可选入参：既可直接给静态值，也可给关键帧动画。 */
 type TransformOptions = {
   pos?: number[] | AnimatedProperty;
   rot?: number | AnimatedProperty;
@@ -38,11 +44,13 @@ type TransformOptions = {
   anchor?: number[];
 };
 
+/** 线性缓动：控制点固定在 (0.5, 0.5)，等价于匀速插值。 */
 const linear = (dims: number): Ease => ({
   x: new Array(dims).fill(0.5),
   y: new Array(dims).fill(0.5),
 });
 
+/** 构造静态属性（a = 0），ix 固定为 1 仅为结构完整。 */
 function staticProp(value: Numeric): LottieProperty {
   return { a: 0, k: value, ix: 1 };
 }
@@ -59,10 +67,15 @@ function animate(frames: Array<{ t: number; v: number[] }>): AnimatedProperty {
   };
 }
 
+/** 类型守卫：判断传入的是否为关键帧动画属性（a === 1）。 */
 function isAnimated(value: unknown): value is AnimatedProperty {
   return typeof value === 'object' && value !== null && (value as AnimatedProperty).a === 1;
 }
 
+/**
+ * 组装 Lottie 的 `ks` 变换对象。
+ * 每项都先判断是否动画属性，静态值再走 staticProp；缺省值按 Lottie 习惯补 100/0。
+ */
 function transform(options: TransformOptions): Record<string, LottieProperty> {
   return {
     o: isAnimated(options.opacity) ? options.opacity : staticProp(options.opacity ?? 100),
@@ -73,6 +86,7 @@ function transform(options: TransformOptions): Record<string, LottieProperty> {
   };
 }
 
+/** 十六进制颜色转 0–1 的三元组（Lottie 的颜色分量按归一化浮点存储）。 */
 function hexToRgb(hex: string): [number, number, number] {
   const normalized = hex.replace('#', '');
   const value = parseInt(normalized, 16);
@@ -83,13 +97,19 @@ function hexToRgb(hex: string): [number, number, number] {
   ];
 }
 
+/** 椭圆造型的可选参数。 */
 interface EllipseOptions {
+  /** 描边宽度（像素）；大于 0 时画描边，否则画填充。 */
   stroke?: number;
+  /** 图层不透明度（0–100）。 */
   opacity?: number;
+  /** 椭圆自身旋转角度（度）。 */
   rotation?: number;
+  /** 填充色的 alpha（0–1），用于做出半透明光晕。 */
   alpha?: number;
 }
 
+/** Lottie 的矢量组（`gr`），it 内依次是形状、样式与组变换。 */
 interface VectorGroup {
   ty: 'gr';
   it: unknown[];
@@ -102,6 +122,7 @@ interface VectorGroup {
   hd: boolean;
 }
 
+/** 构造椭圆路径项（`el`），size 为宽高，position 为相对组内原点。 */
 function ellipsePath(size: [number, number], position: [number, number] = [0, 0]): unknown {
   return {
     ty: 'el',
@@ -114,6 +135,7 @@ function ellipsePath(size: [number, number], position: [number, number] = [0, 0]
   };
 }
 
+/** 构造组变换项（`tr`）：平移/锚点/缩放/旋转/透明度/倾斜全部保持默认。 */
 function groupTransform(rotation = 0): unknown {
   return {
     ty: 'tr',
@@ -128,6 +150,7 @@ function groupTransform(rotation = 0): unknown {
   };
 }
 
+/** 把形状与样式项包成一个矢量组，np 记录子项数量。 */
 function makeGroup(items: unknown[]): VectorGroup {
   return {
     ty: 'gr',
@@ -222,11 +245,19 @@ function arcGroup(
   ]);
 }
 
+/** 图层附加项：父级 ind 与（保留的）透明度动画入参。 */
 interface LayerOptions {
   parent?: number;
   opacity?: AnimatedProperty;
 }
 
+/**
+ * 构造形状图层（ty = 4）。
+ * @param ind 图层 id（parent 引用的就是它）
+ * @param shapes 该层的形状组数组
+ * @param options 变换参数
+ * @param extra 父级等附加设置
+ */
 function shapeLayer(
   ind: number,
   name: string,
@@ -251,6 +282,7 @@ function shapeLayer(
   };
 }
 
+/** 构造空对象层（ty = 3），只提供变换，常用于让子层绕其旋转。 */
 function nullLayer(ind: number, name: string, options: TransformOptions): LottieLayer {
   return {
     ddd: 0,
@@ -273,6 +305,7 @@ function seeded(index: number, salt: number): number {
   return value - Math.floor(value);
 }
 
+/** 构造闪烁动画：由 base 出发，在 45/135 帧处增亮、90 帧处回落，180 帧回到起点。 */
 function twinkle(base: number, index: number): AnimatedProperty {
   const peak = Math.min(100, base + 35 + seeded(index, 3) * 30);
   const mid = Math.max(12, base - 14);
@@ -287,6 +320,10 @@ function twinkle(base: number, index: number): AnimatedProperty {
 
 /* ------------------------------------------------------------------ 示例一：星轨 */
 
+/**
+ * 生成“星轨”示例：两组行星绕各自空对象旋转，外加轨道参考线、恒星与星空。
+ * 图层顺序刻意前（行星、恒星）后（星云）分明，便于观察分层挤出效果。
+ */
 function createOrbitSample(): LottieData {
   const layerList: LottieLayer[] = [];
   let ind = 1;
@@ -448,6 +485,10 @@ function createOrbitSample(): LottieData {
 
 /* ------------------------------------------------------------------ 示例二：脉冲 */
 
+/**
+ * 生成“脉冲”示例：中心核缩放、三条 trim path 光弧反向旋转、外扩脉冲环，
+ * 以及三组环绕光点（同样挂在旋转空对象上）。
+ */
 function createPulseSample(): LottieData {
   const layerList: LottieLayer[] = [];
   let ind = 1;
@@ -636,12 +677,17 @@ function createPulseSample(): LottieData {
   };
 }
 
+/** 一个内置示例：id 用于路由，name 显示在顶部数据源按钮上。 */
 export interface SampleDefinition {
+  /** 数据源 id（也用于 `file:` / `demo:` 前缀之外的内置来源匹配）。 */
   id: string;
+  /** 中文显示名。 */
   name: string;
+  /** 生成的 Lottie 数据。 */
   data: LottieData;
 }
 
+/** 全部内置示例；在模块加载时一次性生成。 */
 export const SAMPLES: SampleDefinition[] = [
   { id: 'orbit', name: '星轨', data: createOrbitSample() },
   { id: 'pulse', name: '脉冲', data: createPulseSample() },

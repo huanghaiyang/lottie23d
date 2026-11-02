@@ -1,3 +1,5 @@
+// 图层分带：把 Lottie 的「前 → 后」图层序列切成若干深度平面，
+// 供左侧多实例渲染，也供右侧按层计算 Z 深度。
 import type { LottieData, LottieLayer } from './types';
 
 /**
@@ -32,12 +34,14 @@ function clone<T>(value: T): T {
  *    也要一并复制进当前分层（父层通常是空对象层，不会产生重复画面）。
  *
  * @param source 原始 Lottie 数据
- * @param requested 期望的分层数
+ * @param requested 期望的分层数（会被 clamp 到 1 … 图层数）
+ * @returns 各分层的数据副本与深度（depth 为 1 → 0，1 最靠前）
  */
 export function splitIntoBands(source: LottieData, requested: number): BandSpec[] {
   const layers = source.layers ?? [];
   if (layers.length === 0) return [];
 
+  // 分层数不能超过图层数，否则会出现空的深度平面。
   const count = Math.max(1, Math.min(Math.floor(requested), layers.length));
   if (count === 1) {
     return [{ index: 0, data: clone(source), layers: layers.length, depth: 0.5 }];
@@ -63,6 +67,7 @@ export function splitIntoBands(source: LottieData, requested: number): BandSpec[
   for (let band = 0; band < count; band++) {
     const include = new Set<number>();
 
+    // 递归向上收集 parent 链；guard 防止畸形数据里的父子环导致死循环。
     const addAncestors = (index: number) => {
       const guard = new Set<number>([index]);
       let parentInd = layers[index]?.parent;

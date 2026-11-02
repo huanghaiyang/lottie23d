@@ -1,10 +1,13 @@
 <script setup lang="ts">
+// 顶部栏：数据源切换 + 转换统计。所有数据由 App.vue 传入，点击只上抛事件。
+/** 一个数据源按钮：id 用于路由，accent 用于强调“选择文件”这类入口。 */
 interface SourceChip {
   id: string;
   label: string;
   accent?: boolean;
 }
 
+/** 展示数据；统计文案已由 App.vue 预先格式化，组件不再做计算。 */
 const props = defineProps<{
   sources: SourceChip[];
   activeSource: string;
@@ -14,11 +17,13 @@ const props = defineProps<{
   size: string;
 }>();
 
+/** select 切换数据源；pick 打开本地文件选择框。 */
 const emit = defineEmits<{
   (event: 'select', id: string): void;
   (event: 'pick'): void;
 }>();
 
+/** 特殊 id `pick` 表示“选择文件”，其余当作数据源 id 上抛。 */
 function onChip(chip: SourceChip): void {
   if (chip.id === 'pick') {
     emit('pick');

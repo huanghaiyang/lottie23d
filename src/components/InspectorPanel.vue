@@ -1,7 +1,12 @@
 <script setup lang="ts">
+// 右侧“转换参数 + 节点列表”面板。
+// 数据流：滑块/开关通过 defineModel 双向绑定回 App.vue；节点行的选择、柔光、
+// 显隐只向上抛事件，状态统一由 App.vue 维护，这里只负责渲染与修饰键映射。
 import { ref } from 'vue';
 import type { StageNode } from '../scene/stage';
 
+// 以下 7 个参数通过 defineModel 与 App.vue 双向绑定（模板中使用 kebab-case 名称）。
+// 厚度/层深是渲染期增量，边缘平滑/采样帧率会触发重转换。
 const thickness = defineModel<number>('thickness', { required: true });
 const depth = defineModel<number>('depth', { required: true });
 const edgeRatio = defineModel<number>('edge-ratio', { required: true });
@@ -10,6 +15,7 @@ const autoRotate = defineModel<boolean>('auto-rotate', { required: true });
 const axisLock = defineModel<boolean>('axis-lock', { required: true });
 const softGlow = defineModel<boolean>('soft-glow', { required: true });
 
+/** App.vue 注入的只读状态：节点列表、选中集合，以及逐节点柔光/显隐标记。 */
 const props = defineProps<{
   nodes: StageNode[];
   selected: number[];
@@ -17,6 +23,7 @@ const props = defineProps<{
   visible: Record<number, boolean>;
 }>();
 
+/** 节点交互统一上抛，避免面板与 App 各存一份状态导致不同步。 */
 const emit = defineEmits<{
   (
     event: 'select-node',
@@ -27,20 +34,28 @@ const emit = defineEmits<{
   (event: 'toggle-node-visibility', id: number): void;
 }>();
 
+/** 面板折叠状态；纯 UI 本地状态，不影响场景。 */
 const open = ref(true);
 
+/** 该节点是否在当前选中集合内。 */
 function isSelected(id: number): boolean {
   return props.selected.includes(id);
 }
 
+/**
+ * 柔光圆点是否点亮，语义与 Stage / App 保持一致：
+ * 总开关开时默认点亮（除非显式 false），总开关关时仅显式 true 的节点点亮。
+ */
 function isGlow(id: number): boolean {
   return softGlow.value ? props.glow[id] !== false : props.glow[id] === true;
 }
 
+/** 节点是否可见；没有显式关闭记录的节点默认可见。 */
 function isVisible(id: number): boolean {
   return props.visible[id] !== false;
 }
 
+/** 把鼠标修饰键映射成 App 约定的选择语义（macOS 的 meta 视作 ctrl）。 */
 function onNodeClick(id: number, event: MouseEvent): void {
   emit('select-node', id, {
     shift: event.shiftKey,

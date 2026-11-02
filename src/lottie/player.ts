@@ -1,3 +1,6 @@
+// 左侧原画面板：把 Lottie 按深度拆成多层，每层一个 lottie-web canvas 实例。
+// 数据流：splitIntoBands 拆分 → 各自 loadAnimation(canvas) → seek() 统一驱动；
+// 产出的 canvas 由上层旋转成 CanvasTexture，贴到对应的 3D 薄板上。
 import lottie, { type AnimationItem } from 'lottie-web';
 import { splitIntoBands } from './bands';
 import type { LottieData } from './types';
@@ -33,6 +36,11 @@ export class LottieBands {
   private readonly bandSurfaces: BandSurface[] = [];
   private currentFrame = Number.NaN;
 
+  /**
+   * @param host 承载各分层 holder 的容器（holder 绝对定位后互相叠放）
+   * @param data 原始 Lottie 数据
+   * @param bandCount 期望的深度分层数（实际会被 clamp 到图层数）
+   */
   constructor(host: HTMLElement, data: LottieData, bandCount: number) {
     this.host = host;
     this.width = Math.max(1, Number(data.w) || 1);
@@ -44,6 +52,8 @@ export class LottieBands {
     const totalSide = Math.max(this.width, this.height);
     // 限制每张纹理的最大边长，避免多层高分辨率画布带来过高的绘制与上传开销
     const maxTextureSide = 768;
+    // 画布像素比按“最长边不超过 768px”反推，并夹在 0.6–1.5 之间，
+    // 兼顾清晰度与多层纹理的上传/显存开销。
     const dpr = Math.max(0.6, Math.min(1.5, maxTextureSide / totalSide));
 
     const specs = splitIntoBands(data, bandCount);
@@ -98,10 +108,11 @@ export class LottieBands {
   }
 
   /**
-   * 把全部分层定位到同一帧。
+   * 把全部分层定位到同一帧（帧单位，非秒）。
    * @returns 帧是否发生变化（用于决定是否需要更新纹理）
    */
   seek(frame: number): boolean {
+    // 先夹到 [ip, op]，再与上次帧比较；1e-4 阈值避免浮点噪声导致每帧重复重绘。
     const clamped = Math.min(this.lastFrame, Math.max(this.firstFrame, frame));
     if (Number.isNaN(this.currentFrame) || Math.abs(clamped - this.currentFrame) > 1e-4) {
       this.currentFrame = clamped;
@@ -113,6 +124,7 @@ export class LottieBands {
     return false;
   }
 
+  /** 销毁所有 lottie 实例并移除 holder，避免重复加载时泄漏 canvas。 */
   destroy(): void {
     for (const animation of this.instances) {
       animation.destroy();

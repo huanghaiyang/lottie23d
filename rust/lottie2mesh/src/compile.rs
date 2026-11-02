@@ -1,6 +1,24 @@
-//! Scene compiler: walks Lottie layers (including precompositions), builds
-//! 3D meshes and bakes every sampled frame into compact transform / colour /
-//! vertex tracks that the three.js player can upload directly.
+//! 场景编译器：遍历 Lottie 图层（含预合成），构建 3D 网格，并把每个采样帧
+//! 烘焙成紧凑的变换 / 颜色 / 顶点轨迹，供 three.js 播放器直接上传。
+//!
+//! 模块职责：
+//! * 建立图层 `Plan` 树（含预合成 owner、parent 链、深度）；
+//! * 生成参考帧网格（`CompiledMesh::from_surface`）；
+//! * 逐帧计算世界矩阵、透明度、几何/颜色，写入轨迹；
+//! * B 方案拓扑分桶：按 `MeshBucket` 签名缓存多套 indices，帧间切换索引；
+//! * 解析并烘焙 AE「顶点跟随空对象」表达式。
+//!
+//! 关键数据流：
+//! ```text
+//! JSON → Lottie → Plan 树 → 参考帧网格 → bake 逐帧轨迹
+//!      → Compiled { meshes, transforms } → output::encode
+//! ```
+//!
+//! 单位与约定：
+//! * 几何 / 厚度为 Lottie 像素；时间为帧号；
+//! * 矩阵为**列主序 4×4**（three.js 约定），以列向量右乘，组合顺序为父在左；
+//! * 全局矩阵把画布缩放到 `3.6 / max(w, h)` 并翻转 Y；
+//! * 图层深度已烘焙进矩阵的 `[14]`（Z 平移）位置，播放器只需叠加滑杆增量；
 
 use std::collections::HashMap;
 
@@ -16,19 +34,22 @@ use crate::path::Contour;
 use crate::prop;
 use crate::shape::{self, Affine, DrawKind, Drawable, FollowContext, FollowSpecs, PathItem};
 
+/// 转换选项，可由 CLI 参数、C ABI 的 JSON 或默认值构造。
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct RawOptions {
+    /// 采样帧率（帧/秒）；缺省用文档 `fr`，并钳制到 6..120。
     pub fps: Option<f32>,
+    /// 烘焙帧数上限；缺省 600，钳制到 1..1200。
     #[serde(default)]
     pub max_frames: Option<usize>,
-    /// Extrusion half-thickness in Lottie pixels.
+    /// 挤出半厚度，单位 Lottie 像素；缺省为 `max(w,h) * 0.012`。
     pub thickness: Option<f32>,
-    /// Edge smoothing radius in Lottie pixels, clamped to the half-thickness.
+    /// 边缘圆角半径，单位 Lottie 像素，钳制到半厚度以内；缺省 0。
     #[serde(default, alias = "edgeRadius")]
     pub edge_radius: Option<f32>,
 }
 
-/// One cached topology: a signature plus the indices built for it.
+/// 一套缓存拓扑：签名 + 该签名下构建的 indices 与顶点规模。
 pub struct MeshBucket {
     pub signature: u64,
     pub slots: Vec<SlotPlan>,
@@ -37,28 +58,39 @@ pub struct MeshBucket {
     pub vertex_count: u32,
 }
 
+/// 编译后的单个网格。
 pub struct CompiledMesh {
+    /// 绘制类型：0 填充、1 描边。
     pub kind: u8,
+    /// 静态颜色 RGBA（各 0..1）；动画颜色走 `color_track`。
     pub static_color: [f32; 4],
+    /// 图层深度，用于排序与 Z 偏移。
     pub depth: f32,
+    /// 挤出半厚度（Lottie 像素）。
     pub half_thickness: f32,
+    /// 参考顶点缓冲 `[x, y, z]`，长度按最大桶的顶点数对齐。
     pub positions: Vec<f32>,
-    /// Per-frame vertices packed contiguously; `frame_offsets` holds the
-    /// start of every frame (in floats) so buckets may use different counts.
+    /// 逐帧顶点连续打包；`frame_offsets` 记录每帧起点（单位：float），
+    /// 因此不同拓扑桶可以有不同顶点数。
     pub frame_positions: Option<Vec<f32>>,
+    /// 每帧在 `frame_positions` 中的起始 float 下标，末尾额外多一项表示总长度。
     pub frame_offsets: Vec<u32>,
-    /// Bucket index used by each frame (empty while there is only one bucket).
+    /// 每帧使用的桶下标（只有一个桶时为空）。
     pub frame_buckets: Vec<u8>,
     pub buckets: Vec<MeshBucket>,
+    /// 基础桶的 indices 副本（兼容只上传一套索引的路径）。
     pub indices: Vec<u32>,
+    /// 逐帧颜色 RGBA；为空表示使用 `static_color`。
     pub color_track: Vec<f32>,
     pub transform_index: usize,
     pub render_order: u32,
+    /// 所有桶中最大的轮廓点数。
     pub point_count: u32,
     pub name: String,
 }
 
 impl CompiledMesh {
+    /// 由参考帧表面创建网格；`animated` 为真时预置空的逐帧顶点轨迹。
     fn from_surface(
         surface: MeshSurface,
         half: f32,
@@ -99,55 +131,81 @@ impl CompiledMesh {
     }
 }
 
+/// 整个场景的编译结果，编码前的最小模型。
 pub struct Compiled {
+    /// 画布宽高（Lottie 像素）。
     pub width: f32,
     pub height: f32,
+    /// 文档帧率（帧/秒）。
     pub frame_rate: f32,
+    /// 入点 / 出点（帧）。
     pub ip: f32,
     pub op: f32,
+    /// 实际采样帧率（可能因预算降采样而低于请求值）。
     pub sample_fps: f32,
     pub frame_count: usize,
     pub name: String,
+    /// 转换耗时（微秒）；wasm 下恒为 0。
     pub conversion_us: u32,
     pub meshes: Vec<CompiledMesh>,
+    /// 每条轨迹长度 `frame_count * 16`，列主序 4×4。
     pub transforms: Vec<Vec<f32>>,
 }
 
+/// 绘制项与网格的对应关系，用于逐帧把新颜色写回正确的网格。
 struct Blueprint {
     mesh_index: usize,
     color: [f32; 4],
 }
 
+/// 一个图层的编译计划（引用原始 `Layer`，避免复制 JSON）。
 struct Plan<'a> {
     layer: &'a Layer,
+    /// 所属预合成图层在 `plans` 中的下标；顶层为 `None`。
     owner: Option<usize>,
+    /// 父图层（`parent` 指向的 `ind`）在 `plans` 中的下标。
     parent: Option<usize>,
+    /// 深度（-0.65..0.65），已烘焙进世界矩阵的 Z 分量。
     depth: f32,
+    /// 该图层世界矩阵轨迹在 `transforms` 中的下标。
     transform_track: usize,
+    /// 该图层产生的网格下标。
     meshes: Vec<usize>,
+    /// 与 drawable 一一对应的网格蓝图；构建失败的 drawable 为 `None`。
     blueprints: Vec<Option<Blueprint>>,
     geometry_animated: bool,
     style_animated: bool,
-    /// Layer opacity (own or inherited) changes across the sampled range,
-    /// so mesh colours embedded the layer alpha must be baked per frame.
+    /// 图层透明度（自身或继承）在采样区间内变化，需要逐帧烘焙颜色 alpha。
     opacity_animated: bool,
+    /// 参考帧（用于构建参考几何）。
     ref_frame: f32,
-    /// Vertex-follow null expressions on this layer's shape paths.
+    /// 该图层形状路径上的顶点跟随空对象表达式。
     follows: Option<FollowSpecs>,
 }
 
+/// 编译期的全局状态。
 struct Compiler<'a> {
     frame_count: usize,
+    /// 采样区间起点（帧）与跨度（帧）。
     sample_start: f32,
     sample_span: f32,
     half: f32,
     edge_radius: f32,
+    /// 全局矩阵（列主序 4×4，含 3.6 缩放与 Y 翻转）。
     global: [f32; 16],
     meshes: Vec<CompiledMesh>,
     transforms: Vec<Vec<f32>>,
     plans: Vec<Plan<'a>>,
 }
 
+/// 编译入口：解析 JSON、建立图层计划、构建参考网格并逐帧烘焙。
+///
+/// 处理流程：
+/// 1. 读取画布/时间信息，确定采样帧数与厚度；
+/// 2. 递归展开图层与预合成（`build_comp`）；
+/// 3. 检测透明度动画、分配颜色轨迹；
+/// 4. 按 8M float 预算必要时降采样，再执行 `bake`；
+/// 5. 计算渲染顺序，返回 `Compiled`。
 pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> {
     #[cfg(not(target_arch = "wasm32"))]
     let started = Instant::now();
@@ -165,20 +223,24 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         .fps
         .unwrap_or(frame_rate)
         .clamp(6.0, 120.0);
+    // 采样帧数 = 时长（秒）× 采样 fps；再受 max_frames（默认 600）限制。
     let raw_frames = (((op - ip) / frame_rate) * sample_fps).round() as usize;
     let max_frames = raw_options.max_frames.unwrap_or(600).clamp(1, 1200);
     let frame_count = raw_frames.max(1).min(max_frames);
 
+    // 半厚度缺省为画布长边的 1.2%，并限制在 0.8% 以内；单位像素。
     let half = raw_options
         .thickness
         .unwrap_or_else(|| width.max(height) * 0.012)
         .clamp(0.01, width.max(height) * 0.08);
+    // 圆角半径不能超过半厚度，否则剖面会自交。
     let edge_radius = raw_options
         .edge_radius
         .unwrap_or(0.0)
         .clamp(0.0, half);
 
     let global = global_matrix(width, height);
+    // 参考帧取动画中点，兼顾开头与结尾的几何形态。
     let global_ref = (ip + op) * 0.5;
 
     let mut compiler = Compiler {
@@ -198,9 +260,8 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
     compiler.mark_opacity_animation();
     compiler.allocate_color_tracks();
 
-    // Performance guard: animated geometry is baked per frame. Cap the total
-    // float budget so heavy scenes stay inside a few tens of MB instead of
-    // hundreds, lowering the sampling rate only when necessary.
+    // 性能护栏：动画几何按帧烘焙。用 8M float 的总预算限制顶点数据量，
+    // 重场景自动降低采样帧数（最低保留 24 帧），而不是膨胀到数百 MB。
     let animated_floats: usize = compiler
         .meshes
         .iter()
@@ -215,6 +276,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         }
     }
 
+    // 以实际帧数反推有效采样 fps，供播放器换算时间。
     let sample_fps = compiler.frame_count as f32 / ((op - ip) / frame_rate).max(1e-4);
     let frame_count = compiler.frame_count;
     compiler.bake();
@@ -238,6 +300,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         transforms: compiler.transforms,
     };
 
+    // 渲染顺序：深度越大越靠后；同深度按网格下标稳定排序。
     for (index, mesh) in compiled.meshes.iter_mut().enumerate() {
         mesh.render_order = (((mesh.depth + 1.0) * 10000.0) as u32).saturating_add(index as u32);
     }
@@ -248,6 +311,11 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
 }
 
 impl<'a> Compiler<'a> {
+    /// 递归展开一个合成（顶层或预合成）的图层。
+    ///
+    /// `owner` 是承载该合成的预合成图层下标；`owner_ref` 为继承的参考帧。
+    /// 每个图层分配一条 16 float × 帧数 的世界矩阵轨迹，并按 `ind` 建立
+    /// 父子关系（`parent`）。
     fn build_comp(
         &mut self,
         doc: &'a Lottie,
@@ -270,6 +338,8 @@ impl<'a> Compiler<'a> {
             } else {
                 0.5
             };
+            // 深度按图层在合成中的顺序均分：越靠前的图层越靠前（z 越大），
+            // 子合成在其 owner 深度附近再压缩到 0.16 的范围。
             let depth = match owner {
                 Some(parent) => self.plans[parent].depth + (0.5 - local_t) * 0.16,
                 None => 0.5 - local_t,
@@ -314,6 +384,10 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// 按图层类型构建内容：4 形状层、1 纯色层、0 预合成层。
+    ///
+    /// 预合成会递归展开资源内的图层，并把参考帧换算到子合成时间
+    /// （`(ref - st) / sr`），时间拉伸 `sr` 不能为 0。
     fn build_content(&mut self, doc: &'a Lottie, id: usize) {
         let layer = self.plans[id].layer;
         match layer.ty {
@@ -334,10 +408,15 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// 构建形状图层的参考帧网格。
+    ///
+    /// 参考帧用与烘焙时相同的顶点跟随上下文求值，保证参考拓扑与动画中
+    /// 真实出现的拓扑一致；每个 drawable 单独生成一个网格。
     fn build_shape_layer(&mut self, id: usize, layer: &'a Layer) {
-        // Reference geometry is sampled in layer-local time, like property eval.
+        // 参考几何在图层局部时间采样，与属性求值保持一致。
         let frame = self.plans[id].ref_frame - layer.st;
         let follows = self.collect_follows(id, &layer.shapes);
+        // 顶点跟随也是几何动画的来源之一。
         let geometry_animated = shape::geometry_animated(&layer.shapes)
             || follows.as_ref().map(|specs| !specs.map.is_empty()).unwrap_or(false);
         let style_animated = shape::style_animated(&layer.shapes);
@@ -348,8 +427,7 @@ impl<'a> Compiler<'a> {
             plan.follows = follows.clone();
         }
 
-        // Build the reference frame with the same vertex-follow context used
-        // while baking, so topology matches the real animation.
+        // 参考帧使用与烘焙时相同的顶点跟随上下文，保证拓扑一致。
         let result = match &follows {
             Some(specs) => {
                 let plan_count = self.plans.len();
@@ -386,6 +464,7 @@ impl<'a> Compiler<'a> {
                 self.plans[id].blueprints.push(None);
                 continue;
             };
+            // 最终颜色 alpha = 样式 alpha × 样式 opacity；图层透明度在烘焙期再乘。
             let color = [
                 drawable.color[0],
                 drawable.color[1],
@@ -411,11 +490,13 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// 构建纯色层：把矩形区域当作一个填充 drawable，颜色从 `#rrggbb` 解析。
     fn build_solid_layer(&mut self, id: usize, layer: &'a Layer) {
         let sw = layer.solid_width.max(1.0);
         let sh = layer.solid_height.max(1.0);
         let rgb = parse_hex(&layer.solid_color);
         let contour = Contour {
+            // 纯色层局部坐标原点为左上角，尺寸单位为像素。
             pts: vec![
                 [0.0, 0.0],
                 [sw, 0.0],
@@ -459,8 +540,7 @@ impl<'a> Compiler<'a> {
         }));
     }
 
-    /// Shrink the baked frame budget. Only valid before [`Compiler::bake`],
-    /// while all tracks still hold placeholder zeros.
+    /// 收紧烘焙帧预算；只能在 [`Compiler::bake`] 之前调用（轨迹仍为占位 0）。
     fn resize_frames(&mut self, new_count: usize) {
         if new_count >= self.frame_count {
             return;
@@ -470,8 +550,8 @@ impl<'a> Compiler<'a> {
             track.resize(new_count * 16, 0.0);
         }
         for mesh in self.meshes.iter_mut() {
-            // Frame vertices are appended during bake (sizes may vary per
-            // topology bucket), so only pre-allocated tracks are resized.
+            // 逐帧顶点在 bake 阶段追加（不同拓扑桶的顶点数可能不同），
+            // 这里只重置预分配轨迹，不按固定长度扩容。
             if mesh.frame_positions.is_some() {
                 mesh.frame_positions = Some(Vec::new());
                 mesh.frame_offsets.clear();
@@ -483,8 +563,10 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Walk the shape tree and resolve `vertex follows null` expressions to
-    /// layer plan ids of the same composition.
+    /// 遍历形状树，把「顶点跟随空对象」表达式解析为同一合成内的 plan id。
+    ///
+    /// 返回 `None` 表示该图层没有顶点跟随表达式；每个键是形状的索引路径，
+    /// 值中的 `usize::MAX` 表示同名空对象未找到（运行时退回原位）。
     fn collect_follows(&self, id: usize, shapes: &[Value]) -> Option<FollowSpecs> {
         let owner = self.plans[id].owner;
         let mut specs = FollowSpecs::default();
@@ -497,9 +579,11 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Mark every plan whose layer alpha varies over the sampled range. Owners
-    /// always own a lower plan index than their composition children, so one
-    /// forward pass is enough to propagate inherited opacity animation.
+    /// 标记采样区间内图层 alpha 会变化的 plan。
+    ///
+    /// 合成 owner 的 plan 下标总小于其子图层，因此单次正序遍历即可把
+    /// 「父级透明度动画 / 父级时间伸缩」的动画状态传给子图层；图层在采样
+    /// 区间内不完整可见时也视为动态（需要逐帧写 alpha）。
     fn mark_opacity_animation(&mut self) {
         let sample_start = self.sample_start;
         let sample_end = self.sample_start + self.sample_span;
@@ -528,8 +612,10 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Allocate per-frame colour tracks only for meshes whose colour or layer
-    /// alpha actually changes; constant colours stay in the mesh record.
+    /// 仅为颜色或图层 alpha 真正变化的网格分配逐帧颜色轨迹。
+    ///
+    /// 轨迹每帧 4 个 f32（RGBA）；常量颜色保留在 mesh record 的
+    /// `static_color` 中，不占用轨迹空间。
     fn allocate_color_tracks(&mut self) {
         let mut flags: Vec<(usize, bool)> = Vec::new();
         for plan in &self.plans {
@@ -544,6 +630,13 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// 逐帧烘焙：写出所有图层的世界矩阵、动态颜色与几何顶点。
+    ///
+    /// 第 i 帧根合成时间为 `sample_start + sample_span * i / frame_count`。
+    /// 变换写入 16 float 列主序矩阵；几何变化时按拓扑签名选桶，把该帧顶点
+    /// 追加到 `frame_positions`，并在 `frame_offsets` 中记录每帧起始的 float
+    /// 下标（末尾再补一个总数作为结束哨兵）。最后把初始顶点补齐到所有桶中
+    /// 的最大顶点数，保证播放时可直接按桶切换索引。
     fn bake(&mut self) {
         let frame_count = self.frame_count;
         let sample_start = self.sample_start;
@@ -553,7 +646,9 @@ impl<'a> Compiler<'a> {
             .filter(|&id| !self.plans[id].blueprints.is_empty())
             .collect();
 
-        // Caches are reused for every frame instead of reallocated per frame.
+        // 所有缓存只分配一次，每帧清零复用，避免逐帧重新分配。
+        // world_cache 存最终世界矩阵，chain_cache 存父级链矩阵，
+        // opacity_cache 存累计 alpha，frame_cache 存图层局部帧。
         let mut world_cache: Vec<Option<[f32; 16]>> = vec![None; plan_count];
         let mut chain_cache: Vec<Option<[f32; 16]>> = vec![None; plan_count];
         let mut opacity_cache: Vec<Option<f32>> = vec![None; plan_count];
@@ -562,6 +657,7 @@ impl<'a> Compiler<'a> {
         let mut scratch = mesh::FrameScratch::default();
 
         for frame_index in 0..frame_count {
+            // 根合成时间按采样区间线性分摊到 frame_count 帧。
             let root_frame = sample_start + sample_span * (frame_index as f32 / frame_count as f32);
             for cache in world_cache.iter_mut() {
                 *cache = None;
@@ -587,6 +683,7 @@ impl<'a> Compiler<'a> {
                     &mut opacity_cache,
                     &mut frame_cache,
                 );
+                // 每帧每位图层写 16 个 f32（列主序 4×4），轨迹按帧紧密排列。
                 let track = self.plans[id].transform_track;
                 let slot = &mut self.transforms[track]
                     [frame_index * 16..(frame_index + 1) * 16];
@@ -601,8 +698,7 @@ impl<'a> Compiler<'a> {
                 let opacity = opacity_cache[id].unwrap_or(0.0);
                 let local_frame = frame_cache[id].unwrap_or(root_frame);
                 let geometry_animated = plan.geometry_animated;
-                // Geometry-only / style-only animations avoid evaluating what
-                // they do not need: style animation skips path flattening.
+                // 只动几何或只动样式时按需求值：纯样式动画跳过路径扁平化。
                 let evaluated = if geometry_animated {
                     match &plan.follows {
                         Some(specs) => {
@@ -648,6 +744,8 @@ impl<'a> Compiler<'a> {
                     let mesh = &mut meshes[blueprint.mesh_index];
 
                     if dynamic_color {
+                        // 动态颜色：取当帧 drawable 的颜色与自身透明度，
+                        // 再乘图层累计 alpha 写入 RGBA 轨迹。
                         let drawable = evaluated
                             .as_ref()
                             .and_then(|result| result.drawables.get(drawable_index));
@@ -668,8 +766,8 @@ impl<'a> Compiler<'a> {
                         let base = frame_index * 4;
                         mesh.color_track[base..base + 4].copy_from_slice(&color);
                     } else if frame_index == 0 {
-                        // Constant colour: fold the static layer alpha into the
-                        // mesh record so no colour track is needed at all.
+                        // 静态颜色：把图层常量 alpha 折进 mesh record，
+                        // 这样完全不需要颜色轨迹。
                         mesh.static_color = [
                             blueprint.color[0],
                             blueprint.color[1],
@@ -679,6 +777,7 @@ impl<'a> Compiler<'a> {
                     }
 
                     if geometry_animated {
+                        // 默认沿用基础拓扑桶（下标 0）。
                         let start = mesh
                             .frame_positions
                             .as_ref()
@@ -695,6 +794,8 @@ impl<'a> Compiler<'a> {
                                 let natural = mesh::plan_slots(&slots);
                                 let signature = mesh::slot_signature(&natural);
                                 if let Some(sig) = signature {
+                                    // 量化签名相同则复用已有桶；否则在桶上限内
+                                    // 新建一套（槽位计划 + indices + 点数）。
                                     if let Some(position) = mesh
                                         .buckets
                                         .iter()
@@ -730,6 +831,7 @@ impl<'a> Compiler<'a> {
                                     (bucket.vertex_count as usize * 3, bucket.slots.as_slice())
                                 };
                                 if let Some(track) = mesh.frame_positions.as_mut() {
+                                    // 本帧顶点追加到轨迹尾部；写入失败则回滚长度。
                                     let write_start = track.len();
                                     track.resize(write_start + count, 0.0);
                                     if !mesh::write_frame_with_slots(
@@ -746,7 +848,9 @@ impl<'a> Compiler<'a> {
                                 }
                             }
                         }
-                        // Offsets stay aligned even when a frame has no drawable.
+                        // 即使本帧没有有效 drawable，偏移表也要保持每帧一项。
+                        // frame_offsets 记录 float 下标（不是顶点数），与
+                        // frame_positions 的长度单位一致。
                         mesh.frame_offsets.push(start as u32);
                         mesh.frame_buckets.push(bucket_index as u8);
                     }
@@ -754,8 +858,10 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        // Close the per-frame offset table and pad the initial positions so
-        // every bucket (which may need more vertices) fits the vertex buffer.
+        // 收尾：补齐偏移表并扩张初始顶点缓冲。
+        // 每个桶可能比参考桶需要更多顶点，因此 positions 要按所有桶的最大
+        // 顶点数对齐；未使用的尾部填 0。frame_offsets 再追加总长度作为
+        // 最后一帧的结束哨兵（长度 = frame_count + 1）。
         for mesh in self.meshes.iter_mut() {
             if mesh.frame_positions.is_none() {
                 mesh.frame_offsets.clear();
@@ -782,10 +888,14 @@ impl<'a> Compiler<'a> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Vertex-follow expressions                                           */
+/* 顶点跟随表达式                                                       */
 /* ------------------------------------------------------------------ */
 
-/// Null layer names are resolved within the shape layer's own composition.
+/// 在形状图层自身所在的合成内解析空对象名称，并记录形状的索引路径。
+///
+/// 递归进入 `gr` 组的子项；遇到带顶点跟随表达式的 `sh` 形状时，把目标空
+/// 对象解析为同 owner 下同名图层的 plan id（未找到记为 `usize::MAX`），
+/// 并以当前索引链 `path` 作为键写入 `specs.map`。
 fn collect_follows_inner(
     plans: &[Plan],
     owner: Option<usize>,
@@ -793,6 +903,7 @@ fn collect_follows_inner(
     path: &mut Vec<usize>,
     specs: &mut FollowSpecs,
 ) {
+    // 未找到目标空对象时的占位 plan id。
     const MISSING: usize = usize::MAX;
     for (index, item) in items.iter().enumerate() {
         match item.get("ty").and_then(Value::as_str).unwrap_or("") {
@@ -826,7 +937,10 @@ fn collect_follows_inner(
     }
 }
 
-/// Composition-space anchor position of a layer with its parent chain baked.
+/// 图层锚点在合成坐标系中的位置（父级链已烘焙）。
+///
+/// 返回 `[x, y]`（Lottie 像素）：用图层链矩阵 [`plan_chain`] 变换锚点
+/// `a`，即 `fromCompToSurface` 反变换的目标位置。
 fn comp_anchor(
     plans: &[Plan],
     id: usize,
@@ -843,7 +957,9 @@ fn comp_anchor(
     ]
 }
 
-/// Resolve every referenced null layer once per frame into `out`.
+/// 每帧把被引用的空对象锚点位置解析到 `out`，按 plan 下标索引。
+///
+/// 同一目标只计算一次；未被引用的位置保持 `None`。
 fn fill_follow_positions(
     plans: &[Plan],
     specs: &FollowSpecs,
@@ -869,7 +985,9 @@ fn fill_follow_positions(
     }
 }
 
-/// Inverse of the shape layer's composition matrix (`fromCompToSurface`).
+/// 形状图层合成矩阵的逆（对应表达式 `fromCompToSurface`）。
+///
+/// 把合成坐标换算回图层局部坐标；矩阵不可逆时退回单位变换。
 fn layer_inverse(
     plans: &[Plan],
     id: usize,
@@ -891,12 +1009,18 @@ fn layer_inverse(
 }
 
 /* ------------------------------------------------------------------ */
-/* Matrices                                                            */
+/* 矩阵工具                                                             */
 /* ------------------------------------------------------------------ */
 
+/// 全局归一化矩阵：把 Lottie 画布映射到 three.js 常用的世界尺寸。
+///
+/// 缩放系数为 `3.6 / max(width, height)`（three.js 中参考相机高度约 3.6
+/// 单位）；Y 轴取负，完成屏幕坐标（Y 向下）到世界坐标（Y 向上）的翻转；
+/// 平移把画布中心移到原点。返回 16 float 列主序 4×4 矩阵。
 fn global_matrix(width: f32, height: f32) -> [f32; 16] {
     let size = width.max(height).max(1.0);
     let scale = 3.6 / size;
+    // 列主序排列：[a, b, 0, 0, c, d, 0, 0, 0, 0, s, 0, tx, ty, 0, 1]。
     [
         scale, 0.0, 0.0, 0.0,
         0.0, -scale, 0.0, 0.0,
@@ -905,6 +1029,10 @@ fn global_matrix(width: f32, height: f32) -> [f32; 16] {
     ]
 }
 
+/// 4×4 列主序矩阵乘法 `out = a * b`（`b` 先作用）。
+///
+/// 与列向量约定一致：对 `p' = a * b * p`，先由 `b` 变换再由 `a` 变换；
+/// 元素按 `out[col * 4 + row]` 存放。
 fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut out = [0.0f32; 16];
     for col in 0..4 {
@@ -919,6 +1047,7 @@ fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     out
 }
 
+/// 把 2D 仿射 [`Affine`] 提升为 4×4 列主序矩阵（Z 保持不变）。
 fn affine_matrix(matrix: Affine) -> [f32; 16] {
     [
         matrix.a, matrix.b, 0.0, 0.0,
@@ -928,11 +1057,14 @@ fn affine_matrix(matrix: Affine) -> [f32; 16] {
     ]
 }
 
+/// 计算图层自身坐标系下的时间（单位：帧）。
+///
+/// 父合成按时间伸缩 `sr` 换算子图层时间（`renderedFrame = num / sr`），
+/// lottie-web 的属性求值再相对图层起始时间 `st` 偏移。
 fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
     let parent_frame = match plans[id].owner {
         Some(owner) => {
-            // The owning precomposition renders its children in time divided
-            // by its stretch (`renderedFrame = num / sr`).
+            // 父合成按时间伸缩 sr 换算子图层时间（renderedFrame = num / sr）。
             let owner_frame = plan_local_frame(plans, owner, root_frame);
             let owner_layer = plans[owner].layer;
             let stretch = if owner_layer.sr.abs() > 1e-3 {
@@ -944,10 +1076,11 @@ fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
         }
         None => root_frame,
     };
-    // lottie-web evaluates a layer's properties relative to its start time.
+    // lottie-web 的属性时间相对图层起始时间 st。
     parent_frame - plans[id].layer.st
 }
 
+/// 图层在给定合成时间（帧）是否可见；`ip == op` 视为始终可见。
 fn visible(layer: &Layer, frame: f32) -> bool {
     if layer.op <= layer.ip {
         true
@@ -956,10 +1089,15 @@ fn visible(layer: &Layer, frame: f32) -> bool {
     }
 }
 
+/// 图层不透明度（0..1）：求值后钳制到 0..100 再除以 100。
 fn layer_opacity(layer: &Layer, frame: f32) -> f32 {
     prop::eval_scalar(&layer.ks, "o", frame, 100.0).clamp(0.0, 100.0) / 100.0
 }
 
+/// 图层自身到父级链的累计仿射矩阵（不含全局归一化矩阵）。
+///
+/// 结果缓存在 `cache`；`frame_cache` 同时记录图层的局部帧，供上层复用。
+/// 乘法顺序遵循列向量约定：先应用子图层局部变换，再应用父级链。
 fn plan_chain(
     plans: &[Plan],
     id: usize,
@@ -974,6 +1112,7 @@ fn plan_chain(
     let local = affine_matrix(shape::transform_matrix(&plans[id].layer.ks, frame));
     let matrix = match plans[id].parent {
         Some(parent) => {
+            // 父矩阵在左：p' = parent * local * p，即先局部后父级。
             let parent_matrix = plan_chain(plans, parent, root_frame, cache, frame_cache);
             mat_mul(&parent_matrix, &local)
         }
@@ -984,6 +1123,11 @@ fn plan_chain(
     matrix
 }
 
+/// 图层最终世界矩阵与累计不透明度。
+///
+/// 世界矩阵 = 父级（owner 合成或全局归一化矩阵）* 图层链矩阵，并把图层
+/// 深度写入 `world[14]` 完成深度烘焙；返回值第二项为 `0..1` 的累计 alpha
+/// （父级与自身可见性相乘）。
 fn plan_world(
     plans: &[Plan],
     global: &[f32; 16],
@@ -1012,11 +1156,10 @@ fn plan_world(
         None => (*global, 1.0),
     };
     let mut world = mat_mul(&base, &chain);
-    // Bake the layer depth into the track so the player can upload the matrix
-    // as-is (the depth slider only adds a delta).
+    // 把图层深度烘焙进矩阵，播放器可直接上传，深度滑块只需再叠加增量。
     world[14] += plans[id].depth;
     let frame = frame_cache[id].unwrap_or_else(|| plan_local_frame(plans, id, root_frame));
-    // `ip` / `op` live in the parent composition's time, not layer-local time.
+    // ip / op 位于父合成时间轴，需要用「局部帧 + st」换回合成时间。
     let comp_frame = frame + plans[id].layer.st;
     let own = if visible(plans[id].layer, comp_frame) {
         layer_opacity(plans[id].layer, frame)
@@ -1029,6 +1172,8 @@ fn plan_world(
     (world, opacity)
 }
 
+/// 解析 `#RRGGBB`（或 6 位十六进制）颜色为归一化 RGB（0..1）；
+/// 解析失败时退回浅灰 `[0.8, 0.8, 0.8]`。
 fn parse_hex(value: &str) -> [f32; 3] {
     let text = value.trim().trim_start_matches('#');
     if text.len() >= 6 {
@@ -1043,7 +1188,7 @@ fn parse_hex(value: &str) -> [f32; 3] {
     [0.8, 0.8, 0.8]
 }
 
-/// Layer types that this converter understands.
+/// 本转换器支持的图层类型：0 预合成、1 纯色、4 形状。
 pub fn is_supported_layer(layer: &Value) -> bool {
     matches!(
         layer.get("ty").and_then(Value::as_i64).unwrap_or(-1),
