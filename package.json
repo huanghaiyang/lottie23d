@@ -6,18 +6,21 @@
   "description": "Rust converter that extrudes Lottie vector animations into 3D meshes, played back with three.js",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vite build",
     "build:wasm": "node scripts/build-wasm.mjs",
     "convert": "node sdk/cli.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "lottie-web": "^5.12.2",
-    "three": "^0.170.0"
+    "three": "^0.170.0",
+    "vue": "^3.5.44"
   },
   "devDependencies": {
     "@types/three": "^0.170.0",
+    "@vitejs/plugin-vue": "^5.2.4",
     "typescript": "^5.6.3",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.12"
   }
 }
