@@ -343,6 +343,51 @@ body {
   overflow-y: auto;
 }
 
+/* Thin, dark scrollbars for the parameter and node lists. */
+.inspector-body,
+.node-list {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(122, 162, 255, 0.32) transparent;
+  scrollbar-gutter: stable;
+}
+
+.inspector-body::-webkit-scrollbar,
+.node-list::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.inspector-body::-webkit-scrollbar-track,
+.node-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.inspector-body::-webkit-scrollbar-thumb,
+.node-list::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(122, 162, 255, 0.3);
+  background-clip: padding-box;
+  transition: background 0.16s ease;
+}
+
+.inspector-body::-webkit-scrollbar-thumb:hover,
+.node-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(122, 162, 255, 0.55);
+  background-clip: padding-box;
+}
+
+.inspector-body::-webkit-scrollbar-thumb:active,
+.node-list::-webkit-scrollbar-thumb:active {
+  background: rgba(61, 139, 255, 0.7);
+  background-clip: padding-box;
+}
+
+.inspector-body::-webkit-scrollbar-corner,
+.node-list::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 .inspector-row {
   display: grid;
   grid-template-columns: 58px minmax(0, 1fr) 54px;
@@ -368,6 +413,105 @@ body {
   margin-top: 2px;
   padding-top: 8px;
   border-top: 1px solid var(--line);
+}
+
+/* ------------------------------------------------------------- node list */
+
+.node-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.node-count {
+  color: #cfd8ee;
+  font-variant-numeric: tabular-nums;
+}
+
+.node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 188px;
+  overflow-y: auto;
+}
+
+.node-empty {
+  padding: 6px 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.node-row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+}
+
+.node-row:hover {
+  color: var(--text);
+  background: rgba(122, 162, 255, 0.08);
+}
+
+.node-row.is-selected {
+  color: #e8f1ff;
+  border-color: rgba(61, 139, 255, 0.65);
+  background: rgba(61, 139, 255, 0.14);
+}
+
+.node-glow {
+  width: 8px;
+  height: 8px;
+  margin: 0 auto;
+  border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  background: transparent;
+  transition: background 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.node-glow.is-on {
+  border-color: rgba(255, 217, 122, 0.85);
+  background: #ffd97a;
+  box-shadow: 0 0 8px rgba(255, 217, 122, 0.75);
+}
+
+.node-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.node-type {
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.55);
+}
+
+.node-hint {
+  margin: 0;
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.55);
 }
 
 .pane-badge {

@@ -37,6 +37,19 @@ export interface MeshModel {
   name: string;
 }
 
+export interface NodeModel {
+  /** Index in render order; also the index into `meshes`. */
+  id: number;
+  /** Layer name plus drawable name, e.g. "Dot A · 光晕". */
+  name: string;
+  /** 0 = fill, 1 = stroke. */
+  kind: number;
+  animated: boolean;
+  vertexCount: number;
+  indexCount: number;
+  renderOrder: number;
+}
+
 export interface Model {
   version: number;
   width: number;
@@ -57,6 +70,8 @@ export interface Model {
   /** Column-major 4×4 world matrices per frame. */
   transforms: Float32Array[];
   meshes: MeshModel[];
+  /** Flat node list in render order (id indexes into `meshes`). */
+  nodes: NodeModel[];
 }
 
 export interface Converter {

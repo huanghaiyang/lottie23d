@@ -8,7 +8,7 @@ import TransportBar from './components/TransportBar.vue';
 import InspectorPanel from './components/InspectorPanel.vue';
 import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
-import { AXIS_LABELS, Stage, type ViewAxis } from './scene/stage';
+import { AXIS_LABELS, Stage, type StageNode, type ViewAxis } from './scene/stage';
 
 const SOURCES = [
   { id: 'orbit', label: '星轨' },
@@ -30,9 +30,14 @@ const depth = ref(1);
 const thickness = ref(1);
 const edgeRatio = ref(0);
 const sampleFps = ref(30);
-const autoRotate = ref(true);
+const autoRotate = ref(false);
 const axisLock = ref(false);
 const activeAxis = ref<ViewAxis | null>(null);
+const nodes = ref<StageNode[]>([]);
+const selectedIds = ref<number[]>([]);
+const softGlow = ref(false);
+const nodeGlow = reactive<Record<number, boolean>>({});
+let selectionAnchor = -1;
 const progress = ref(0);
 const frameLabel = ref('000 / 000');
 const fps = ref(0);
@@ -179,6 +184,56 @@ function onAxisPick(axis: ViewAxis): void {
   stage?.setRotationLock(true);
 }
 
+function syncNodes(): void {
+  nodes.value = model?.nodes ? [...model.nodes] : [];
+  selectedIds.value = [];
+  selectionAnchor = -1;
+  for (const key of Object.keys(nodeGlow)) {
+    delete nodeGlow[Number(key)];
+  }
+  stage?.setSelection([]);
+}
+
+/**
+ * Plain click selects one node, Shift extends a range from the anchor and
+ * Alt (or Ctrl) toggles the node inside a multi-selection.
+ */
+function onNodeSelect(
+  id: number,
+  modifiers: { shift: boolean; alt: boolean; ctrl: boolean },
+): void {
+  const list = nodes.value;
+  if (modifiers.alt || modifiers.ctrl) {
+    const selected = new Set(selectedIds.value);
+    if (selected.has(id)) {
+      selected.delete(id);
+    } else {
+      selected.add(id);
+    }
+    selectedIds.value = list.filter((node) => selected.has(node.id)).map((node) => node.id);
+    selectionAnchor = id;
+  } else if (modifiers.shift && selectionAnchor >= 0) {
+    const from = list.findIndex((node) => node.id === selectionAnchor);
+    const to = list.findIndex((node) => node.id === id);
+    if (from >= 0 && to >= 0) {
+      const start = Math.min(from, to);
+      const end = Math.max(from, to);
+      selectedIds.value = list.slice(start, end + 1).map((node) => node.id);
+    }
+  } else {
+    selectedIds.value = [id];
+    selectionAnchor = id;
+  }
+  stage?.setSelection(selectedIds.value);
+}
+
+/** Per-node glow flag; nodes default to enabled once the master switch is on. */
+function toggleNodeGlow(id: number): void {
+  const next = nodeGlow[id] === false;
+  nodeGlow[id] = next;
+  stage?.setNodeGlow(id, next);
+}
+
 function convertOptions(): ConvertOptions {
   const options: ConvertOptions = { fps: sampleFps.value };
   const half = model?.meshes[0]?.halfThickness ?? 0;
@@ -223,6 +278,7 @@ function reconvert(): void {
   convertKey = key;
   model = converted;
   stage?.setModel(converted);
+  syncNodes();
   time = ratio * duration;
   syncScene(true);
   applyStats(converted, elapsed);
@@ -267,6 +323,7 @@ async function loadDocument(data: LottieData, id: string): Promise<void> {
   model = converted;
   animation = createAnimation(data);
   stage?.setModel(converted);
+  syncNodes();
 
   time = 0;
   syncScene(true);
@@ -419,12 +476,14 @@ watch(axisLock, (value) => {
 });
 watch(edgeRatio, scheduleReconvert);
 watch(sampleFps, scheduleReconvert);
+watch(softGlow, (value) => stage?.setSoftGlow(value));
 
 onMounted(() => {
   stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick });
   stage.setDepthScale(depth.value);
   stage.setThicknessScale(thickness.value);
   stage.setAutoRotate(autoRotate.value);
+  stage.setSoftGlow(softGlow.value);
 
   rafId = requestAnimationFrame(tick);
   window.addEventListener('keydown', onKeyDown);
@@ -496,6 +555,12 @@ onBeforeUnmount(() => {
             v-model:sample-fps="sampleFps"
             v-model:auto-rotate="autoRotate"
             v-model:axis-lock="axisLock"
+            v-model:soft-glow="softGlow"
+            :nodes="nodes"
+            :selected="selectedIds"
+            :glow="nodeGlow"
+            @select-node="onNodeSelect"
+            @toggle-node-glow="toggleNodeGlow"
           />
           <span class="canvas-hint">
             {{

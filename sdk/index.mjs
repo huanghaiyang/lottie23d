@@ -175,7 +175,19 @@ export function parseModel(bytes) {
   }
   meshes.sort((a, b) => a.renderOrder - b.renderOrder);
 
-  return { ...meta, transforms, meshes };
+  // Stable node list for UIs and external tools. Node ids follow the render
+  // order, which is the same order three.js builds its meshes in.
+  const nodes = meshes.map((mesh, id) => ({
+    id,
+    name: mesh.name,
+    kind: mesh.kind,
+    animated: mesh.animated,
+    vertexCount: mesh.vertexCount,
+    indexCount: mesh.indexCount,
+    renderOrder: mesh.renderOrder,
+  }));
+
+  return { ...meta, transforms, meshes, nodes };
 }
 
 /** Instantiate the converter. Pass a URL/path/bytes to override the default wasm. */

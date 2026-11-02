@@ -9,6 +9,16 @@ export interface StageCallbacks {
   onAxisPick?: (axis: ViewAxis) => void;
 }
 
+/** One selectable mesh as exposed to the UI / external API. */
+export interface StageNode {
+  id: number;
+  name: string;
+  kind: number;
+  animated: boolean;
+  vertexCount: number;
+  indexCount: number;
+}
+
 export const AXIS_LABELS: Record<ViewAxis, string> = {
   x: '+X',
   '-x': '-X',
@@ -38,8 +48,35 @@ const AXIS_COLORS: Record<ViewAxis, number> = {
   '-z': 0x466a9f,
 };
 
-const AXIS_HOME = new THREE.Vector3(0, 1.15, 7.2);
+/** Default view: straight on +Z (Blender front view). */
+const AXIS_HOME = new THREE.Vector3(0, 0, 7.2);
 const VIEW_TWEEN_MS = 320;
+
+const SELECTION_COLOR = 0x3d8bff;
+const GLOW_SCALE = 0.25;
+const GLOW_OPACITY = 0.8;
+
+const FULLSCREEN_VERTEX = `
+varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}
+`;
+
+const GAUSSIAN_BLUR = `
+uniform sampler2D source;
+uniform vec2 direction;
+varying vec2 vUv;
+void main() {
+  vec4 sum = texture2D(source, vUv) * 0.2270270270;
+  sum += texture2D(source, vUv + direction * 1.3846153846) * 0.3162162162;
+  sum += texture2D(source, vUv - direction * 1.3846153846) * 0.3162162162;
+  sum += texture2D(source, vUv + direction * 3.2307692308) * 0.0702702703;
+  sum += texture2D(source, vUv - direction * 3.2307692308) * 0.0702702703;
+  gl_FragColor = sum;
+}
+`;
 
 interface Entry {
   data: MeshModel;
@@ -94,6 +131,36 @@ export class Stage {
   private lowFpsWindows = 0;
   private readonly observer: ResizeObserver;
   private readonly callbacks: StageCallbacks;
+  private readonly nodes: StageNode[] = [];
+
+  /** Per-node selection wires (blue 1px cuboids). */
+  private readonly selectionBoxes = new Map<number, THREE.Box3Helper>();
+  private readonly boxScratch = new THREE.Box3();
+
+  /** Soft glow: per-node silhouettes blurred and added over the main image. */
+  private softGlow = false;
+  private readonly glowFlags = new Map<number, boolean>();
+  private readonly glowMeshes = new Map<number, THREE.Mesh>();
+  private readonly glowScene = new THREE.Scene();
+  private glowRead: THREE.WebGLRenderTarget | null = null;
+  private glowWrite: THREE.WebGLRenderTarget | null = null;
+  private glowWidth = 0;
+  private glowHeight = 0;
+  private glowCompositeMaterial: THREE.MeshBasicMaterial | null = null;
+  private readonly glowQuadScene = new THREE.Scene();
+  private readonly glowQuadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private readonly glowQuadGeometry = new THREE.PlaneGeometry(2, 2);
+  private readonly glowQuad = new THREE.Mesh(this.glowQuadGeometry);
+  private readonly glowBlurMaterial = new THREE.ShaderMaterial({
+    vertexShader: FULLSCREEN_VERTEX,
+    fragmentShader: GAUSSIAN_BLUR,
+    uniforms: {
+      source: { value: null },
+      direction: { value: new THREE.Vector2(1, 0) },
+    },
+    depthTest: false,
+    depthWrite: false,
+  });
 
   /** Blender-style orientation gizmo rendered in the top-left corner. */
   private readonly gizmoScene = new THREE.Scene();
@@ -169,7 +236,7 @@ export class Stage {
     this.controls.rotateSpeed = 0.85;
     this.controls.minDistance = 2.4;
     this.controls.maxDistance = 18;
-    this.controls.autoRotate = true;
+    this.controls.autoRotate = false;
     this.controls.autoRotateSpeed = 0.65;
     this.controls.addEventListener('change', () => {
       this.dirty = true;
@@ -185,6 +252,8 @@ export class Stage {
     this.scene.add(ambient, key, rim, fill);
 
     this.buildGizmo();
+    this.glowQuad.frustumCulled = false;
+    this.glowQuadScene.add(this.glowQuad);
     // Capture on the container so the gizmo click is handled before
     // OrbitControls' canvas listeners start a drag.
     host.addEventListener('pointerdown', this.onGizmoPointerDown, true);
@@ -203,12 +272,14 @@ export class Stage {
     this.clear();
     this.model = model;
     this.frameIndex = -1;
+    this.nodes.length = 0;
+    this.glowFlags.clear();
 
     // Meshes of the same layer share a transform track; detect statically
     // transformed layers only once per track.
     const staticTracks = new Map<number, boolean>();
 
-    for (const data of model.meshes) {
+    for (const [id, data] of model.meshes.entries()) {
       const positionsAnimated = data.animated && data.framePositions != null;
       const positions = positionsAnimated
         ? new Float32Array(data.positions)
@@ -272,9 +343,77 @@ export class Stage {
         position,
         positionsAnimated,
       });
+      this.nodes.push({
+        id,
+        name: data.name || `节点 ${id + 1}`,
+        kind: data.kind,
+        animated: data.animated,
+        vertexCount: data.vertexCount,
+        indexCount: data.indexCount,
+      });
     }
 
     this.applyFrame(0);
+    this.syncGlowMeshes();
+    this.dirty = true;
+  }
+
+  /** Node list in render order; ids match `setSelection` ids. */
+  getNodes(): readonly StageNode[] {
+    return this.nodes;
+  }
+
+  /** Selected node ids; also drives the blue wire cuboids. */
+  setSelection(ids: readonly number[]): void {
+    const wanted = new Set<number>();
+    for (const id of ids) {
+      if (id >= 0 && id < this.entries.length) {
+        wanted.add(id);
+      }
+    }
+
+    for (const [id, helper] of this.selectionBoxes) {
+      if (!wanted.has(id)) {
+        this.scene.remove(helper);
+        helper.geometry.dispose();
+        (helper.material as THREE.Material).dispose();
+        this.selectionBoxes.delete(id);
+      }
+    }
+
+    for (const id of wanted) {
+      if (this.selectionBoxes.has(id)) {
+        continue;
+      }
+      const helper = new THREE.Box3Helper(new THREE.Box3(), SELECTION_COLOR);
+      (helper.material as THREE.LineBasicMaterial).depthTest = false;
+      helper.renderOrder = 12;
+      helper.visible = false;
+      this.scene.add(helper);
+      this.selectionBoxes.set(id, helper);
+    }
+
+    this.updateSelectionBoxes();
+    this.dirty = true;
+  }
+
+  /** Toggle the global soft-glow pass. */
+  setSoftGlow(enabled: boolean): void {
+    if (this.softGlow === enabled) {
+      return;
+    }
+    this.softGlow = enabled;
+    this.syncGlowMeshes();
+    this.dirty = true;
+  }
+
+  /** Enable / disable glow for a single node. */
+  setNodeGlow(id: number, enabled: boolean): void {
+    if (this.glowFlags.get(id) === enabled) {
+      return;
+    }
+    this.glowFlags.set(id, enabled);
+    this.syncGlowMeshes();
     this.dirty = true;
   }
 
@@ -390,10 +529,12 @@ export class Stage {
 
     const width = Math.max(1, this.host.clientWidth);
     const height = Math.max(1, this.host.clientHeight);
+    this.updateSelectionBoxes();
     this.renderer.setViewport(0, 0, width, height);
     this.renderer.setScissorTest(false);
     this.renderer.clear();
     this.renderer.render(this.scene, this.camera);
+    this.renderGlow(width, height);
     this.renderGizmo(width, height);
     this.dirty = false;
   }
@@ -403,6 +544,7 @@ export class Stage {
     this.host.removeEventListener('pointerdown', this.onGizmoPointerDown, true);
     this.host.removeEventListener('pointerup', this.onGizmoPointerUp, true);
     this.clear();
+    this.disposeGlow();
     this.disposeGizmo();
     this.controls.dispose();
     this.renderer.dispose();
@@ -470,12 +612,21 @@ export class Stage {
   }
 
   private clear(): void {
+    for (const helper of this.selectionBoxes.values()) {
+      this.scene.remove(helper);
+      helper.geometry.dispose();
+      (helper.material as THREE.Material).dispose();
+    }
+    this.selectionBoxes.clear();
+    this.clearGlowMeshes();
+
     for (const entry of this.entries) {
       this.scene.remove(entry.mesh);
       entry.geometry.dispose();
       entry.material.dispose();
     }
     this.entries.length = 0;
+    this.nodes.length = 0;
     this.model = null;
   }
 
@@ -486,6 +637,209 @@ export class Stage {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.dirty = true;
+  }
+
+  // ------------------------------------------------------- selection & glow
+
+  private updateSelectionBoxes(): void {
+    for (const [id, helper] of this.selectionBoxes) {
+      const entry = this.entries[id];
+      if (entry == null) {
+        helper.visible = false;
+        continue;
+      }
+      this.boxScratch.setFromBufferAttribute(entry.position);
+      this.boxScratch.applyMatrix4(entry.mesh.matrixWorld);
+      if (this.boxScratch.isEmpty()) {
+        helper.visible = false;
+        continue;
+      }
+      helper.box.copy(this.boxScratch);
+      helper.visible = true;
+    }
+  }
+
+  private isNodeGlowEnabled(id: number): boolean {
+    return this.glowFlags.get(id) !== false;
+  }
+
+  /** Create / drop glow shells so only enabled nodes take part in the pass. */
+  private syncGlowMeshes(): void {
+    if (!this.softGlow) {
+      this.clearGlowMeshes();
+      this.dirty = true;
+      return;
+    }
+
+    const wanted = new Set<number>();
+    for (let id = 0; id < this.entries.length; id += 1) {
+      if (this.isNodeGlowEnabled(id)) {
+        wanted.add(id);
+      }
+    }
+
+    for (const [id, mesh] of this.glowMeshes) {
+      if (wanted.has(id)) {
+        continue;
+      }
+      this.glowScene.remove(mesh);
+      (mesh.material as THREE.Material).dispose();
+      this.glowMeshes.delete(id);
+    }
+
+    for (const id of wanted) {
+      if (this.glowMeshes.has(id)) {
+        continue;
+      }
+      const entry = this.entries[id];
+      if (entry == null) {
+        continue;
+      }
+      const material = new THREE.MeshBasicMaterial({
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: false,
+        depthWrite: false,
+        toneMapped: false,
+      });
+      const mesh = new THREE.Mesh(entry.geometry, material);
+      mesh.matrixAutoUpdate = false;
+      mesh.matrixWorldAutoUpdate = false;
+      mesh.frustumCulled = false;
+      this.glowScene.add(mesh);
+      this.glowMeshes.set(id, mesh);
+    }
+
+    this.dirty = true;
+  }
+
+  private clearGlowMeshes(): void {
+    for (const mesh of this.glowMeshes.values()) {
+      this.glowScene.remove(mesh);
+      (mesh.material as THREE.Material).dispose();
+    }
+    this.glowMeshes.clear();
+  }
+
+  private ensureGlowTargets(width: number, height: number): boolean {
+    const targetWidth = Math.max(64, Math.floor(width * GLOW_SCALE));
+    const targetHeight = Math.max(64, Math.floor(height * GLOW_SCALE));
+    if (
+      this.glowRead != null &&
+      this.glowWrite != null &&
+      this.glowWidth === targetWidth &&
+      this.glowHeight === targetHeight
+    ) {
+      return true;
+    }
+
+    this.glowRead?.dispose();
+    this.glowWrite?.dispose();
+    const options = {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    };
+    this.glowRead = new THREE.WebGLRenderTarget(targetWidth, targetHeight, options);
+    this.glowWrite = new THREE.WebGLRenderTarget(targetWidth, targetHeight, options);
+    this.glowWidth = targetWidth;
+    this.glowHeight = targetHeight;
+    return true;
+  }
+
+  /**
+   * Additive soft glow: render only the enabled meshes, blur the result at a
+   * quarter resolution and composite it over the already-rendered scene.
+   */
+  private renderGlow(width: number, height: number): void {
+    if (!this.softGlow || this.glowMeshes.size === 0) {
+      return;
+    }
+    this.ensureGlowTargets(width, height);
+    const read = this.glowRead;
+    const write = this.glowWrite;
+    if (read == null || write == null) {
+      return;
+    }
+
+    for (const [id, mesh] of this.glowMeshes) {
+      const entry = this.entries[id];
+      if (entry == null) {
+        continue;
+      }
+      mesh.matrixWorld.copy(entry.mesh.matrixWorld);
+      mesh.visible = entry.mesh.visible;
+      const material = mesh.material as THREE.MeshBasicMaterial;
+      material.color.copy(entry.material.color);
+      material.opacity = entry.material.opacity;
+    }
+
+    this.renderer.setClearColor(0x000000, 1);
+    this.renderer.setScissorTest(false);
+    this.renderer.setRenderTarget(read);
+    this.renderer.clear(true, false, false);
+    this.renderer.render(this.glowScene, this.camera);
+
+    this.glowQuad.material = this.glowBlurMaterial;
+    this.glowBlurMaterial.uniforms.source.value = read.texture;
+    (this.glowBlurMaterial.uniforms.direction.value as THREE.Vector2).set(
+      1 / this.glowWidth,
+      0,
+    );
+    this.renderer.setRenderTarget(write);
+    this.renderer.clear(true, false, false);
+    this.renderer.render(this.glowQuadScene, this.glowQuadCamera);
+
+    this.glowBlurMaterial.uniforms.source.value = write.texture;
+    (this.glowBlurMaterial.uniforms.direction.value as THREE.Vector2).set(
+      0,
+      1 / this.glowHeight,
+    );
+    this.renderer.setRenderTarget(read);
+    this.renderer.clear(true, false, false);
+    this.renderer.render(this.glowQuadScene, this.glowQuadCamera);
+
+    let composite = this.glowCompositeMaterial;
+    if (composite == null) {
+      composite = new THREE.MeshBasicMaterial({
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthTest: false,
+        depthWrite: false,
+        opacity: GLOW_OPACITY,
+        toneMapped: false,
+      });
+      this.glowCompositeMaterial = composite;
+    }
+    if (composite.map !== read.texture) {
+      const firstMap = composite.map == null;
+      composite.map = read.texture;
+      if (firstMap) {
+        composite.needsUpdate = true;
+      }
+    }
+
+    this.renderer.setRenderTarget(null);
+    this.renderer.setViewport(0, 0, width, height);
+    this.renderer.setScissorTest(false);
+    this.renderer.clearDepth();
+    this.glowQuad.material = composite;
+    this.renderer.render(this.glowQuadScene, this.glowQuadCamera);
+    this.renderer.setClearColor(0x000000, 0);
+  }
+
+  private disposeGlow(): void {
+    this.clearGlowMeshes();
+    this.glowRead?.dispose();
+    this.glowWrite?.dispose();
+    this.glowRead = null;
+    this.glowWrite = null;
+    this.glowCompositeMaterial?.dispose();
+    this.glowCompositeMaterial = null;
+    this.glowBlurMaterial.dispose();
+    this.glowQuadGeometry.dispose();
+    this.glowQuadScene.clear();
   }
 
   // -------------------------------------------------------------- axis gizmo
