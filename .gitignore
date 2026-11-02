@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+rust/lottie2mesh/target/
+*.l2d3
+*.log
+.vite/
+.screenshots/
+.trae-html-share-packages/
+.DS_Store
+Thumbs.db

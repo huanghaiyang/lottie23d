@@ -1,0 +1,23 @@
+{
+  "name": "lottie23d",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Rust converter that extrudes Lottie vector animations into 3D meshes, played back with three.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "convert": "node sdk/cli.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lottie-web": "^5.12.2",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.170.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.7"
+  }
+}
