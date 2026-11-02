@@ -298,7 +298,7 @@ function createOrbitSample(): LottieData {
       'Aster',
       [ellipseGroup([92, 92], '#ffd7a0'), ellipseGroup([64, 64], '#ffe8be')],
       { pos: [196, 0, 0] },
-      { parent: 10 },
+      { parent: 100 },
     ),
   );
   ind += 1;
@@ -321,7 +321,7 @@ function createOrbitSample(): LottieData {
   ind += 1;
 
   layerList.push(
-    nullLayer(10, 'Orbiter A', {
+    nullLayer(100, 'Orbiter A', {
       pos: [320, 320, 0],
       rot: animate([
         { t: 0, v: [0] },
@@ -332,7 +332,7 @@ function createOrbitSample(): LottieData {
 
   // 青色行星
   layerList.push(
-    shapeLayer(ind, 'Cyan', [ellipseGroup([58, 58], '#8fe6ff')], { pos: [-150, 0, 0] }, { parent: 20 }),
+    shapeLayer(ind, 'Cyan', [ellipseGroup([58, 58], '#8fe6ff')], { pos: [-150, 0, 0] }, { parent: 200 }),
   );
   ind += 1;
 
@@ -344,7 +344,7 @@ function createOrbitSample(): LottieData {
   ind += 1;
 
   layerList.push(
-    nullLayer(20, 'Orbiter B', {
+    nullLayer(200, 'Orbiter B', {
       pos: [320, 320, 0],
       rot: animate([
         { t: 0, v: [0] },
