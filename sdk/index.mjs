@@ -130,6 +130,10 @@ export function parseModel(bytes) {
     const colorTrackOffset = view.getUint32(record + 52, true);
     const pointCount = view.getUint32(record + 64, true);
     const name = readString(buffer, view.getUint32(record + 68, true), view.getUint32(record + 72, true));
+    const bucketCount = view.getUint32(record + 76, true);
+    const bucketTableOffset = view.getUint32(record + 80, true);
+    const frameOffsetsOffset = view.getUint32(record + 84, true);
+    const frameBucketOffset = view.getUint32(record + 88, true);
 
     const positions = new Float32Array(
       buffer.buffer,
@@ -145,13 +149,53 @@ export function parseModel(bytes) {
             meta.frameCount * 4,
           )
         : null;
+
+    // v2 packs every frame contiguously, so buckets may use different vertex
+    // counts; the offset table marks where each frame starts.
+    const frameOffsets =
+      flags & 4
+        ? new Uint32Array(
+            buffer.buffer,
+            buffer.byteOffset + frameOffsetsOffset,
+            meta.frameCount + 1,
+          )
+        : null;
     const framePositions =
       flags & 1
         ? new Float32Array(
             buffer.buffer,
             buffer.byteOffset + framePositionsOffset,
-            meta.frameCount * vertexCount * 3,
+            frameOffsets ? frameOffsets[meta.frameCount] : meta.frameCount * vertexCount * 3,
           )
+        : null;
+
+    // Topology buckets: one cached index set per sampled contour layout.
+    let buckets;
+    if (flags & 8 && bucketCount > 0) {
+      buckets = new Array(bucketCount);
+      for (let b = 0; b < bucketCount; b += 1) {
+        const entry = bucketTableOffset + b * 16;
+        const bucketIndicesOffset = view.getUint32(entry, true);
+        const bucketIndexCount = view.getUint32(entry + 4, true);
+        const bucketVertexCount = view.getUint32(entry + 8, true);
+        const bucketPointCount = view.getUint32(entry + 12, true);
+        buckets[b] = {
+          indices: new Uint32Array(
+            buffer.buffer,
+            buffer.byteOffset + bucketIndicesOffset,
+            bucketIndexCount,
+          ),
+          indexCount: bucketIndexCount,
+          vertexCount: bucketVertexCount,
+          pointCount: bucketPointCount,
+        };
+      }
+    } else {
+      buckets = [{ indices, indexCount, vertexCount, pointCount }];
+    }
+    const frameBuckets =
+      flags & 8 && frameBucketOffset
+        ? new Uint8Array(buffer.buffer, buffer.byteOffset + frameBucketOffset, meta.frameCount)
         : null;
 
     meshes[index] = {
@@ -166,6 +210,9 @@ export function parseModel(bytes) {
       pointCount,
       positions,
       framePositions,
+      frameOffsets,
+      frameBuckets,
+      buckets,
       indices,
       colors,
       transformIndex: view.getUint32(record + 56, true),

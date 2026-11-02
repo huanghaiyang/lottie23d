@@ -11,6 +11,14 @@ export interface ConvertOptions {
   edgeRadius?: number;
 }
 
+export interface MeshBucket {
+  /** Cached triangle indices for this topology. */
+  indices: Uint32Array;
+  indexCount: number;
+  vertexCount: number;
+  pointCount: number;
+}
+
 export interface MeshModel {
   index: number;
   /** 0 = fill, 1 = stroke. */
@@ -22,13 +30,21 @@ export interface MeshModel {
   /** Layer depth in normalised [-0.65, 0.65] space. */
   depth: number;
   halfThickness: number;
+  /** Largest vertex count across all topology buckets. */
   vertexCount: number;
   indexCount: number;
   pointCount: number;
   /** Static vertex positions, xyz interleaved. */
   positions: Float32Array;
-  /** Baked positions, frameCount × vertexCount × 3, or null. */
+  /** Baked positions packed frame by frame (see `frameOffsets`), or null. */
   framePositions: Float32Array | null;
+  /** Start of every frame in floats (frameCount + 1 entries), or null. */
+  frameOffsets: Uint32Array | null;
+  /** Topology bucket index per frame, or null when there is a single bucket. */
+  frameBuckets: Uint8Array | null;
+  /** Cached index sets per topology; always at least one entry. */
+  buckets: MeshBucket[];
+  /** Indices of the first bucket (kept for simple consumers). */
   indices: Uint32Array;
   /** RGBA per frame, frameCount × 4, or null when the colour is constant. */
   colors: Float32Array | null;

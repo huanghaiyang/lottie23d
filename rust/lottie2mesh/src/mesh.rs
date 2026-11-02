@@ -9,6 +9,12 @@ use crate::shape::{DrawKind, Drawable};
 /// Number of segments in each quarter-round of a smoothed edge.
 const ROUND_SEGMENTS: usize = 3;
 
+/// Minimum / maximum resampled points per contour.
+const MIN_K: usize = 6;
+const MAX_K: usize = 128;
+/// Hard cap on topology buckets per mesh (frames beyond it reuse the closest).
+pub const MAX_BUCKETS: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct SlotPlan {
     pub k: usize,
@@ -69,6 +75,61 @@ pub fn build_surface(
     if slots.is_empty() {
         return None;
     }
+    let plans = plan_slots(&slots);
+    build_surface_from_slots(drawable, &slots, plans, half_thickness, edge_radius)
+}
+
+/// Natural resampling density for one contour (4 px spacing, like lottie-web).
+pub fn natural_k(contour: &Contour) -> usize {
+    let length = contour.length();
+    if length < 1e-4 {
+        4
+    } else {
+        ((length / 4.0).ceil() as usize).clamp(MIN_K, MAX_K)
+    }
+}
+
+pub fn plan_slots(slots: &[(Cow<'_, Contour>, bool, bool)]) -> Vec<SlotPlan> {
+    slots
+        .iter()
+        .map(|(contour, closed, _)| SlotPlan {
+            k: natural_k(contour),
+            closed: *closed,
+            hole: false,
+        })
+        .collect()
+}
+
+/// Bucket signature for B-scheme topology caching: contour count, quantised
+/// resampling density and closure of every slot. Quantising k keeps the
+/// bucket count small while still letting the density follow shape size.
+/// `None` means "too many slots", in which case the mesh keeps its base
+/// topology (A behaviour).
+pub fn slot_signature(plans: &[SlotPlan]) -> Option<u64> {
+    if plans.len() > 8 {
+        return None;
+    }
+    let mut signature = plans.len() as u64;
+    for (index, plan) in plans.iter().enumerate() {
+        let kq = ((plan.k + 7) / 8) as u64;
+        let bits = (kq << 1) | plan.closed as u64;
+        signature |= bits << (4 + index * 6);
+    }
+    Some(signature)
+}
+
+/// Build the surface for an explicit slot list (used when a new topology
+/// bucket is discovered while baking).
+pub fn build_surface_from_slots(
+    drawable: &Drawable,
+    slots: &[(Cow<'_, Contour>, bool, bool)],
+    mut plans: Vec<SlotPlan>,
+    half_thickness: f32,
+    edge_radius: f32,
+) -> Option<MeshSurface> {
+    if slots.is_empty() || plans.len() != slots.len() {
+        return None;
+    }
 
     // Only fills get rounded edges; stroke ribbons keep the sharp profile.
     let radius = if drawable.kind == DrawKind::Fill {
@@ -78,24 +139,7 @@ pub fn build_surface(
     };
     let stride = profile_stride(radius);
 
-    let mut plans: Vec<SlotPlan> = slots
-        .iter()
-        .map(|(contour, closed, _)| {
-            let length = contour.length();
-            let k = if length < 1e-4 {
-                4
-            } else {
-                ((length / 4.0).ceil() as usize).clamp(6, 128)
-            };
-            SlotPlan {
-                k,
-                closed: *closed,
-                hole: false,
-            }
-        })
-        .collect();
-
-    let points = build_points(drawable, &slots, &plans)?;
+    let points = build_points(drawable, slots, &plans)?;
     if drawable.kind == DrawKind::Fill && radius > 0.0 {
         let holes = classify_holes(&points, &plans);
         for (plan, hole) in plans.iter_mut().zip(holes) {
@@ -136,6 +180,8 @@ pub struct FrameScratch {
     sampled: Vec<Vec<[f32; 2]>>,
     points: Vec<[f32; 2]>,
     normals: Vec<[f32; 2]>,
+    /// Natural slot plans for the current frame (topology signature input).
+    pub plans: Vec<SlotPlan>,
 }
 
 /// Rebuild vertex positions for another frame, writing straight into the
@@ -149,6 +195,20 @@ pub fn write_frame(
     scratch: &mut FrameScratch,
 ) -> bool {
     let slots = crate::shape::drawable_slots(drawable);
+    write_frame_with_slots(drawable, &slots, plans, half_thickness, edge_radius, out, scratch)
+}
+
+/// Same as [`write_frame`] but accepts pre-computed slots (the compiler
+/// already has them from the bucket signature pass).
+pub fn write_frame_with_slots(
+    drawable: &Drawable,
+    slots: &[(Cow<'_, Contour>, bool, bool)],
+    plans: &[SlotPlan],
+    half_thickness: f32,
+    edge_radius: f32,
+    out: &mut [f32],
+    scratch: &mut FrameScratch,
+) -> bool {
     if slots.is_empty() {
         return false;
     }

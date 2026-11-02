@@ -90,6 +90,10 @@ interface Entry {
   colors: Float32Array | null;
   position: THREE.BufferAttribute;
   positionsAnimated: boolean;
+  /** One index buffer per topology bucket (always at least one). */
+  indexAttributes: THREE.BufferAttribute[];
+  /** Bucket currently bound to the geometry (drives the index attribute). */
+  currentBucket: number;
   /** Visibility derived from the base alpha, before manual hiding. */
   staticVisible: boolean;
 }
@@ -294,7 +298,10 @@ export class Stage {
       const position = new THREE.BufferAttribute(positions, 3);
       position.setUsage(positionsAnimated ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
       geometry.setAttribute('position', position);
-      geometry.setIndex(new THREE.BufferAttribute(data.indices, 1));
+      const indexAttributes = data.buckets.map(
+        (bucket) => new THREE.BufferAttribute(bucket.indices, 1),
+      );
+      geometry.setIndex(indexAttributes[0]);
 
       const track = model.transforms[data.transformIndex] ?? null;
       let transformStatic = staticTracks.get(data.transformIndex);
@@ -348,6 +355,8 @@ export class Stage {
         colors,
         position,
         positionsAnimated,
+        indexAttributes,
+        currentBucket: 0,
         staticVisible,
       });
       this.nodes.push({
@@ -649,11 +658,33 @@ export class Stage {
       }
 
       if (entry.positionsAnimated && data.framePositions) {
-        const count = data.vertexCount * 3;
-        const offset = frame * count;
-        if (offset + count <= data.framePositions.length) {
-          position.array.set(data.framePositions.subarray(offset, offset + count));
-          position.needsUpdate = true;
+        const offsets = data.frameOffsets;
+        if (offsets != null) {
+          const start = offsets[frame] ?? 0;
+          const end = offsets[frame + 1] ?? start;
+          if (end > start) {
+            position.array.set(data.framePositions.subarray(start, end));
+            position.needsUpdate = true;
+          }
+        } else {
+          // Legacy layout: every frame reserves the maximum vertex count.
+          const count = data.vertexCount * 3;
+          const offset = frame * count;
+          if (offset + count <= data.framePositions.length) {
+            position.array.set(data.framePositions.subarray(offset, offset + count));
+            position.needsUpdate = true;
+          }
+        }
+      }
+
+      // Switch the cached index set when the contour topology changes.
+      const buckets = entry.indexAttributes;
+      if (buckets.length > 1) {
+        const bucket = data.frameBuckets?.[frame] ?? 0;
+        const wanted = bucket < buckets.length ? bucket : 0;
+        if (wanted !== entry.currentBucket) {
+          entry.currentBucket = wanted;
+          entry.geometry.setIndex(buckets[wanted]);
         }
       }
     }
@@ -690,6 +721,28 @@ export class Stage {
 
   // ------------------------------------------------------- selection & glow
 
+  /** Tight box over the vertices actually used by the current bucket. */
+  private setBoxFromPositions(
+    box: THREE.Box3,
+    array: ArrayLike<number>,
+    vertexCount: number,
+  ): void {
+    box.makeEmpty();
+    const limit = Math.min(vertexCount, Math.floor(array.length / 3)) * 3;
+    const { min, max } = box;
+    for (let i = 0; i < limit; i += 3) {
+      const x = array[i];
+      const y = array[i + 1];
+      const z = array[i + 2];
+      if (x < min.x) min.x = x;
+      if (y < min.y) min.y = y;
+      if (z < min.z) min.z = z;
+      if (x > max.x) max.x = x;
+      if (y > max.y) max.y = y;
+      if (z > max.z) max.z = z;
+    }
+  }
+
   private updateSelectionBoxes(): void {
     for (const [id, helper] of this.selectionBoxes) {
       const entry = this.entries[id];
@@ -697,7 +750,12 @@ export class Stage {
         helper.visible = false;
         continue;
       }
-      this.boxScratch.setFromBufferAttribute(entry.position);
+      const bucket = entry.data.buckets[entry.currentBucket] ?? entry.data.buckets[0];
+      this.setBoxFromPositions(
+        this.boxScratch,
+        entry.position.array,
+        bucket ? bucket.vertexCount : entry.data.vertexCount,
+      );
       this.boxScratch.applyMatrix4(entry.mesh.matrixWorld);
       if (this.boxScratch.isEmpty()) {
         helper.visible = false;

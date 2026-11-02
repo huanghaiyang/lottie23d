@@ -204,5 +204,5 @@ pub extern "C" fn l2d_error_len() -> u32 {
 /// ABI version, bumped when the exported surface changes.
 #[no_mangle]
 pub extern "C" fn l2d_version() -> u32 {
-    1
+    2
 }

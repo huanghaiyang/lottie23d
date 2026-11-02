@@ -67,7 +67,7 @@ l2d_dealloc(jsonPtr, jsonLen)
 { "fps": 30, "max_frames": 600, "thickness": 8, "edge_radius": 3 }
 ```
 
-字段均可省略；`edge_radius` 也接受别名 `edgeRadius`。`l2d_version()` 当前返回 `1`，ABI 或二进制格式变化时递增。
+字段均可省略；`edge_radius` 也接受别名 `edgeRadius`。`l2d_version()` 当前返回 `2`，ABI 或二进制格式变化时递增。
 
 ---
 
@@ -279,7 +279,7 @@ k = clamp(ceil(arc_length / 4), 6, 128)   // 退化轮廓用 4
 ├──────────────────────────────┤
 │ transform tracks 16 f32 × F × T │
 ├──────────────────────────────┤
-│ data chunks：静态顶点 / 帧顶点 / 索引 / 颜色 / 网格名 │
+│ data chunks：静态顶点 / 帧顶点 / 索引桶 / 颜色 / 桶表 / 帧偏移 / 网格名 │
 ├──────────────────────────────┤
 │ 文档名（4 字节对齐）          │
 └──────────────────────────────┘
@@ -290,7 +290,7 @@ k = clamp(ceil(arc_length / 4), 6, 128)   // 退化轮廓用 4
 | 偏移 | 类型 | 含义 |
 |---|---|---|
 | 0 | u32 | magic `0x4C323344`（"L23D"） |
-| 4 | u32 | 版本，当前 `1` |
+| 4 | u32 | 版本，当前 `2` |
 | 8 / 12 | f32 | 画布宽 / 高 |
 | 16 | f32 | 文档帧率 |
 | 20 / 24 | f32 | `ip` / `op` |
@@ -311,21 +311,25 @@ k = clamp(ceil(arc_length / 4), 6, 128)   // 退化轮廓用 4
 | 偏移 | 类型 | 含义 |
 |---|---|---|
 | 0 | u32 | `kind`：`0` 填充 / `1` 描边 |
-| 4 | u32 | flags：bit0 有帧顶点轨道，bit1 有颜色轨道 |
+| 4 | u32 | flags：bit0 有帧顶点轨道，bit1 有颜色轨道，bit2 有帧顶点偏移表，bit3 有多个拓扑桶 |
 | 8 / 12 / 16 / 20 | f32 | 静态颜色 RGBA（sRGB，0–1） |
 | 24 | f32 | Z 深度 |
 | 28 | f32 | 挤出半厚度（Lottie 像素） |
-| 32 | u32 | 顶点数 |
-| 36 | u32 | 索引数 |
+| 32 | u32 | 顶点数（所有拓扑桶的最大值） |
+| 36 | u32 | 索引数（桶 0） |
 | 40 | u32 | 静态顶点偏移（3 × f32） |
-| 44 | u32 | 帧顶点偏移（`frame_count × 3 × f32`，无则 0） |
-| 48 | u32 | 索引偏移（u32） |
+| 44 | u32 | 帧顶点偏移（按 `frame_offsets` 连续打包，无则 0） |
+| 48 | u32 | 索引偏移（桶 0 的 u32 索引） |
 | 52 | u32 | 颜色轨道偏移（`frame_count × 4 × f32`，无则 0） |
 | 56 | u32 | 变换轨道索引 |
 | 60 | u32 | 渲染顺序 |
 | 64 | u32 | 参考轮廓点数（未计 `stride`） |
 | 68 / 72 | u32 | 网格名偏移 / 长度 |
-| 76 起 | — | 保留 |
+| 76 | u32 | 拓扑桶数量 |
+| 80 | u32 | 桶表偏移（每桶 16 B：索引偏移 / 索引数 / 顶点数 / 轮廓点数） |
+| 84 | u32 | 帧顶点偏移表偏移（`frame_count + 1` 个 u32，单位为 float） |
+| 88 | u32 | 帧拓扑桶表偏移（`frame_count` 个 u8） |
+| 92 | — | 保留 |
 
 ### 9.3 变换轨道
 
@@ -342,8 +346,8 @@ mesh.matrixWorld.fromArray(track, frame * 16);
 ### 9.4 数据块
 
 - 参考顶点：`vertex_count × 3` f32，位于图层局部坐标（已烘焙组变换与挤出 Z），最终位置由变换轨道中的世界矩阵决定。
-- 帧顶点：`frame_count × vertex_count × 3` f32，按帧连续排列。
-- 索引：`index_count` u32。
+- 帧顶点：按帧连续打包，`frame_offsets[f]` 到 `frame_offsets[f + 1]`（单位 float）是本帧的顶点区间；不同拓扑桶的顶点数可以不同。
+- 索引桶：每桶一份 `index_count` u32 索引；桶表记录各桶的偏移、索引数、顶点数与轮廓点数。
 - 颜色轨道：`frame_count × 4` f32（RGBA，sRGB）。
 - 字符串：UTF-8，尾部补零到 4 字节对齐。
 
@@ -374,7 +378,7 @@ mesh.matrixWorld.fromArray(track, frame * 16);
 }
 ```
 
-`MeshModel` 包含 `positions`、`framePositions`、`indices`、`colors`、`transformIndex`、`renderOrder`、`depth`、`halfThickness`、`kind`、`name` 等字段（完整声明见 [`sdk/index.d.mts`](../sdk/index.d.mts)）。
+`MeshModel` 包含 `positions`、`framePositions`、`frameOffsets`、`frameBuckets`、`buckets`、`indices`、`colors`、`transformIndex`、`renderOrder`、`depth`、`halfThickness`、`kind`、`name` 等字段（完整声明见 [`sdk/index.d.mts`](../sdk/index.d.mts)）。`buckets[0].indices` 与 `indices` 相同，便于只关心单一拓扑的调用方。
 
 浏览器端部署时，把 `public/wasm/lottie2mesh.wasm` 放到站点根目录的 `wasm/` 下即可；也可显式传入 URL。
 
@@ -396,13 +400,15 @@ mesh.matrixWorld.fromArray(track, frame * 16);
 matrixWorld.fromArray(track, frame * 16)
 elements[14] += depth * (depthScale - 1)      // 层深滑块
 elements[2/6/10] *= thicknessScale            // 厚度滑块（等价后乘 scale(1,1,t)）
-position.array.set(framePositions.subarray(offset, offset + count))
+position.array.set(framePositions.subarray(frameOffsets[f], frameOffsets[f + 1]))
 position.needsUpdate = true
+geometry.setIndex(indexAttributes[frameBuckets[f]])   // 拓扑变化时切换
 ```
 
 - 全程静态的变换轨道只上传一次（`isConstantTrack`）。
 - 颜色动画直接写 `material.color.setRGB(..., SRGBColorSpace)` 与 `opacity`。
 - 透明度低于 `0.004` 的网格直接 `visible = false`，跳过绘制。
+- 每套拓扑桶的索引属性只创建一次；切换到相同桶时不做任何绑定。
 
 ### 11.3 脏渲染
 
@@ -432,10 +438,11 @@ position.needsUpdate = true
 
 ### 12.1 转换期
 
-- 三角化只在参考帧执行一次；逐帧只做弧长重采样 + 写顶点。
+- 每个拓扑桶只三角化一次；逐帧只做弧长重采样 + 写顶点，遇到新签名才建桶。
 - 每层每帧的世界矩阵与透明度带缓存，父子链不重复计算。
 - 复用 `FrameScratch`、世界矩阵缓存与局部帧缓存，烘焙过程零逐帧分配。
 - 仅几何动画时才展平路径；仅样式动画时跳过几何。
+- 顶点跟随表达式每帧只解析一次空对象位置（`fill_follow_positions`），多个 drawable 共享。
 
 ### 12.2 内存预算
 
@@ -476,8 +483,8 @@ position.needsUpdate = true
 ## 14. 已知限制与取舍
 
 1. **2.5D**：不还原真实 3D 图层的 `rx/ry`、Z 位置与透视相机；只使用 `rz` 与自动分层深度。
-2. **不支持图层**：图片（`ty:2`）、文本（`ty:5`）、蒙版、轨道遮罩、表达式、效果器。
-3. **形变按弧长对应**：为保持固定拓扑，逐帧重采样到同一 `k`，因此形变是“弧长对应”而非 lottie 的逐顶点对应；轮廓数量或闭合性变化时退化为切换/塌陷。
+2. **不支持图层**：图片（`ty:2`）、文本（`ty:5`）、蒙版、轨道遮罩、效果器。表达式只识别“顶点跟随空对象”一种模式（见 §14.2），其余表达式忽略。
+3. **形变按桶切换**：轮廓数量 / 密度 / 闭合性变化时按拓扑签名切换索引桶（最多 8 套），桶内按弧长对应；超出 8 套时回退到桶 0 的固定拓扑。
 4. **渐变近似**：`gf` / `gs` 取首色作为纯色。
 5. **`ind` 必须唯一**：同一合成内重复 `ind` 会导致父级挂错（lottie-web 按 `ind` 遍历所有图层，重复属于非法数据）。
 6. **修剪模式**：忽略 `tm` 的 `m`（同时/逐个）字段，统一按每条轮廓各自的归一化弧长裁剪，等价于“逐个”语义；多轮廓场景与 lottie-web 的“同时”模式可能存在差异。
@@ -485,13 +492,39 @@ position.needsUpdate = true
 
 ### 14.1 形变能力的三档方案
 
-当前采用 A 档；如需更高保真度，可按需升级：
+当前采用 B 档；C 档保留为后续选项：
 
 | 方案 | 做法 | 代价 |
 |---|---|---|
-| A（现状） | 固定 `k`，弧长重采样 | 顶点对应与 lottie 不完全一致，但零重建、零分配 |
-| B | 按拓扑签名（轮廓数 + 顶点数 + 闭合性）分桶缓存多套 indices | 帧间可能切换索引，需额外显存与切换逻辑 |
-| C | 每帧重新三角化 | 保真度最高，但每帧 CPU 成本高，不适合浏览器实时播放 |
+| A（基础） | 固定 `k`，弧长重采样 | 顶点对应与 lottie 不完全一致，但零重建、零分配 |
+| B（已实现） | 按拓扑签名（轮廓数 + 量化密度 + 闭合性）分桶缓存多套 indices，帧间切换索引 | 每桶一份索引显存；切换时重建 `geometry.index`；最多 8 桶 |
+| C（未实现） | 每帧重新三角化 | 保真度最高，但每帧 CPU 成本高，不适合浏览器实时播放 |
+
+B 档细节：
+
+- 签名对 `k` 做 8 步量化（`(k + 7) / 8`），避免逐帧轻微长度变化产生大量几乎相同的桶。
+- 帧顶点不再按 `frame_count × max_vertex_count` 预留，而是按帧连续打包，由 `frame_offsets` 表定位；因此各桶可以有不同顶点数。
+- 帧级 `frame_buckets` 记录本帧使用的桶；只有单桶时不写桶表，格式开销为零。
+- 桶内仍按弧长重采样，所以 B 档提升的是“拓扑正确性”，不是逐顶点对应。
+
+### 14.2 顶点跟随空对象表达式
+
+`starfish.json` 这类 AE 导出会把路径顶点绑定到空对象：
+
+```js
+var nullLayerNames = [ 'Shape Layer 1: Path 1 [1.0]', ... ];
+for (...) origPoints[i] = fromCompToSurface(nullLayer.toComp(nullLayer.anchorPoint));
+$bm_rt = createPath(origPoints, origInTang, origOutTang, origPath.isClosed());
+```
+
+转换器的处理：
+
+1. `vertex_follow_names` 识别 `fromCompToSurface` + `Layer Control` 表达式，按括号深度解析 `nullLayerNames` 数组（层名本身含 `[1.0]`，不能用第一个 `]` 收尾）。
+2. 每帧对每个空对象求 `comp_anchor = plan_chain(null) × anchorPoint`，得到 comp 坐标。
+3. 用形状层链条矩阵的逆（`fromCompToSurface`）变回图层局部坐标，替换原路径顶点；切线保持不变。
+4. 因此这类图层视为几何动画，逐帧烘焙；拓扑固定（顶点数不变），通常只产生一个桶。
+
+这解释了此前“海星主体不动”的原因：表达式未被求值，10 个顶点停留在参考帧位置；现在会随空对象与父级 `main` 一起运动。
 
 ---
 

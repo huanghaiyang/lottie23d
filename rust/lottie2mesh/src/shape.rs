@@ -6,6 +6,7 @@
 //! runtime animation work inside Rust.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -51,6 +52,22 @@ pub struct Drawable {
 
 pub struct ShapeResult {
     pub drawables: Vec<Drawable>,
+}
+
+/// Null-layer references for "vertex follows null" expressions, keyed by the
+/// position path of the shape item inside the layer's shape tree.
+#[derive(Default, Clone, Debug)]
+pub struct FollowSpecs {
+    pub map: HashMap<Vec<usize>, Vec<usize>>,
+}
+
+/// Per-frame evaluation context for vertex-follow expressions.
+pub struct FollowContext<'a> {
+    pub specs: &'a FollowSpecs,
+    /// Inverse of the shape layer's composition matrix.
+    pub layer_inverse: Affine,
+    /// Composition-space anchor position per layer plan id.
+    pub positions: &'a [Option<[f32; 2]>],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +147,22 @@ impl Affine {
             self.b * p[0] + self.d * p[1] + self.ty,
         ]
     }
+
+    /// Inverse affine transform, or `None` for singular matrices.
+    pub fn inverse(&self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        Some(Affine {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            tx: (self.c * self.ty - self.d * self.tx) / det,
+            ty: (self.b * self.tx - self.a * self.ty) / det,
+        })
+    }
 }
 
 /// Position may be a single property or split into `x` / `y` / `z`
@@ -199,19 +232,35 @@ pub fn transform_matrix(ks: &Value, frame: f32) -> Affine {
 }
 
 pub fn eval_shapes(shapes: &[Value], frame: f32) -> ShapeResult {
-    eval_with_geometry(shapes, frame, true)
+    eval_with_geometry(shapes, frame, true, None)
+}
+
+/// Same as [`eval_shapes`], but with a context that lets path items follow
+/// null-layer positions (AE "vertex follows null" expressions).
+pub fn eval_shapes_follow(
+    shapes: &[Value],
+    frame: f32,
+    ctx: &FollowContext<'_>,
+) -> ShapeResult {
+    eval_with_geometry(shapes, frame, true, Some(ctx))
 }
 
 /// Evaluate colours only, skipping path flattening and group transforms.
 /// The returned drawables keep the same order as [`eval_shapes`], which lets
 /// style-only animations avoid rebuilding geometry every frame.
 pub fn eval_styles(shapes: &[Value], frame: f32) -> ShapeResult {
-    eval_with_geometry(shapes, frame, false)
+    eval_with_geometry(shapes, frame, false, None)
 }
 
-fn eval_with_geometry(shapes: &[Value], frame: f32, geometry: bool) -> ShapeResult {
+fn eval_with_geometry(
+    shapes: &[Value],
+    frame: f32,
+    geometry: bool,
+    ctx: Option<&FollowContext<'_>>,
+) -> ShapeResult {
     let mut result = GroupResult::default();
-    eval_group_items(shapes, frame, &mut result, geometry);
+    let mut path = Vec::new();
+    eval_group_items(shapes, frame, &mut result, geometry, ctx, &mut path);
     ShapeResult {
         drawables: result.drawables,
     }
@@ -225,7 +274,14 @@ struct GroupResult {
     path_count: usize,
 }
 
-fn eval_group_items(items: &[Value], frame: f32, out: &mut GroupResult, geometry: bool) {
+fn eval_group_items(
+    items: &[Value],
+    frame: f32,
+    out: &mut GroupResult,
+    geometry: bool,
+    ctx: Option<&FollowContext<'_>>,
+    path: &mut Vec<usize>,
+) {
     // A group transform applies to all of its contents, regardless of where
     // the `tr` item sits in the list.
     let transform = items
@@ -238,7 +294,7 @@ fn eval_group_items(items: &[Value], frame: f32, out: &mut GroupResult, geometry
     let mut active_count = 0usize;
     let mut local = GroupResult::default();
 
-    for item in items {
+    for (item_index, item) in items.iter().enumerate() {
         let ty = item.get("ty").and_then(Value::as_str).unwrap_or("");
         match ty {
             "sh" => {
@@ -250,9 +306,26 @@ fn eval_group_items(items: &[Value], frame: f32, out: &mut GroupResult, geometry
                     continue;
                 }
                 if let Some(ks) = item.get("ks") {
-                    if let Some(path) = path::eval_path_property(ks, frame) {
+                    if let Some(shape_path) = path::eval_path_property(ks, frame) {
+                        let mut data = shape_path;
+                        if let Some(ctx) = ctx {
+                            path.push(item_index);
+                            if let Some(targets) = ctx.specs.map.get(path.as_slice()) {
+                                for (index, target) in targets.iter().enumerate() {
+                                    if index >= data.v.len() {
+                                        break;
+                                    }
+                                    if let Some(position) =
+                                        ctx.positions.get(*target).copied().flatten()
+                                    {
+                                        data.v[index] = ctx.layer_inverse.apply(position);
+                                    }
+                                }
+                            }
+                            path.pop();
+                        }
                         active.push(PathItem {
-                            contour: path::flatten_path(&path),
+                            contour: path::flatten_path(&data),
                             trim: None,
                         });
                     }
@@ -337,7 +410,9 @@ fn eval_group_items(items: &[Value], frame: f32, out: &mut GroupResult, geometry
                 }
                 if let Some(children) = item.get("it").and_then(Value::as_array) {
                     let mut child = GroupResult::default();
-                    eval_group_items(children, frame, &mut child, geometry);
+                    path.push(item_index);
+                    eval_group_items(children, frame, &mut child, geometry, ctx, path);
+                    path.pop();
                     local.drawables.extend(child.drawables);
                     active_count += child.path_count;
                     if geometry {
@@ -554,6 +629,74 @@ pub fn is_animated(value: &Value) -> bool {
     value.get("a").and_then(Value::as_i64).unwrap_or(0) != 0
 }
 
+/// Detect the AE "vertex follows null layer" path expression, where every
+/// path vertex is replaced by a null layer's composition position:
+/// `origPoints[i] = fromCompToSurface(nullLayer.toComp(nullLayer.anchorPoint))`.
+/// Returns the referenced null layer names in vertex order.
+pub fn vertex_follow_names(item: &Value) -> Option<Vec<String>> {
+    if item.get("ty").and_then(Value::as_str) != Some("sh") {
+        return None;
+    }
+    let expression = item.get("ks")?.get("x")?.as_str()?;
+    if !expression.contains("fromCompToSurface") || !expression.contains("Layer Control") {
+        return None;
+    }
+    let start = expression.find("nullLayerNames")?;
+    let tail = &expression[start..];
+    let array_start = tail.find('[')?;
+    // Layer names may contain brackets ("Path 1 [1.0]"), so find the matching
+    // close bracket by depth instead of the first `]`.
+    let mut depth = 0usize;
+    let mut array_end = None;
+    for (offset, ch) in tail[array_start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    array_end = Some(array_start + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let array_end = array_end?;
+    if array_end <= array_start {
+        return None;
+    }
+    let names = quoted_strings(&tail[array_start + 1..array_end]);
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+/// Collect single- or double-quoted string literals in source order.
+fn quoted_strings(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<(char, String)> = None;
+    for ch in source.chars() {
+        match &mut current {
+            Some((quote, text)) => {
+                if ch == *quote {
+                    out.push(std::mem::take(text));
+                    current = None;
+                } else {
+                    text.push(ch);
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    current = Some((ch, String::new()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether shape geometry (paths, primitives, trim, width, group transforms)
 /// changes over time. Colour-only animation is excluded.
 pub fn geometry_animated(shapes: &[Value]) -> bool {
@@ -562,6 +705,9 @@ pub fn geometry_animated(shapes: &[Value]) -> bool {
         match ty {
             "sh" => {
                 if item.get("ks").map(is_animated).unwrap_or(false) {
+                    return true;
+                }
+                if vertex_follow_names(item).is_some() {
                     return true;
                 }
             }

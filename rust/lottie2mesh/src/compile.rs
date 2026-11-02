@@ -11,10 +11,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::lottie::{Layer, Lottie};
-use crate::mesh::{self, SlotPlan};
+use crate::mesh::{self, MeshSurface, SlotPlan};
 use crate::path::Contour;
 use crate::prop;
-use crate::shape::{self, Affine, DrawKind, Drawable, PathItem};
+use crate::shape::{self, Affine, DrawKind, Drawable, FollowContext, FollowSpecs, PathItem};
 
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct RawOptions {
@@ -28,19 +28,75 @@ pub struct RawOptions {
     pub edge_radius: Option<f32>,
 }
 
+/// One cached topology: a signature plus the indices built for it.
+pub struct MeshBucket {
+    pub signature: u64,
+    pub slots: Vec<SlotPlan>,
+    pub indices: Vec<u32>,
+    pub point_count: u32,
+    pub vertex_count: u32,
+}
+
 pub struct CompiledMesh {
     pub kind: u8,
     pub static_color: [f32; 4],
     pub depth: f32,
     pub half_thickness: f32,
     pub positions: Vec<f32>,
+    /// Per-frame vertices packed contiguously; `frame_offsets` holds the
+    /// start of every frame (in floats) so buckets may use different counts.
     pub frame_positions: Option<Vec<f32>>,
+    pub frame_offsets: Vec<u32>,
+    /// Bucket index used by each frame (empty while there is only one bucket).
+    pub frame_buckets: Vec<u8>,
+    pub buckets: Vec<MeshBucket>,
     pub indices: Vec<u32>,
     pub color_track: Vec<f32>,
     pub transform_index: usize,
     pub render_order: u32,
     pub point_count: u32,
     pub name: String,
+}
+
+impl CompiledMesh {
+    fn from_surface(
+        surface: MeshSurface,
+        half: f32,
+        kind: u8,
+        color: [f32; 4],
+        depth: f32,
+        transform_index: usize,
+        name: String,
+        animated: bool,
+    ) -> CompiledMesh {
+        let signature = mesh::slot_signature(&surface.slots).unwrap_or(0);
+        let point_count = surface.point_count as u32;
+        let vertex_count = (surface.point_count * surface.stride) as u32;
+        let frames = if animated { Some(Vec::new()) } else { None };
+        CompiledMesh {
+            kind,
+            static_color: color,
+            depth,
+            half_thickness: half,
+            positions: surface.ref_positions,
+            frame_positions: frames,
+            frame_offsets: Vec::new(),
+            frame_buckets: Vec::new(),
+            buckets: vec![MeshBucket {
+                signature,
+                slots: surface.slots,
+                indices: surface.indices.clone(),
+                point_count,
+                vertex_count,
+            }],
+            indices: surface.indices,
+            color_track: Vec::new(),
+            transform_index,
+            render_order: 0,
+            point_count,
+            name,
+        }
+    }
 }
 
 pub struct Compiled {
@@ -58,7 +114,6 @@ pub struct Compiled {
 }
 
 struct Blueprint {
-    slots: Vec<SlotPlan>,
     mesh_index: usize,
     color: [f32; 4],
 }
@@ -77,6 +132,8 @@ struct Plan<'a> {
     /// so mesh colours embedded the layer alpha must be baked per frame.
     opacity_animated: bool,
     ref_frame: f32,
+    /// Vertex-follow null expressions on this layer's shape paths.
+    follows: Option<FollowSpecs>,
 }
 
 struct Compiler<'a> {
@@ -234,6 +291,7 @@ impl<'a> Compiler<'a> {
                 style_animated: false,
                 opacity_animated: false,
                 ref_frame,
+                follows: None,
             });
             ids.push(id);
         }
@@ -279,14 +337,49 @@ impl<'a> Compiler<'a> {
     fn build_shape_layer(&mut self, id: usize, layer: &'a Layer) {
         // Reference geometry is sampled in layer-local time, like property eval.
         let frame = self.plans[id].ref_frame - layer.st;
-        let result = shape::eval_shapes(&layer.shapes, frame);
-        let geometry_animated = shape::geometry_animated(&layer.shapes);
+        let follows = self.collect_follows(id, &layer.shapes);
+        let geometry_animated = shape::geometry_animated(&layer.shapes)
+            || follows.as_ref().map(|specs| !specs.map.is_empty()).unwrap_or(false);
         let style_animated = shape::style_animated(&layer.shapes);
         {
             let plan = &mut self.plans[id];
             plan.geometry_animated = geometry_animated;
             plan.style_animated = style_animated;
+            plan.follows = follows.clone();
         }
+
+        // Build the reference frame with the same vertex-follow context used
+        // while baking, so topology matches the real animation.
+        let result = match &follows {
+            Some(specs) => {
+                let plan_count = self.plans.len();
+                let mut chain_cache = vec![None; plan_count];
+                let mut frame_cache = vec![None; plan_count];
+                let mut positions = vec![None; plan_count];
+                fill_follow_positions(
+                    &self.plans,
+                    specs,
+                    self.plans[id].ref_frame,
+                    &mut chain_cache,
+                    &mut frame_cache,
+                    &mut positions,
+                );
+                let inverse = layer_inverse(
+                    &self.plans,
+                    id,
+                    self.plans[id].ref_frame,
+                    &mut chain_cache,
+                    &mut frame_cache,
+                );
+                let ctx = FollowContext {
+                    specs,
+                    layer_inverse: inverse,
+                    positions: &positions,
+                };
+                shape::eval_shapes_follow(&layer.shapes, frame, &ctx)
+            }
+            None => shape::eval_shapes(&layer.shapes, frame),
+        };
 
         for drawable in result.drawables {
             let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius) else {
@@ -300,33 +393,21 @@ impl<'a> Compiler<'a> {
                 drawable.color[3] * drawable.opacity,
             ];
             let mesh_index = self.meshes.len();
-            let vertex_count = surface.point_count * surface.stride;
-            let frame_positions = if geometry_animated {
-                Some(vec![0.0; self.frame_count * vertex_count * 3])
-            } else {
-                None
-            };
             let name = format!("{} · {}", layer.nm, drawable.name);
-            self.meshes.push(CompiledMesh {
-                kind: if drawable.kind == DrawKind::Fill { 0 } else { 1 },
-                static_color: color,
-                depth: self.plans[id].depth,
-                half_thickness: self.half,
-                positions: surface.ref_positions,
-                frame_positions,
-                indices: surface.indices,
-                color_track: Vec::new(),
-                transform_index: self.plans[id].transform_track,
-                render_order: 0,
-                point_count: surface.point_count as u32,
-                name,
-            });
-            self.plans[id].meshes.push(mesh_index);
-            self.plans[id].blueprints.push(Some(Blueprint {
-                slots: surface.slots,
-                mesh_index,
+            self.meshes.push(CompiledMesh::from_surface(
+                surface,
+                self.half,
+                if drawable.kind == DrawKind::Fill { 0 } else { 1 },
                 color,
-            }));
+                self.plans[id].depth,
+                self.plans[id].transform_track,
+                name,
+                geometry_animated,
+            ));
+            self.plans[id].meshes.push(mesh_index);
+            self.plans[id]
+                .blueprints
+                .push(Some(Blueprint { mesh_index, color }));
         }
     }
 
@@ -361,23 +442,18 @@ impl<'a> Compiler<'a> {
             return;
         };
         let mesh_index = self.meshes.len();
-        self.meshes.push(CompiledMesh {
-            kind: 0,
-            static_color: [rgb[0], rgb[1], rgb[2], 1.0],
-            depth: self.plans[id].depth,
-            half_thickness: self.half,
-            positions: surface.ref_positions,
-            frame_positions: None,
-            indices: surface.indices,
-            color_track: Vec::new(),
-            transform_index: self.plans[id].transform_track,
-            render_order: 0,
-            point_count: surface.point_count as u32,
-            name: layer.nm.clone(),
-        });
+        self.meshes.push(CompiledMesh::from_surface(
+            surface,
+            self.half,
+            0,
+            [rgb[0], rgb[1], rgb[2], 1.0],
+            self.plans[id].depth,
+            self.plans[id].transform_track,
+            layer.nm.clone(),
+            false,
+        ));
         self.plans[id].meshes.push(mesh_index);
         self.plans[id].blueprints.push(Some(Blueprint {
-            slots: surface.slots,
             mesh_index,
             color: [rgb[0], rgb[1], rgb[2], 1.0],
         }));
@@ -394,12 +470,30 @@ impl<'a> Compiler<'a> {
             track.resize(new_count * 16, 0.0);
         }
         for mesh in self.meshes.iter_mut() {
-            if let Some(frames) = mesh.frame_positions.as_mut() {
-                frames.resize(new_count * mesh.positions.len(), 0.0);
+            // Frame vertices are appended during bake (sizes may vary per
+            // topology bucket), so only pre-allocated tracks are resized.
+            if mesh.frame_positions.is_some() {
+                mesh.frame_positions = Some(Vec::new());
+                mesh.frame_offsets.clear();
+                mesh.frame_buckets.clear();
             }
             if !mesh.color_track.is_empty() {
                 mesh.color_track.resize(new_count * 4, 0.0);
             }
+        }
+    }
+
+    /// Walk the shape tree and resolve `vertex follows null` expressions to
+    /// layer plan ids of the same composition.
+    fn collect_follows(&self, id: usize, shapes: &[Value]) -> Option<FollowSpecs> {
+        let owner = self.plans[id].owner;
+        let mut specs = FollowSpecs::default();
+        let mut path = Vec::new();
+        collect_follows_inner(&self.plans, owner, shapes, &mut path, &mut specs);
+        if specs.map.is_empty() {
+            None
+        } else {
+            Some(specs)
         }
     }
 
@@ -464,6 +558,7 @@ impl<'a> Compiler<'a> {
         let mut chain_cache: Vec<Option<[f32; 16]>> = vec![None; plan_count];
         let mut opacity_cache: Vec<Option<f32>> = vec![None; plan_count];
         let mut frame_cache: Vec<Option<f32>> = vec![None; plan_count];
+        let mut follow_positions: Vec<Option<[f32; 2]>> = vec![None; plan_count];
         let mut scratch = mesh::FrameScratch::default();
 
         for frame_index in 0..frame_count {
@@ -509,7 +604,36 @@ impl<'a> Compiler<'a> {
                 // Geometry-only / style-only animations avoid evaluating what
                 // they do not need: style animation skips path flattening.
                 let evaluated = if geometry_animated {
-                    Some(shape::eval_shapes(&plan.layer.shapes, local_frame))
+                    match &plan.follows {
+                        Some(specs) => {
+                            fill_follow_positions(
+                                plans,
+                                specs,
+                                root_frame,
+                                &mut chain_cache,
+                                &mut frame_cache,
+                                &mut follow_positions,
+                            );
+                            let inverse = layer_inverse(
+                                plans,
+                                id,
+                                root_frame,
+                                &mut chain_cache,
+                                &mut frame_cache,
+                            );
+                            let ctx = FollowContext {
+                                specs,
+                                layer_inverse: inverse,
+                                positions: &follow_positions,
+                            };
+                            Some(shape::eval_shapes_follow(
+                                &plan.layer.shapes,
+                                local_frame,
+                                &ctx,
+                            ))
+                        }
+                        None => Some(shape::eval_shapes(&plan.layer.shapes, local_frame)),
+                    }
                 } else if plan.style_animated {
                     Some(shape::eval_styles(&plan.layer.shapes, local_frame))
                 } else {
@@ -555,33 +679,215 @@ impl<'a> Compiler<'a> {
                     }
 
                     if geometry_animated {
-                        let drawable = evaluated
+                        let start = mesh
+                            .frame_positions
                             .as_ref()
-                            .and_then(|result| result.drawables.get(drawable_index));
-                        let Some(drawable) = drawable else {
-                            continue;
-                        };
-                        let half = mesh.half_thickness;
-                        let count = mesh.positions.len();
-                        let offset = frame_index * count;
-                        let Some(track) = mesh.frame_positions.as_mut() else {
-                            continue;
-                        };
-                        if offset + count <= track.len() {
-                            mesh::write_frame(
-                                drawable,
-                                &blueprint.slots,
-                                half,
-                                edge_radius,
-                                &mut track[offset..offset + count],
-                                &mut scratch,
-                            );
+                            .map(|track| track.len())
+                            .unwrap_or(0);
+                        let mut bucket_index = 0usize;
+                        if let Some(drawable) = evaluated
+                            .as_ref()
+                            .and_then(|result| result.drawables.get(drawable_index))
+                        {
+                            let half = mesh.half_thickness;
+                            let slots = shape::drawable_slots(drawable);
+                            if !slots.is_empty() {
+                                let natural = mesh::plan_slots(&slots);
+                                let signature = mesh::slot_signature(&natural);
+                                if let Some(sig) = signature {
+                                    if let Some(position) = mesh
+                                        .buckets
+                                        .iter()
+                                        .position(|bucket| bucket.signature == sig)
+                                    {
+                                        bucket_index = position;
+                                    } else if mesh.buckets.len() < mesh::MAX_BUCKETS {
+                                        if let Some(surface) = mesh::build_surface_from_slots(
+                                            drawable,
+                                            &slots,
+                                            natural,
+                                            half,
+                                            edge_radius,
+                                        ) {
+                                            mesh.point_count = mesh
+                                                .point_count
+                                                .max(surface.point_count as u32);
+                                            mesh.buckets.push(MeshBucket {
+                                                signature: sig,
+                                                slots: surface.slots,
+                                                indices: surface.indices,
+                                                point_count: surface.point_count as u32,
+                                                vertex_count: (surface.point_count * surface.stride)
+                                                    as u32,
+                                            });
+                                            bucket_index = mesh.buckets.len() - 1;
+                                        }
+                                    }
+                                }
+
+                                let (count, bucket_plans) = {
+                                    let bucket = &mesh.buckets[bucket_index];
+                                    (bucket.vertex_count as usize * 3, bucket.slots.as_slice())
+                                };
+                                if let Some(track) = mesh.frame_positions.as_mut() {
+                                    let write_start = track.len();
+                                    track.resize(write_start + count, 0.0);
+                                    if !mesh::write_frame_with_slots(
+                                        drawable,
+                                        &slots,
+                                        bucket_plans,
+                                        half,
+                                        edge_radius,
+                                        &mut track[write_start..],
+                                        &mut scratch,
+                                    ) {
+                                        track.truncate(write_start);
+                                    }
+                                }
+                            }
                         }
+                        // Offsets stay aligned even when a frame has no drawable.
+                        mesh.frame_offsets.push(start as u32);
+                        mesh.frame_buckets.push(bucket_index as u8);
                     }
                 }
             }
         }
+
+        // Close the per-frame offset table and pad the initial positions so
+        // every bucket (which may need more vertices) fits the vertex buffer.
+        for mesh in self.meshes.iter_mut() {
+            if mesh.frame_positions.is_none() {
+                mesh.frame_offsets.clear();
+                mesh.frame_buckets.clear();
+                continue;
+            }
+            let max_vertex = mesh
+                .buckets
+                .iter()
+                .map(|bucket| bucket.vertex_count)
+                .max()
+                .unwrap_or(0);
+            mesh.point_count = mesh
+                .point_count
+                .max(mesh.buckets.iter().map(|bucket| bucket.point_count).max().unwrap_or(0));
+            let needed = max_vertex as usize * 3;
+            if mesh.positions.len() < needed {
+                mesh.positions.resize(needed, 0.0);
+            }
+            let total = mesh.frame_positions.as_ref().map_or(0, |track| track.len());
+            mesh.frame_offsets.push(total as u32);
+        }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Vertex-follow expressions                                           */
+/* ------------------------------------------------------------------ */
+
+/// Null layer names are resolved within the shape layer's own composition.
+fn collect_follows_inner(
+    plans: &[Plan],
+    owner: Option<usize>,
+    items: &[Value],
+    path: &mut Vec<usize>,
+    specs: &mut FollowSpecs,
+) {
+    const MISSING: usize = usize::MAX;
+    for (index, item) in items.iter().enumerate() {
+        match item.get("ty").and_then(Value::as_str).unwrap_or("") {
+            "sh" => {
+                if let Some(names) = shape::vertex_follow_names(item) {
+                    path.push(index);
+                    let mut targets = Vec::with_capacity(names.len());
+                    for name in names {
+                        targets.push(
+                            plans
+                                .iter()
+                                .position(|plan| {
+                                    plan.owner == owner && plan.layer.nm == name
+                                })
+                                .unwrap_or(MISSING),
+                        );
+                    }
+                    specs.map.insert(path.clone(), targets);
+                    path.pop();
+                }
+            }
+            "gr" => {
+                if let Some(children) = item.get("it").and_then(Value::as_array) {
+                    path.push(index);
+                    collect_follows_inner(plans, owner, children, path, specs);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Composition-space anchor position of a layer with its parent chain baked.
+fn comp_anchor(
+    plans: &[Plan],
+    id: usize,
+    root_frame: f32,
+    chain_cache: &mut [Option<[f32; 16]>],
+    frame_cache: &mut [Option<f32>],
+) -> [f32; 2] {
+    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache);
+    let frame = plan_local_frame(plans, id, root_frame);
+    let anchor = prop::eval_in(&plans[id].layer.ks, "a", frame, &[0.0, 0.0, 0.0]);
+    [
+        matrix[0] * anchor[0] + matrix[4] * anchor[1] + matrix[12],
+        matrix[1] * anchor[0] + matrix[5] * anchor[1] + matrix[13],
+    ]
+}
+
+/// Resolve every referenced null layer once per frame into `out`.
+fn fill_follow_positions(
+    plans: &[Plan],
+    specs: &FollowSpecs,
+    root_frame: f32,
+    chain_cache: &mut [Option<[f32; 16]>],
+    frame_cache: &mut [Option<f32>],
+    out: &mut Vec<Option<[f32; 2]>>,
+) {
+    out.clear();
+    out.resize(plans.len(), None);
+    for targets in specs.map.values() {
+        for &target in targets {
+            if target < out.len() && out[target].is_none() {
+                out[target] = Some(comp_anchor(
+                    plans,
+                    target,
+                    root_frame,
+                    chain_cache,
+                    frame_cache,
+                ));
+            }
+        }
+    }
+}
+
+/// Inverse of the shape layer's composition matrix (`fromCompToSurface`).
+fn layer_inverse(
+    plans: &[Plan],
+    id: usize,
+    root_frame: f32,
+    chain_cache: &mut [Option<[f32; 16]>],
+    frame_cache: &mut [Option<f32>],
+) -> Affine {
+    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache);
+    Affine {
+        a: matrix[0],
+        b: matrix[1],
+        c: matrix[4],
+        d: matrix[5],
+        tx: matrix[12],
+        ty: matrix[13],
+    }
+    .inverse()
+    .unwrap_or(Affine::IDENTITY)
 }
 
 /* ------------------------------------------------------------------ */
