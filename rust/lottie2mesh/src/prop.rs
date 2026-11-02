@@ -229,40 +229,38 @@ fn sample_bezier(p1: f32, p2: f32, t: f32) -> f32 {
 }
 
 /// Sample the spatial cubic through `s -> e` at the eased arc length.
+/// lottie-web uses 150 curve segments by default, so match that resolution.
 fn spatial_value(s: &[f32], e: &[f32], to: &[f32], ti: &[f32], progress: f32) -> Vec<f32> {
-    const STEPS: usize = 24;
+    const STEPS: usize = 150;
     let dims = s.len().min(e.len()).min(3);
-    let mut points: Vec<[f32; 3]> = Vec::with_capacity(STEPS + 1);
-    for step in 0..=STEPS {
+    let mut points = [[0.0f32; 3]; STEPS + 1];
+    for (step, point) in points.iter_mut().enumerate() {
         let t = step as f32 / STEPS as f32;
         let it = 1.0 - t;
         let b0 = it * it * it;
         let b1 = 3.0 * it * it * t;
         let b2 = 3.0 * it * t * t;
         let b3 = t * t * t;
-        let mut p = [0.0f32; 3];
-        for d in 0..dims {
+        for (d, value) in point.iter_mut().enumerate().take(dims) {
             let c1 = s[d] + to.get(d).copied().unwrap_or(0.0);
             let c2 = e[d] + ti.get(d).copied().unwrap_or(0.0);
-            p[d] = b0 * s[d] + b1 * c1 + b2 * c2 + b3 * e[d];
+            *value = b0 * s[d] + b1 * c1 + b2 * c2 + b3 * e[d];
         }
-        points.push(p);
     }
 
     // Build cumulative arc lengths.
-    let mut lengths = Vec::with_capacity(points.len());
-    lengths.push(0.0f32);
-    for i in 1..points.len() {
+    let mut lengths = [0.0f32; STEPS + 1];
+    for i in 1..=STEPS {
         let mut d = 0.0f32;
         for axis in 0..dims {
             let delta = points[i][axis] - points[i - 1][axis];
             d += delta * delta;
         }
-        lengths.push(lengths[i - 1] + d.sqrt());
+        lengths[i] = lengths[i - 1] + d.sqrt();
     }
-    let total = *lengths.last().unwrap_or(&0.0);
+    let total = lengths[STEPS];
     if total <= 1e-6 {
-        return points[0].to_vec();
+        return points[0][..dims].to_vec();
     }
     let target = total * progress;
     let mut i = 1usize;

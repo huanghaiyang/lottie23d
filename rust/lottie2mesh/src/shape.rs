@@ -132,12 +132,45 @@ impl Affine {
     }
 }
 
+/// Position may be a single property or split into `x` / `y` / `z`
+/// (`p.s === true`), which lottie-web evaluates separately.
+fn position_of(ks: &Value, frame: f32) -> [f32; 3] {
+    if let Some(p) = ks.get("p") {
+        if p.get("s").and_then(Value::as_bool).unwrap_or(false) {
+            return [
+                prop::eval_scalar(p, "x", frame, 0.0),
+                prop::eval_scalar(p, "y", frame, 0.0),
+                prop::eval_scalar(p, "z", frame, 0.0),
+            ];
+        }
+        let value = prop::eval(p, frame);
+        return [
+            value.first().copied().unwrap_or(0.0),
+            value.get(1).copied().unwrap_or(0.0),
+            value.get(2).copied().unwrap_or(0.0),
+        ];
+    }
+    [0.0, 0.0, 0.0]
+}
+
+/// 3D layers rotate around Z via `rz` even when `r` is present, matching
+/// lottie-web's `TransformProperty`.
+fn rotation_of(ks: &Value, frame: f32) -> f32 {
+    if ks.get("rx").is_some() {
+        let rz = prop::eval_scalar(ks, "rz", frame, 0.0);
+        if ks.get("rz").is_some() {
+            return rz;
+        }
+    }
+    prop::eval_scalar(ks, "r", frame, 0.0)
+}
+
 /// Build the 2D transform described by a Lottie `tr` group / layer transform.
 pub fn transform_matrix(ks: &Value, frame: f32) -> Affine {
-    let p = prop::eval_in(ks, "p", frame, &[0.0, 0.0, 0.0]);
+    let p = position_of(ks, frame);
     let a = prop::eval_in(ks, "a", frame, &[0.0, 0.0, 0.0]);
     let s = prop::eval_in(ks, "s", frame, &[100.0, 100.0, 100.0]);
-    let r = prop::eval_scalar(ks, "r", frame, 0.0);
+    let r = rotation_of(ks, frame);
     let sk = prop::eval_scalar(ks, "sk", frame, 0.0);
     let sa = prop::eval_scalar(ks, "sa", frame, 0.0);
 

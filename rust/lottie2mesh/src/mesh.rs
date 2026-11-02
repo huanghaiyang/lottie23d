@@ -6,27 +6,79 @@ use std::borrow::Cow;
 use crate::path::{self, Contour};
 use crate::shape::{DrawKind, Drawable};
 
+/// Number of segments in each quarter-round of a smoothed edge.
+const ROUND_SEGMENTS: usize = 3;
+
 #[derive(Clone, Debug)]
 pub struct SlotPlan {
     pub k: usize,
     pub closed: bool,
+    /// Hole contour of a compound fill; its offset direction is flipped.
+    pub hole: bool,
 }
 
 pub struct MeshSurface {
     pub slots: Vec<SlotPlan>,
     pub point_count: usize,
+    /// Vertices per contour point along the extruded edge profile.
+    pub stride: usize,
     pub indices: Vec<u32>,
     pub ref_positions: Vec<f32>,
 }
 
+/// Vertices generated per point: 2 for a sharp edge, more when rounded.
+fn profile_stride(radius: f32) -> usize {
+    if radius > 1e-4 {
+        2 * ROUND_SEGMENTS + 2
+    } else {
+        2
+    }
+}
+
+/// Offset along the inward normal and Z for one profile ring.
+fn ring_profile(index: usize, radius: f32, half: f32) -> (f32, f32) {
+    if radius <= 1e-4 {
+        return (0.0, if index == 0 { half } else { -half });
+    }
+    if index <= ROUND_SEGMENTS {
+        // Upper quarter-round: side wall -> top cap boundary.
+        let theta = (1.0 - index as f32 / ROUND_SEGMENTS as f32)
+            * std::f32::consts::FRAC_PI_2;
+        (
+            radius * (1.0 - theta.cos()),
+            (half - radius) + radius * theta.sin(),
+        )
+    } else {
+        // Lower quarter-round: bottom cap boundary -> side wall.
+        let local = index - (ROUND_SEGMENTS + 1);
+        let theta = local as f32 / ROUND_SEGMENTS as f32 * std::f32::consts::FRAC_PI_2;
+        (
+            radius * (1.0 - theta.cos()),
+            -(half - radius) - radius * theta.sin(),
+        )
+    }
+}
+
 /// Build the reference surface and its fixed topology.
-pub fn build_surface(drawable: &Drawable, half_thickness: f32) -> Option<MeshSurface> {
+pub fn build_surface(
+    drawable: &Drawable,
+    half_thickness: f32,
+    edge_radius: f32,
+) -> Option<MeshSurface> {
     let slots = crate::shape::drawable_slots(drawable);
     if slots.is_empty() {
         return None;
     }
 
-    let plans: Vec<SlotPlan> = slots
+    // Only fills get rounded edges; stroke ribbons keep the sharp profile.
+    let radius = if drawable.kind == DrawKind::Fill {
+        edge_radius.clamp(0.0, half_thickness)
+    } else {
+        0.0
+    };
+    let stride = profile_stride(radius);
+
+    let mut plans: Vec<SlotPlan> = slots
         .iter()
         .map(|(contour, closed, _)| {
             let length = contour.length();
@@ -38,11 +90,19 @@ pub fn build_surface(drawable: &Drawable, half_thickness: f32) -> Option<MeshSur
             SlotPlan {
                 k,
                 closed: *closed,
+                hole: false,
             }
         })
         .collect();
 
     let points = build_points(drawable, &slots, &plans)?;
+    if drawable.kind == DrawKind::Fill && radius > 0.0 {
+        let holes = classify_holes(&points, &plans);
+        for (plan, hole) in plans.iter_mut().zip(holes) {
+            plan.hole = hole;
+        }
+    }
+
     let surface_indices = match drawable.kind {
         DrawKind::Fill => tessellate_fill(&points, &plans),
         DrawKind::Stroke => build_ribbon_indices(&plans),
@@ -52,12 +112,18 @@ pub fn build_surface(drawable: &Drawable, half_thickness: f32) -> Option<MeshSur
     }
 
     let point_count = points.len();
-    let indices = extrude(&surface_indices, point_count);
-    let ref_positions = expand_positions(&points, half_thickness);
+    let indices = extrude(&surface_indices, point_count, stride);
+    let mut normals = Vec::new();
+    if radius > 0.0 {
+        normals.reserve(point_count);
+        fill_normals(&points, &plans, &mut normals);
+    }
+    let ref_positions = expand_positions(&points, &normals, stride, radius, half_thickness);
 
     Some(MeshSurface {
         slots: plans,
         point_count,
+        stride,
         indices,
         ref_positions,
     })
@@ -69,6 +135,7 @@ pub fn build_surface(drawable: &Drawable, half_thickness: f32) -> Option<MeshSur
 pub struct FrameScratch {
     sampled: Vec<Vec<[f32; 2]>>,
     points: Vec<[f32; 2]>,
+    normals: Vec<[f32; 2]>,
 }
 
 /// Rebuild vertex positions for another frame, writing straight into the
@@ -77,6 +144,7 @@ pub fn write_frame(
     drawable: &Drawable,
     plans: &[SlotPlan],
     half_thickness: f32,
+    edge_radius: f32,
     out: &mut [f32],
     scratch: &mut FrameScratch,
 ) -> bool {
@@ -84,6 +152,12 @@ pub fn write_frame(
     if slots.is_empty() {
         return false;
     }
+    let radius = if drawable.kind == DrawKind::Fill {
+        edge_radius.clamp(0.0, half_thickness)
+    } else {
+        0.0
+    };
+    let stride = profile_stride(radius);
     if scratch.sampled.len() < plans.len() {
         scratch.sampled.resize_with(plans.len(), Vec::new);
     }
@@ -122,18 +196,23 @@ pub fn write_frame(
         }
     }
 
+    if radius > 0.0 {
+        scratch.normals.clear();
+        fill_normals(&scratch.points, plans, &mut scratch.normals);
+    }
     let points = &scratch.points;
-    if points.len() * 6 > out.len() {
+    if points.len() * stride * 3 > out.len() {
         return false;
     }
     for (index, p) in points.iter().enumerate() {
-        let base = index * 6;
-        out[base] = p[0];
-        out[base + 1] = p[1];
-        out[base + 2] = half_thickness;
-        out[base + 3] = p[0];
-        out[base + 4] = p[1];
-        out[base + 5] = -half_thickness;
+        let normal = scratch.normals.get(index).copied().unwrap_or([0.0, 0.0]);
+        for ring in 0..stride {
+            let (offset, z) = ring_profile(ring, radius, half_thickness);
+            let base = (index * stride + ring) * 3;
+            out[base] = p[0] + normal[0] * offset;
+            out[base + 1] = p[1] + normal[1] * offset;
+            out[base + 2] = z;
+        }
     }
     true
 }
@@ -416,22 +495,23 @@ fn point_in_polygon(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
 }
 
 /// Extrude a flat triangle surface: front cap, back cap, boundary walls.
-fn extrude(surface: &[u32], point_count: usize) -> Vec<u32> {
+fn extrude(surface: &[u32], point_count: usize, stride: usize) -> Vec<u32> {
     let mut indices = Vec::with_capacity(surface.len() * 2 + 64);
+    let last = stride - 1;
 
     // Front and back caps.
     for tri in surface.chunks_exact(3) {
         indices.extend_from_slice(&[
-            tri[0] * 2,
-            tri[1] * 2,
-            tri[2] * 2,
+            (tri[0] as usize * stride) as u32,
+            (tri[1] as usize * stride) as u32,
+            (tri[2] as usize * stride) as u32,
         ]);
     }
     for tri in surface.chunks_exact(3) {
         indices.extend_from_slice(&[
-            tri[2] * 2 + 1,
-            tri[1] * 2 + 1,
-            tri[0] * 2 + 1,
+            (tri[2] as usize * stride + last) as u32,
+            (tri[1] as usize * stride + last) as u32,
+            (tri[0] as usize * stride + last) as u32,
         ]);
     }
 
@@ -456,26 +536,123 @@ fn extrude(surface: &[u32], point_count: usize) -> Vec<u32> {
         if count != 1 {
             continue;
         }
-        let fa = a * 2;
-        let fb = b * 2;
-        let ba = a * 2 + 1;
-        let bb = b * 2 + 1;
-        indices.extend_from_slice(&[fa, ba, bb, fa, bb, fb]);
+        let a = a as usize * stride;
+        let b = b as usize * stride;
+        for ring in 0..last {
+            indices.extend_from_slice(&[
+                (a + ring) as u32,
+                (a + ring + 1) as u32,
+                (b + ring + 1) as u32,
+                (a + ring) as u32,
+                (b + ring + 1) as u32,
+                (b + ring) as u32,
+            ]);
+        }
     }
 
-    indices.retain(|&i| (i as usize) < point_count * 2);
+    indices.retain(|&i| (i as usize) < point_count * stride);
     indices
 }
 
-fn expand_positions(points: &[[f32; 2]], half: f32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(points.len() * 6);
-    for p in points {
-        out.push(p[0]);
-        out.push(p[1]);
-        out.push(half);
-        out.push(p[0]);
-        out.push(p[1]);
-        out.push(-half);
+fn expand_positions(
+    points: &[[f32; 2]],
+    normals: &[[f32; 2]],
+    stride: usize,
+    radius: f32,
+    half: f32,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(points.len() * stride * 3);
+    for (index, p) in points.iter().enumerate() {
+        let normal = normals.get(index).copied().unwrap_or([0.0, 0.0]);
+        for ring in 0..stride {
+            let (offset, z) = ring_profile(ring, radius, half);
+            out.push(p[0] + normal[0] * offset);
+            out.push(p[1] + normal[1] * offset);
+            out.push(z);
+        }
     }
     out
+}
+
+/// Split the concatenated fill buffer back into contours and mark which ones
+/// are holes, mirroring the containment grouping used by the tessellator.
+fn classify_holes(points: &[[f32; 2]], plans: &[SlotPlan]) -> Vec<bool> {
+    let mut contours: Vec<&[[f32; 2]]> = Vec::with_capacity(plans.len());
+    let mut offset = 0usize;
+    for plan in plans {
+        let end = (offset + plan.k).min(points.len());
+        contours.push(&points[offset..end]);
+        offset = end;
+    }
+
+    let mut order: Vec<usize> = (0..contours.len()).collect();
+    order.sort_by(|&a, &b| {
+        area(contours[b])
+            .abs()
+            .partial_cmp(&area(contours[a]).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut holes = vec![false; contours.len()];
+    for (position, &index) in order.iter().enumerate() {
+        if contours[index].len() < 3 || area(contours[index]).abs() < 1e-3 {
+            continue;
+        }
+        let representative = representative_point(contours[index]);
+        for &outer in &order[..position] {
+            if area(contours[outer]).abs() > area(contours[index]).abs()
+                && point_in_polygon(representative, contours[outer])
+            {
+                holes[index] = true;
+                break;
+            }
+        }
+    }
+    holes
+}
+
+/// Outward-from-cap normals for every fill point. Outer contours offset
+/// toward their interior, holes offset away from theirs (into the solid).
+fn fill_normals(points: &[[f32; 2]], plans: &[SlotPlan], out: &mut Vec<[f32; 2]>) {
+    let mut offset = 0usize;
+    for plan in plans {
+        let end = (offset + plan.k).min(points.len());
+        push_contour_normals(&points[offset..end], plan.hole, out);
+        offset = end;
+    }
+}
+
+fn push_contour_normals(points: &[[f32; 2]], hole: bool, out: &mut Vec<[f32; 2]>) {
+    let n = points.len();
+    if n < 2 {
+        out.extend(std::iter::repeat([0.0, 0.0]).take(n));
+        return;
+    }
+    let direction = if area(points) >= 0.0 { 1.0 } else { -1.0 };
+    let direction = if hole { -direction } else { direction };
+    for i in 0..n {
+        let prev = points[(i + n - 1) % n];
+        let current = points[i];
+        let next = points[(i + 1) % n];
+        let mut nx = 0.0f32;
+        let mut ny = 0.0f32;
+        for (a, b) in [(prev, current), (current, next)] {
+            let dx = b[0] - a[0];
+            let dy = b[1] - a[1];
+            let length = (dx * dx + dy * dy).sqrt();
+            if length > 1e-6 {
+                nx += -dy / length;
+                ny += dx / length;
+            }
+        }
+        let length = (nx * nx + ny * ny).sqrt();
+        if length > 1e-6 {
+            nx /= length;
+            ny /= length;
+        } else {
+            nx = 1.0;
+            ny = 0.0;
+        }
+        out.push([nx * direction, ny * direction]);
+    }
 }

@@ -132,8 +132,16 @@ export class Stage {
 
       const colors = data.colors;
       const alpha = colors ? colors[3] : data.color[3];
+      // Lottie colours are sRGB; convert once here so static and animated
+      // colours share the same linear-space representation as three.js.
+      const baseColor = new THREE.Color().setRGB(
+        data.color[0],
+        data.color[1],
+        data.color[2],
+        THREE.SRGBColorSpace,
+      );
       const material = new THREE.MeshLambertMaterial({
-        color: new THREE.Color(data.color[0], data.color[1], data.color[2]),
+        color: baseColor,
         flatShading: true,
         side: THREE.DoubleSide,
         // Opaque constant colours skip blending and per-frame sorting entirely.

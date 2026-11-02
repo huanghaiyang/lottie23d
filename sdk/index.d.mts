@@ -5,6 +5,10 @@ export interface ConvertOptions {
   max_frames?: number;
   /** Extrusion half-thickness in Lottie pixels. */
   thickness?: number;
+  /** Edge smoothing radius in Lottie pixels (fills only, clamped to thickness). */
+  edge_radius?: number;
+  /** camelCase alias of `edge_radius`. */
+  edgeRadius?: number;
 }
 
 export interface MeshModel {

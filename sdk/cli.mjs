@@ -14,7 +14,7 @@ const options = {};
 for (const arg of args) {
   if (arg === "-h" || arg === "--help") {
     console.log(
-      "用法: node sdk/cli.mjs <input.json> [output.l2d3] [--fps=30] [--max-frames=600] [--thickness=10]",
+      "用法: node sdk/cli.mjs <input.json> [output.l2d3] [--fps=30] [--max-frames=600] [--thickness=10] [--edge-radius=4]",
     );
     process.exit(0);
   }
@@ -24,6 +24,7 @@ for (const arg of args) {
     if (key === "fps") options.fps = Number(value);
     else if (key === "max-frames") options.max_frames = Number(value);
     else if (key === "thickness") options.thickness = Number(value);
+    else if (key === "edge-radius") options.edge_radius = Number(value);
     continue;
   }
   if (input == null) input = arg;

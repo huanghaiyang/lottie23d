@@ -29,6 +29,10 @@ fn main() -> ExitCode {
             options.thickness = value.parse::<f32>().ok();
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--edge-radius=") {
+            options.edge_radius = value.parse::<f32>().ok();
+            continue;
+        }
         if input.is_none() {
             input = Some(arg);
         } else if output.is_none() {
@@ -118,6 +122,8 @@ fn print_help() {
           \x20 --fps=<n>          sampling fps (default: document frame rate)\n\
           \x20 --max-frames=<n>   cap on baked frames (default 600)\n\
           \x20 --thickness=<px>   extrusion half-thickness in Lottie pixels\n\
+          \x20 --edge-radius=<px> edge smoothing radius in Lottie pixels\n\
+          \x20                     (clamped to the half-thickness, default 0)\n\
           \n\
           Pass `-` as input to read JSON from stdin; omit the output path to\n\
           stream the binary model to stdout."

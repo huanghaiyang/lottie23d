@@ -23,6 +23,9 @@ pub struct RawOptions {
     pub max_frames: Option<usize>,
     /// Extrusion half-thickness in Lottie pixels.
     pub thickness: Option<f32>,
+    /// Edge smoothing radius in Lottie pixels, clamped to the half-thickness.
+    #[serde(default, alias = "edgeRadius")]
+    pub edge_radius: Option<f32>,
 }
 
 pub struct CompiledMesh {
@@ -81,6 +84,7 @@ struct Compiler<'a> {
     sample_start: f32,
     sample_span: f32,
     half: f32,
+    edge_radius: f32,
     global: [f32; 16],
     meshes: Vec<CompiledMesh>,
     transforms: Vec<Vec<f32>>,
@@ -112,6 +116,10 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         .thickness
         .unwrap_or_else(|| width.max(height) * 0.012)
         .clamp(0.01, width.max(height) * 0.08);
+    let edge_radius = raw_options
+        .edge_radius
+        .unwrap_or(0.0)
+        .clamp(0.0, half);
 
     let global = global_matrix(width, height);
     let global_ref = (ip + op) * 0.5;
@@ -121,6 +129,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         sample_start: ip,
         sample_span: op - ip,
         half,
+        edge_radius,
         global,
         meshes: Vec::new(),
         transforms: Vec::new(),
@@ -139,7 +148,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         .meshes
         .iter()
         .filter(|mesh| mesh.frame_positions.is_some())
-        .map(|mesh| mesh.point_count as usize * 6)
+        .map(|mesh| mesh.positions.len())
         .sum();
     if animated_floats > 0 {
         const BUDGET_FLOATS: usize = 8_000_000;
@@ -268,7 +277,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn build_shape_layer(&mut self, id: usize, layer: &'a Layer) {
-        let frame = self.plans[id].ref_frame;
+        // Reference geometry is sampled in layer-local time, like property eval.
+        let frame = self.plans[id].ref_frame - layer.st;
         let result = shape::eval_shapes(&layer.shapes, frame);
         let geometry_animated = shape::geometry_animated(&layer.shapes);
         let style_animated = shape::style_animated(&layer.shapes);
@@ -279,7 +289,7 @@ impl<'a> Compiler<'a> {
         }
 
         for drawable in result.drawables {
-            let Some(surface) = mesh::build_surface(&drawable, self.half) else {
+            let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius) else {
                 self.plans[id].blueprints.push(None);
                 continue;
             };
@@ -290,7 +300,7 @@ impl<'a> Compiler<'a> {
                 drawable.color[3] * drawable.opacity,
             ];
             let mesh_index = self.meshes.len();
-            let vertex_count = surface.point_count * 2;
+            let vertex_count = surface.point_count * surface.stride;
             let frame_positions = if geometry_animated {
                 Some(vec![0.0; self.frame_count * vertex_count * 3])
             } else {
@@ -347,11 +357,10 @@ impl<'a> Compiler<'a> {
                 trim: None,
             }],
         };
-        let Some(surface) = mesh::build_surface(&drawable, self.half) else {
+        let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius) else {
             return;
         };
         let mesh_index = self.meshes.len();
-        let vertex_count = surface.point_count * 2;
         self.meshes.push(CompiledMesh {
             kind: 0,
             static_color: [rgb[0], rgb[1], rgb[2], 1.0],
@@ -372,7 +381,6 @@ impl<'a> Compiler<'a> {
             mesh_index,
             color: [rgb[0], rgb[1], rgb[2], 1.0],
         }));
-        let _ = vertex_count;
     }
 
     /// Shrink the baked frame budget. Only valid before [`Compiler::bake`],
@@ -387,7 +395,7 @@ impl<'a> Compiler<'a> {
         }
         for mesh in self.meshes.iter_mut() {
             if let Some(frames) = mesh.frame_positions.as_mut() {
-                frames.resize(new_count * mesh.point_count as usize * 6, 0.0);
+                frames.resize(new_count * mesh.positions.len(), 0.0);
             }
             if !mesh.color_track.is_empty() {
                 mesh.color_track.resize(new_count * 4, 0.0);
@@ -492,6 +500,7 @@ impl<'a> Compiler<'a> {
 
             let plans = &self.plans;
             let meshes = &mut self.meshes;
+            let edge_radius = self.edge_radius;
             for &id in &mesh_plans {
                 let plan = &plans[id];
                 let opacity = opacity_cache[id].unwrap_or(0.0);
@@ -553,7 +562,7 @@ impl<'a> Compiler<'a> {
                             continue;
                         };
                         let half = mesh.half_thickness;
-                        let count = mesh.point_count as usize * 6;
+                        let count = mesh.positions.len();
                         let offset = frame_index * count;
                         let Some(track) = mesh.frame_positions.as_mut() else {
                             continue;
@@ -563,6 +572,7 @@ impl<'a> Compiler<'a> {
                                 drawable,
                                 &blueprint.slots,
                                 half,
+                                edge_radius,
                                 &mut track[offset..offset + count],
                                 &mut scratch,
                             );
@@ -613,8 +623,10 @@ fn affine_matrix(matrix: Affine) -> [f32; 16] {
 }
 
 fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
-    match plans[id].owner {
+    let parent_frame = match plans[id].owner {
         Some(owner) => {
+            // The owning precomposition renders its children in time divided
+            // by its stretch (`renderedFrame = num / sr`).
             let owner_frame = plan_local_frame(plans, owner, root_frame);
             let owner_layer = plans[owner].layer;
             let stretch = if owner_layer.sr.abs() > 1e-3 {
@@ -622,10 +634,12 @@ fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
             } else {
                 1.0
             };
-            (owner_frame - owner_layer.st) / stretch
+            owner_frame / stretch
         }
         None => root_frame,
-    }
+    };
+    // lottie-web evaluates a layer's properties relative to its start time.
+    parent_frame - plans[id].layer.st
 }
 
 fn visible(layer: &Layer, frame: f32) -> bool {
@@ -696,7 +710,9 @@ fn plan_world(
     // as-is (the depth slider only adds a delta).
     world[14] += plans[id].depth;
     let frame = frame_cache[id].unwrap_or_else(|| plan_local_frame(plans, id, root_frame));
-    let own = if visible(plans[id].layer, frame) {
+    // `ip` / `op` live in the parent composition's time, not layer-local time.
+    let comp_frame = frame + plans[id].layer.st;
+    let own = if visible(plans[id].layer, comp_frame) {
         layer_opacity(plans[id].layer, frame)
     } else {
         0.0
