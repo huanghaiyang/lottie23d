@@ -2,9 +2,10 @@
 import lottie, { type AnimationItem } from 'lottie-web';
 import { onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { loadConverter } from '../sdk/index.mjs';
-import type { Converter, Model } from '../sdk/index.mjs';
+import type { Converter, ConvertOptions, Model } from '../sdk/index.mjs';
 import TopBar from './components/TopBar.vue';
 import TransportBar from './components/TransportBar.vue';
+import InspectorPanel from './components/InspectorPanel.vue';
 import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
 import { Stage } from './scene/stage';
@@ -27,6 +28,8 @@ const playing = ref(true);
 const speed = ref(1);
 const depth = ref(1);
 const thickness = ref(1);
+const edgeRatio = ref(0);
+const sampleFps = ref(30);
 const autoRotate = ref(true);
 const progress = ref(0);
 const frameLabel = ref('000 / 000');
@@ -48,6 +51,7 @@ let stage: Stage | null = null;
 let converter: Converter | null = null;
 let animation: AnimationItem | null = null;
 let model: Model | null = null;
+let currentData: LottieData | null = null;
 let duration = 1;
 let ip = 0;
 let op = 0;
@@ -62,6 +66,8 @@ let resumeAfterDrag = false;
 let fpsAccumulator = 0;
 let fpsWindowStart = 0;
 let dragDepth = 0;
+let reconvertTimer = 0;
+let convertKey = '';
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) {
@@ -160,31 +166,92 @@ function resetView(): void {
   stage?.resetView();
 }
 
+function convertOptions(): ConvertOptions {
+  const options: ConvertOptions = { fps: sampleFps.value };
+  const half = model?.meshes[0]?.halfThickness ?? 0;
+  // Edge rounding is expressed as a ratio of the baked half-thickness.
+  if (edgeRatio.value > 0 && half > 0) {
+    options.edge_radius = (edgeRatio.value / 100) * half;
+  }
+  return options;
+}
+
+function optionsKey(): string {
+  return `${sampleFps.value}|${edgeRatio.value}`;
+}
+
+function applyStats(converted: Model, elapsed: number): void {
+  rightMeta.value = `${converted.meshCount} 网格 · ${converted.totalVertices.toLocaleString()} 顶点 · ${(converted.totalIndices / 3).toLocaleString()} 三角形`;
+  stats.conversion = `转换 ${elapsed.toFixed(1)} ms`;
+  stats.frames = `${converted.frameCount} 烘焙帧 · ${converted.sampleFps.toFixed(0)} fps`;
+  stats.geometry = `${converted.meshCount} 网格 · ${(converted.totalIndices / 3).toLocaleString()} 三角形`;
+  stats.size = formatBytes(converted.totalSize);
+}
+
+/** Rebuild the mesh with the current conversion options, keeping playback time. */
+function reconvert(): void {
+  if (converter == null || currentData == null) {
+    return;
+  }
+  const key = optionsKey();
+  if (key === convertKey) {
+    return;
+  }
+  const ratio = duration > 0 ? time / duration : 0;
+  const started = performance.now();
+  let converted: Model;
+  try {
+    converted = converter.convert(currentData, convertOptions());
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const elapsed = performance.now() - started;
+  convertKey = key;
+  model = converted;
+  stage?.setModel(converted);
+  time = ratio * duration;
+  syncScene(true);
+  applyStats(converted, elapsed);
+}
+
+function scheduleReconvert(): void {
+  if (currentData == null) {
+    return;
+  }
+  window.clearTimeout(reconvertTimer);
+  reconvertTimer = window.setTimeout(reconvert, 90);
+}
+
 async function loadDocument(data: LottieData, id: string): Promise<void> {
   if (!converter) {
     showToast('转换器尚未就绪');
     return;
   }
 
-  const started = performance.now();
-  let converted: Model;
-  try {
-    converted = converter.convert(data);
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error));
-    return;
-  }
-  const elapsed = performance.now() - started;
-
-  model = converted;
-  frameRate = Math.max(1, Number(data.fr) || converted.frameRate);
+  currentData = data;
+  frameRate = Math.max(1, Number(data.fr) || 30);
   ip = Number.isFinite(data.ip) ? Number(data.ip) : 0;
   op = Number.isFinite(data.op) && Number(data.op) > ip ? Number(data.op) : ip + frameRate * 3;
   if (op <= ip) {
     op = ip + frameRate * 3;
   }
   duration = Math.max(0.001, (op - ip) / frameRate);
+  sampleFps.value = Math.min(120, Math.max(6, Math.round(frameRate)));
+  edgeRatio.value = 0;
 
+  const started = performance.now();
+  let converted: Model;
+  try {
+    converted = converter.convert(data, convertOptions());
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const elapsed = performance.now() - started;
+  convertKey = optionsKey();
+
+  model = converted;
   animation = createAnimation(data);
   stage?.setModel(converted);
 
@@ -192,11 +259,7 @@ async function loadDocument(data: LottieData, id: string): Promise<void> {
   syncScene(true);
 
   leftMeta.value = `${Number(data.w) || converted.width} × ${Number(data.h) || converted.height} · ${frameRate.toFixed(0)} fps · ${(op - ip).toFixed(0)} 帧源`;
-  rightMeta.value = `${converted.meshCount} 网格 · ${converted.totalVertices.toLocaleString()} 顶点 · ${(converted.totalIndices / 3).toLocaleString()} 三角形`;
-  stats.conversion = `转换 ${elapsed.toFixed(1)} ms`;
-  stats.frames = `${converted.frameCount} 烘焙帧 · ${converted.sampleFps.toFixed(0)} fps`;
-  stats.geometry = `${converted.meshCount} 网格 · ${(converted.totalIndices / 3).toLocaleString()} 三角形`;
-  stats.size = formatBytes(converted.totalSize);
+  applyStats(converted, elapsed);
   activeSource.value = id;
   ready.value = true;
   setPlaying(true);
@@ -328,6 +391,8 @@ async function boot(): Promise<void> {
 watch(depth, (value) => stage?.setDepthScale(value));
 watch(thickness, (value) => stage?.setThicknessScale(value));
 watch(autoRotate, (value) => stage?.setAutoRotate(value));
+watch(edgeRatio, scheduleReconvert);
+watch(sampleFps, scheduleReconvert);
 
 onMounted(() => {
   stage = new Stage(threeHost.value as HTMLDivElement);
@@ -353,6 +418,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragleave', onDragLeave);
   window.removeEventListener('drop', onDrop);
   window.clearTimeout(toastTimer);
+  window.clearTimeout(reconvertTimer);
   disposeAnimation();
   stage?.dispose();
   stage = null;
@@ -397,6 +463,13 @@ onBeforeUnmount(() => {
           <span class="pane-meta">{{ rightMeta }}</span>
         </div>
         <div ref="threeHost" class="canvas-wrap canvas-three">
+          <InspectorPanel
+            v-model:thickness="thickness"
+            v-model:depth="depth"
+            v-model:edge-ratio="edgeRatio"
+            v-model:sample-fps="sampleFps"
+            v-model:auto-rotate="autoRotate"
+          />
           <span class="canvas-hint">拖拽环绕 · 滚轮缩放</span>
         </div>
         <span class="pane-badge">Rust 生成网格</span>
@@ -405,9 +478,6 @@ onBeforeUnmount(() => {
 
     <TransportBar
       v-model:speed="speed"
-      v-model:depth="depth"
-      v-model:thickness="thickness"
-      v-model:auto-rotate="autoRotate"
       :playing="playing"
       :progress="progress"
       :frame-label="frameLabel"

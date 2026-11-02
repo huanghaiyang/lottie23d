@@ -15,9 +15,6 @@ const emit = defineEmits<{
 }>();
 
 const speed = defineModel<number>('speed', { required: true });
-const depth = defineModel<number>('depth', { required: true });
-const thickness = defineModel<number>('thickness', { required: true });
-const autoRotate = defineModel<boolean>('auto-rotate', { required: true });
 
 function onSeek(event: Event): void {
   emit('seek', Number((event.target as HTMLInputElement).value));
@@ -58,24 +55,9 @@ function onSeek(event: Event): void {
         <input v-model.number="speed" type="range" min="0.25" max="2" step="0.05" />
         <output>{{ speed.toFixed(2) }}×</output>
       </label>
-      <label class="field">
-        <span>层深</span>
-        <input v-model.number="depth" type="range" min="0" max="2.5" step="0.05" />
-        <output>{{ depth.toFixed(2) }}</output>
-      </label>
-      <label class="field">
-        <span>厚度</span>
-        <input v-model.number="thickness" type="range" min="0.25" max="2.5" step="0.05" />
-        <output>{{ thickness.toFixed(2) }}×</output>
-      </label>
     </div>
 
     <div class="view-actions">
-      <label class="toggle">
-        <input v-model="autoRotate" type="checkbox" />
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-        <span>自动环绕</span>
-      </label>
       <button class="ghost" type="button" @click="emit('reset-view')">重置视角</button>
       <span class="fps">{{ props.fps > 0 ? `${props.fps} FPS` : '-- FPS' }}</span>
     </div>

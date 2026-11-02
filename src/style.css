@@ -15,7 +15,8 @@
 }
 
 html,
-body {
+body,
+#app {
   height: 100%;
 }
 
@@ -285,6 +286,88 @@ body {
 
 .canvas-hint.is-hidden {
   opacity: 0;
+}
+
+/* ------------------------------------------------------------------ inspector */
+
+.inspector {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  width: min(252px, calc(100% - 20px));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(8, 12, 20, 0.84);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 14px 34px rgba(2, 5, 10, 0.45);
+}
+
+.inspector.is-collapsed {
+  width: auto;
+  padding: 4px 8px;
+}
+
+.inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  padding: 4px 4px 6px;
+  border: 0;
+  background: transparent;
+  color: #cfd8ee;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.inspector-caret {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.inspector-body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  max-height: min(58vh, 420px);
+  padding: 4px;
+  overflow-y: auto;
+}
+
+.inspector-row {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) 54px;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.inspector-row input[type="range"] {
+  width: 100%;
+  min-width: 0;
+}
+
+.inspector-row output {
+  text-align: right;
+  color: #cfd8ee;
+  font-variant-numeric: tabular-nums;
+}
+
+.inspector-toggle {
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
 }
 
 .pane-badge {
