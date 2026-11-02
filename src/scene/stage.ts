@@ -90,6 +90,8 @@ interface Entry {
   colors: Float32Array | null;
   position: THREE.BufferAttribute;
   positionsAnimated: boolean;
+  /** Visibility derived from the base alpha, before manual hiding. */
+  staticVisible: boolean;
 }
 
 /** Tracks that never change only need one matrix upload, not one per frame. */
@@ -136,6 +138,9 @@ export class Stage {
   /** Per-node selection wires (blue 1px cuboids). */
   private readonly selectionBoxes = new Map<number, THREE.Box3Helper>();
   private readonly boxScratch = new THREE.Box3();
+
+  /** Node ids hidden from the scene through the node list. */
+  private readonly hiddenNodes = new Set<number>();
 
   /** Soft glow: per-node silhouettes blurred and added over the main image. */
   private softGlow = false;
@@ -323,7 +328,8 @@ export class Stage {
       mesh.matrixWorldNeedsUpdate = false;
       mesh.frustumCulled = false;
       mesh.renderOrder = 0;
-      mesh.visible = alpha >= 0.004;
+      const staticVisible = alpha >= 0.004;
+      mesh.visible = staticVisible;
       this.scene.add(mesh);
 
       const base = new THREE.Matrix4();
@@ -342,6 +348,7 @@ export class Stage {
         colors,
         position,
         positionsAnimated,
+        staticVisible,
       });
       this.nodes.push({
         id,
@@ -414,6 +421,22 @@ export class Stage {
     }
     this.glowFlags.set(id, enabled);
     this.syncGlowMeshes();
+    this.dirty = true;
+  }
+
+  /** Show or hide one node; hidden nodes also drop their selection wire. */
+  setNodeVisible(id: number, visible: boolean): void {
+    const hidden = !visible;
+    if (id < 0 || id >= this.entries.length || this.hiddenNodes.has(id) === hidden) {
+      return;
+    }
+    if (hidden) {
+      this.hiddenNodes.add(id);
+    } else {
+      this.hiddenNodes.delete(id);
+    }
+    this.applyFrame(Math.max(0, this.frameIndex));
+    this.updateSelectionBoxes();
     this.dirty = true;
   }
 
@@ -561,8 +584,15 @@ export class Stage {
     const depthDelta = this.depthAmount - 1;
     const thickness = this.thicknessAmount;
 
-    for (const entry of this.entries) {
+    for (let id = 0; id < this.entries.length; id += 1) {
+      const entry = this.entries[id];
       const { data, mesh, material, position, colors, track } = entry;
+
+      // Hidden nodes skip all per-frame work until the eye is toggled back on.
+      if (this.hiddenNodes.has(id)) {
+        mesh.visible = false;
+        continue;
+      }
 
       // Write the world matrix directly: layers sit under the scene root, so
       // there is no parent multiply to do and nothing to invalidate.
@@ -598,6 +628,8 @@ export class Stage {
           colors[colorBase + 2],
           THREE.SRGBColorSpace,
         );
+      } else {
+        mesh.visible = entry.staticVisible;
       }
 
       if (entry.positionsAnimated && data.framePositions) {
@@ -627,6 +659,7 @@ export class Stage {
     }
     this.entries.length = 0;
     this.nodes.length = 0;
+    this.hiddenNodes.clear();
     this.model = null;
   }
 
@@ -644,7 +677,7 @@ export class Stage {
   private updateSelectionBoxes(): void {
     for (const [id, helper] of this.selectionBoxes) {
       const entry = this.entries[id];
-      if (entry == null) {
+      if (entry == null || !entry.mesh.visible) {
         helper.visible = false;
         continue;
       }
@@ -660,17 +693,16 @@ export class Stage {
   }
 
   private isNodeGlowEnabled(id: number): boolean {
-    return this.glowFlags.get(id) !== false;
+    // With the master pass on every node glows unless it was explicitly
+    // excluded; with it off only nodes explicitly enabled still glow, so a
+    // single node can light up on its own.
+    return this.softGlow
+      ? this.glowFlags.get(id) !== false
+      : this.glowFlags.get(id) === true;
   }
 
   /** Create / drop glow shells so only enabled nodes take part in the pass. */
   private syncGlowMeshes(): void {
-    if (!this.softGlow) {
-      this.clearGlowMeshes();
-      this.dirty = true;
-      return;
-    }
-
     const wanted = new Set<number>();
     for (let id = 0; id < this.entries.length; id += 1) {
       if (this.isNodeGlowEnabled(id)) {
@@ -753,7 +785,8 @@ export class Stage {
    * quarter resolution and composite it over the already-rendered scene.
    */
   private renderGlow(width: number, height: number): void {
-    if (!this.softGlow || this.glowMeshes.size === 0) {
+    // Runs whenever at least one node is lit, even if the master pass is off.
+    if (this.glowMeshes.size === 0) {
       return;
     }
     this.ensureGlowTargets(width, height);

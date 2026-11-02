@@ -14,6 +14,7 @@ const props = defineProps<{
   nodes: StageNode[];
   selected: number[];
   glow: Record<number, boolean>;
+  visible: Record<number, boolean>;
 }>();
 
 const emit = defineEmits<{
@@ -22,7 +23,8 @@ const emit = defineEmits<{
     id: number,
     modifiers: { shift: boolean; alt: boolean; ctrl: boolean },
   ): void;
-  (event: 'toggle-node-glow', id: number): void;
+  (event: 'toggle-node-glow', id: number, solo: boolean): void;
+  (event: 'toggle-node-visibility', id: number): void;
 }>();
 
 const open = ref(true);
@@ -32,7 +34,11 @@ function isSelected(id: number): boolean {
 }
 
 function isGlow(id: number): boolean {
-  return props.glow[id] !== false;
+  return softGlow.value ? props.glow[id] !== false : props.glow[id] === true;
+}
+
+function isVisible(id: number): boolean {
+  return props.visible[id] !== false;
 }
 
 function onNodeClick(id: number, event: MouseEvent): void {
@@ -105,20 +111,37 @@ function onNodeClick(id: number, event: MouseEvent): void {
             v-for="node in nodes"
             :key="node.id"
             class="node-row"
-            :class="{ 'is-selected': isSelected(node.id) }"
+            :class="{ 'is-selected': isSelected(node.id), 'is-hidden': !isVisible(node.id) }"
             @click="onNodeClick(node.id, $event)"
           >
             <span
               class="node-glow"
               :class="{ 'is-on': isGlow(node.id) }"
-              :title="isGlow(node.id) ? '关闭柔光' : '开启柔光'"
-              @click.stop="emit('toggle-node-glow', node.id)"
+              :title="
+                isGlow(node.id)
+                  ? '关闭该节点柔光（Alt+点击：仅此节点）'
+                  : '开启该节点柔光（总柔光关闭时也可单独开启）'
+              "
+              @click.stop="emit('toggle-node-glow', node.id, $event.altKey)"
             ></span>
             <span class="node-name" :title="node.name">{{ node.name }}</span>
             <span class="node-type">{{ node.kind === 0 ? '填充' : '描边' }}</span>
+            <button
+              class="node-vis"
+              :class="{ 'is-off': !isVisible(node.id) }"
+              type="button"
+              :title="isVisible(node.id) ? '隐藏节点' : '显示节点'"
+              @click.stop="emit('toggle-node-visibility', node.id)"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M1.2 8S3.9 3.9 8 3.9 14.8 8 14.8 8 12.1 12.1 8 12.1 1.2 8 1.2 8Z" />
+                <circle cx="8" cy="8" r="1.9" />
+                <path v-if="!isVisible(node.id)" d="M3 3 13 13" />
+              </svg>
+            </button>
           </div>
         </div>
-        <p class="node-hint">点击选择 · Shift 范围 · Alt 加选</p>
+        <p class="node-hint">点选/再点取消 · Shift 范围 · Alt 加选 · Alt+黄点：单节点柔光</p>
       </div>
     </div>
   </aside>

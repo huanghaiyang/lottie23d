@@ -37,6 +37,7 @@ const nodes = ref<StageNode[]>([]);
 const selectedIds = ref<number[]>([]);
 const softGlow = ref(false);
 const nodeGlow = reactive<Record<number, boolean>>({});
+const nodeVisible = reactive<Record<number, boolean>>({});
 let selectionAnchor = -1;
 const progress = ref(0);
 const frameLabel = ref('000 / 000');
@@ -191,12 +192,16 @@ function syncNodes(): void {
   for (const key of Object.keys(nodeGlow)) {
     delete nodeGlow[Number(key)];
   }
+  for (const key of Object.keys(nodeVisible)) {
+    delete nodeVisible[Number(key)];
+  }
   stage?.setSelection([]);
 }
 
 /**
  * Plain click selects one node, Shift extends a range from the anchor and
- * Alt (or Ctrl) toggles the node inside a multi-selection.
+ * Alt (or Ctrl) toggles the node inside a multi-selection. Clicking the
+ * already selected single node clears the selection.
  */
 function onNodeSelect(
   id: number,
@@ -220,6 +225,9 @@ function onNodeSelect(
       const end = Math.max(from, to);
       selectedIds.value = list.slice(start, end + 1).map((node) => node.id);
     }
+  } else if (selectedIds.value.length === 1 && selectedIds.value[0] === id) {
+    selectedIds.value = [];
+    selectionAnchor = -1;
   } else {
     selectedIds.value = [id];
     selectionAnchor = id;
@@ -227,11 +235,34 @@ function onNodeSelect(
   stage?.setSelection(selectedIds.value);
 }
 
-/** Per-node glow flag; nodes default to enabled once the master switch is on. */
-function toggleNodeGlow(id: number): void {
-  const next = nodeGlow[id] === false;
+/**
+ * Per-node glow follows the same rule as the stage: with the master switch on
+ * a node glows unless explicitly excluded, with it off only explicitly enabled
+ * nodes glow. Alt+click solos the node.
+ */
+function nodeGlowActive(id: number): boolean {
+  return softGlow.value ? nodeGlow[id] !== false : nodeGlow[id] === true;
+}
+
+function toggleNodeGlow(id: number, solo: boolean): void {
+  if (solo) {
+    for (const node of nodes.value) {
+      const enabled = node.id === id;
+      nodeGlow[node.id] = enabled;
+      stage?.setNodeGlow(node.id, enabled);
+    }
+    return;
+  }
+  const next = !nodeGlowActive(id);
   nodeGlow[id] = next;
   stage?.setNodeGlow(id, next);
+}
+
+/** Eye toggle in the node list; nodes default to visible. */
+function toggleNodeVisibility(id: number): void {
+  const next = nodeVisible[id] === false;
+  nodeVisible[id] = next;
+  stage?.setNodeVisible(id, next);
 }
 
 function convertOptions(): ConvertOptions {
@@ -559,8 +590,10 @@ onBeforeUnmount(() => {
             :nodes="nodes"
             :selected="selectedIds"
             :glow="nodeGlow"
+            :visible="nodeVisible"
             @select-node="onNodeSelect"
             @toggle-node-glow="toggleNodeGlow"
+            @toggle-node-visibility="toggleNodeVisibility"
           />
           <span class="canvas-hint">
             {{
