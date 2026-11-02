@@ -507,7 +507,15 @@ watch(axisLock, (value) => {
 });
 watch(edgeRatio, scheduleReconvert);
 watch(sampleFps, scheduleReconvert);
-watch(softGlow, (value) => stage?.setSoftGlow(value));
+watch(softGlow, (value) => {
+  // The master switch drives every node at once; individual dots can still
+  // override it afterwards, even while the master switch stays off.
+  for (const node of nodes.value) {
+    nodeGlow[node.id] = value;
+  }
+  stage?.setAllNodeGlow(value);
+  stage?.setSoftGlow(value);
+});
 
 onMounted(() => {
   stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick });

@@ -424,6 +424,22 @@ export class Stage {
     this.dirty = true;
   }
 
+  /** Apply the master switch to every node at once. */
+  setAllNodeGlow(enabled: boolean): void {
+    let changed = false;
+    for (let id = 0; id < this.entries.length; id += 1) {
+      if (this.glowFlags.get(id) !== enabled) {
+        this.glowFlags.set(id, enabled);
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return;
+    }
+    this.syncGlowMeshes();
+    this.dirty = true;
+  }
+
   /** Show or hide one node; hidden nodes also drop their selection wire. */
   setNodeVisible(id: number, visible: boolean): void {
     const hidden = !visible;
