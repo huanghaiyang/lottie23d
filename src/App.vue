@@ -8,7 +8,7 @@ import TransportBar from './components/TransportBar.vue';
 import InspectorPanel from './components/InspectorPanel.vue';
 import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
-import { Stage } from './scene/stage';
+import { AXIS_LABELS, Stage, type ViewAxis } from './scene/stage';
 
 const SOURCES = [
   { id: 'orbit', label: '星轨' },
@@ -31,6 +31,8 @@ const thickness = ref(1);
 const edgeRatio = ref(0);
 const sampleFps = ref(30);
 const autoRotate = ref(true);
+const axisLock = ref(false);
+const activeAxis = ref<ViewAxis | null>(null);
 const progress = ref(0);
 const frameLabel = ref('000 / 000');
 const fps = ref(0);
@@ -163,7 +165,18 @@ function onDragEnd(): void {
 }
 
 function resetView(): void {
+  activeAxis.value = null;
+  axisLock.value = false;
   stage?.resetView();
+}
+
+/** Clicking a gizmo axis snaps the camera and locks the orbit for inspection. */
+function onAxisPick(axis: ViewAxis): void {
+  activeAxis.value = axis;
+  autoRotate.value = false;
+  axisLock.value = true;
+  stage?.setAutoRotate(false);
+  stage?.setRotationLock(true);
 }
 
 function convertOptions(): ConvertOptions {
@@ -390,12 +403,25 @@ async function boot(): Promise<void> {
 
 watch(depth, (value) => stage?.setDepthScale(value));
 watch(thickness, (value) => stage?.setThicknessScale(value));
-watch(autoRotate, (value) => stage?.setAutoRotate(value));
+watch(autoRotate, (value) => {
+  if (value && axisLock.value) {
+    axisLock.value = false;
+    // Unlock first: setAutoRotate ignores the request while still locked.
+    stage?.setRotationLock(false);
+  }
+  stage?.setAutoRotate(value);
+});
+watch(axisLock, (value) => {
+  if (value) {
+    autoRotate.value = false;
+  }
+  stage?.setRotationLock(value);
+});
 watch(edgeRatio, scheduleReconvert);
 watch(sampleFps, scheduleReconvert);
 
 onMounted(() => {
-  stage = new Stage(threeHost.value as HTMLDivElement);
+  stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick });
   stage.setDepthScale(depth.value);
   stage.setThicknessScale(thickness.value);
   stage.setAutoRotate(autoRotate.value);
@@ -469,8 +495,17 @@ onBeforeUnmount(() => {
             v-model:edge-ratio="edgeRatio"
             v-model:sample-fps="sampleFps"
             v-model:auto-rotate="autoRotate"
+            v-model:axis-lock="axisLock"
           />
-          <span class="canvas-hint">拖拽环绕 · 滚轮缩放</span>
+          <span class="canvas-hint">
+            {{
+              activeAxis
+                ? `轴向 ${AXIS_LABELS[activeAxis]}${axisLock ? ' · 已锁定' : ''} · 滚轮缩放`
+                : axisLock
+                  ? '视角已锁定 · 滚轮缩放 · 点击轴向切换'
+                  : '拖拽环绕 · 滚轮缩放 · 点击轴向切换'
+            }}
+          </span>
         </div>
         <span class="pane-badge">Rust 生成网格</span>
       </section>

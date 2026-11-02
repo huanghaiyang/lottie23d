@@ -6,6 +6,7 @@ const depth = defineModel<number>('depth', { required: true });
 const edgeRatio = defineModel<number>('edge-ratio', { required: true });
 const sampleFps = defineModel<number>('sample-fps', { required: true });
 const autoRotate = defineModel<boolean>('auto-rotate', { required: true });
+const axisLock = defineModel<boolean>('axis-lock', { required: true });
 
 const open = ref(true);
 </script>
@@ -46,6 +47,12 @@ const open = ref(true);
         <input v-model="autoRotate" type="checkbox" />
         <span class="toggle-track"><span class="toggle-thumb"></span></span>
         <span>自动环绕</span>
+      </label>
+
+      <label class="toggle">
+        <input v-model="axisLock" type="checkbox" />
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        <span>视角锁定</span>
       </label>
     </div>
   </aside>

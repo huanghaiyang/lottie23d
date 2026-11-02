@@ -2,6 +2,45 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Model, MeshModel } from '../../sdk/index.mjs';
 
+/** Six Blender-style view directions: +X, -X, +Y, -Y, +Z, -Z. */
+export type ViewAxis = 'x' | '-x' | 'y' | '-y' | 'z' | '-z';
+
+export interface StageCallbacks {
+  onAxisPick?: (axis: ViewAxis) => void;
+}
+
+export const AXIS_LABELS: Record<ViewAxis, string> = {
+  x: '+X',
+  '-x': '-X',
+  y: '+Y',
+  '-y': '-Y',
+  z: '+Z',
+  '-z': '-Z',
+};
+
+const AXIS_ORDER: ViewAxis[] = ['x', '-x', 'y', '-y', 'z', '-z'];
+
+const AXIS_VECTORS: Record<ViewAxis, THREE.Vector3> = {
+  x: new THREE.Vector3(1, 0, 0),
+  '-x': new THREE.Vector3(-1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0),
+  '-y': new THREE.Vector3(0, -1, 0),
+  z: new THREE.Vector3(0, 0, 1),
+  '-z': new THREE.Vector3(0, 0, -1),
+};
+
+const AXIS_COLORS: Record<ViewAxis, number> = {
+  x: 0xff6b6b,
+  '-x': 0x9c4a52,
+  y: 0x7dff9e,
+  '-y': 0x45875a,
+  z: 0x6ea8ff,
+  '-z': 0x466a9f,
+};
+
+const AXIS_HOME = new THREE.Vector3(0, 1.15, 7.2);
+const VIEW_TWEEN_MS = 320;
+
 interface Entry {
   data: MeshModel;
   mesh: THREE.Mesh;
@@ -54,9 +93,60 @@ export class Stage {
   private pixelRatio = 1.5;
   private lowFpsWindows = 0;
   private readonly observer: ResizeObserver;
+  private readonly callbacks: StageCallbacks;
 
-  constructor(host: HTMLElement) {
+  /** Blender-style orientation gizmo rendered in the top-left corner. */
+  private readonly gizmoScene = new THREE.Scene();
+  private readonly gizmoCamera = new THREE.OrthographicCamera(-1.6, 1.6, 1.6, -1.6, 0.1, 20);
+  private readonly gizmoBalls = new Map<ViewAxis, THREE.Mesh>();
+  private readonly gizmoLabels = new Map<ViewAxis, THREE.Sprite>();
+  private readonly gizmoTextures: THREE.Texture[] = [];
+  private readonly gizmoResources: Array<{ dispose(): void }> = [];
+  private readonly gizmoProjection = new THREE.Vector3();
+  private gizmoSelection: THREE.Sprite | null = null;
+  private selectedAxis: ViewAxis | null = null;
+  private rotationLocked = false;
+  private viewTween: { from: THREE.Vector3; to: THREE.Vector3; started: number } | null = null;
+  private gizmoPointerDown: { x: number; y: number } | null = null;
+  private readonly gizmoMargin = 12;
+  private readonly gizmoDirection = new THREE.Vector3();
+
+  private readonly onGizmoPointerDown = (event: PointerEvent): void => {
+    if (event.button !== 0) {
+      return;
+    }
+    const point = this.localPoint(event);
+    if (!this.inGizmo(point)) {
+      return;
+    }
+    event.stopPropagation();
+    event.preventDefault();
+    this.gizmoPointerDown = point;
+  };
+
+  private readonly onGizmoPointerUp = (event: PointerEvent): void => {
+    const start = this.gizmoPointerDown;
+    if (start == null) {
+      return;
+    }
+    this.gizmoPointerDown = null;
+    const point = this.localPoint(event);
+    event.stopPropagation();
+    event.preventDefault();
+    if (Math.hypot(point.x - start.x, point.y - start.y) > 6) {
+      return;
+    }
+    const axis = this.pickGizmoAxis(start);
+    if (axis == null) {
+      return;
+    }
+    this.viewAxis(axis);
+    this.callbacks.onAxisPick?.(axis);
+  };
+
+  constructor(host: HTMLElement, callbacks: StageCallbacks = {}) {
     this.host = host;
+    this.callbacks = callbacks;
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: true,
@@ -65,11 +155,12 @@ export class Stage {
     this.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
     this.renderer.setPixelRatio(this.pixelRatio);
     this.renderer.setClearColor(0x000000, 0);
+    this.renderer.autoClear = false;
     this.renderer.domElement.className = 'three-canvas';
     host.appendChild(this.renderer.domElement);
 
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 60);
-    this.camera.position.set(0, 1.15, 7.2);
+    this.camera.position.copy(AXIS_HOME);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0, 0, 0);
@@ -92,6 +183,12 @@ export class Stage {
     const fill = new THREE.DirectionalLight(0x86a8ff, 0.9);
     fill.position.set(-1.5, -2.8, 3.4);
     this.scene.add(ambient, key, rim, fill);
+
+    this.buildGizmo();
+    // Capture on the container so the gizmo click is handled before
+    // OrbitControls' canvas listeners start a drag.
+    host.addEventListener('pointerdown', this.onGizmoPointerDown, true);
+    host.addEventListener('pointerup', this.onGizmoPointerUp, true);
 
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(host);
@@ -210,7 +307,37 @@ export class Stage {
   }
 
   setAutoRotate(enabled: boolean): void {
-    this.controls.autoRotate = enabled;
+    this.controls.autoRotate = enabled && !this.rotationLocked;
+    this.dirty = true;
+  }
+
+  /** Lock orbiting while keeping pan / zoom and axis switching available. */
+  setRotationLock(locked: boolean): void {
+    this.rotationLocked = locked;
+    this.controls.enableRotate = !locked;
+    if (locked) {
+      this.controls.autoRotate = false;
+    }
+    this.updateGizmoSelection();
+    this.dirty = true;
+  }
+
+  /** Snap the camera to one of the six Blender-style view directions. */
+  viewAxis(axis: ViewAxis): void {
+    const distance = Math.max(2.4, this.camera.position.distanceTo(this.controls.target));
+    const to = this.controls.target.clone().add(AXIS_VECTORS[axis].clone().multiplyScalar(distance));
+    // OrbitControls' spherical conversion degenerates exactly on the Y pole,
+    // so top / bottom views get a fraction of a degree of tilt.
+    if (Math.abs(AXIS_VECTORS[axis].y) > 0.5) {
+      to.z += distance * 0.004;
+    }
+    this.selectedAxis = axis;
+    this.viewTween = {
+      from: this.camera.position.clone(),
+      to,
+      started: performance.now(),
+    };
+    this.updateGizmoSelection();
     this.dirty = true;
   }
 
@@ -235,23 +362,48 @@ export class Stage {
   }
 
   resetView(): void {
-    this.camera.position.set(0, 1.15, 7.2);
+    this.selectedAxis = null;
+    this.viewTween = null;
+    this.camera.position.copy(AXIS_HOME);
     this.controls.target.set(0, 0, 0);
     this.controls.update();
+    this.updateGizmoSelection();
     this.dirty = true;
   }
 
   render(): void {
-    const moved = this.controls.update();
-    if (moved || this.dirty) {
-      this.renderer.render(this.scene, this.camera);
-      this.dirty = false;
+    const now = performance.now();
+    if (this.viewTween) {
+      const t = Math.min(1, (now - this.viewTween.started) / VIEW_TWEEN_MS);
+      const eased = 1 - (1 - t) ** 3;
+      this.camera.position.lerpVectors(this.viewTween.from, this.viewTween.to, eased);
+      if (t >= 1) {
+        this.viewTween = null;
+      }
+      this.dirty = true;
     }
+
+    const moved = this.controls.update();
+    if (!moved && !this.dirty) {
+      return;
+    }
+
+    const width = Math.max(1, this.host.clientWidth);
+    const height = Math.max(1, this.host.clientHeight);
+    this.renderer.setViewport(0, 0, width, height);
+    this.renderer.setScissorTest(false);
+    this.renderer.clear();
+    this.renderer.render(this.scene, this.camera);
+    this.renderGizmo(width, height);
+    this.dirty = false;
   }
 
   dispose(): void {
     this.observer.disconnect();
+    this.host.removeEventListener('pointerdown', this.onGizmoPointerDown, true);
+    this.host.removeEventListener('pointerup', this.onGizmoPointerUp, true);
     this.clear();
+    this.disposeGizmo();
     this.controls.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();
@@ -334,5 +486,276 @@ export class Stage {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.dirty = true;
+  }
+
+  // -------------------------------------------------------------- axis gizmo
+
+  private get gizmoSize(): number {
+    const shortest = Math.min(this.host.clientWidth, this.host.clientHeight);
+    return Math.max(76, Math.min(128, Math.floor(shortest * 0.28)));
+  }
+
+  private buildGizmo(): void {
+    const backdrop = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.createBackdropTexture(),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    backdrop.scale.setScalar(3);
+    backdrop.renderOrder = -1;
+    this.gizmoScene.add(backdrop);
+    this.gizmoResources.push(backdrop.material);
+
+    const ballGeometry = new THREE.SphereGeometry(0.19, 20, 14);
+    this.gizmoResources.push(ballGeometry);
+
+    const pairs: Array<[ViewAxis, ViewAxis]> = [
+      ['x', '-x'],
+      ['y', '-y'],
+      ['z', '-z'],
+    ];
+    for (const [positive, negative] of pairs) {
+      const geometry = new THREE.BufferGeometry().setFromPoints([
+        AXIS_VECTORS[negative].clone().multiplyScalar(1.02),
+        AXIS_VECTORS[positive].clone().multiplyScalar(1.02),
+      ]);
+      const material = new THREE.LineBasicMaterial({
+        color: AXIS_COLORS[positive],
+        transparent: true,
+        opacity: 0.38,
+        depthWrite: false,
+      });
+      this.gizmoScene.add(new THREE.Line(geometry, material));
+      this.gizmoResources.push(geometry, material);
+    }
+
+    for (const axis of AXIS_ORDER) {
+      const negative = axis.startsWith('-');
+      const material = new THREE.MeshBasicMaterial({
+        color: AXIS_COLORS[axis],
+        transparent: negative,
+        opacity: negative ? 0.55 : 1,
+        depthWrite: !negative,
+      });
+      const ball = new THREE.Mesh(ballGeometry, material);
+      ball.position.copy(AXIS_VECTORS[axis]);
+      this.gizmoScene.add(ball);
+      this.gizmoResources.push(material);
+      this.gizmoBalls.set(axis, ball);
+
+      const label = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: this.createLabelTexture(AXIS_LABELS[axis]),
+          transparent: true,
+          depthTest: false,
+          depthWrite: false,
+        }),
+      );
+      label.position.copy(AXIS_VECTORS[axis]);
+      label.scale.setScalar(0.5);
+      label.renderOrder = 2;
+      this.gizmoScene.add(label);
+      this.gizmoResources.push(label.material);
+      this.gizmoLabels.set(axis, label);
+    }
+
+    const ring = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.createRingTexture(),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    ring.scale.setScalar(0.66);
+    ring.visible = false;
+    ring.renderOrder = 3;
+    this.gizmoScene.add(ring);
+    this.gizmoResources.push(ring.material);
+    this.gizmoSelection = ring;
+    this.updateGizmoSelection();
+  }
+
+  private updateGizmoSelection(): void {
+    for (const axis of AXIS_ORDER) {
+      const ball = this.gizmoBalls.get(axis);
+      if (ball != null) {
+        ball.scale.setScalar(this.selectedAxis === axis ? 1.3 : 1);
+      }
+    }
+    const ring = this.gizmoSelection;
+    if (ring == null) {
+      return;
+    }
+    if (this.selectedAxis == null) {
+      ring.visible = false;
+      return;
+    }
+    ring.visible = true;
+    ring.position.copy(AXIS_VECTORS[this.selectedAxis]);
+    (ring.material as THREE.SpriteMaterial).color.setHex(
+      this.rotationLocked ? 0xe6b45c : 0x7fe8ff,
+    );
+  }
+
+  private renderGizmo(width: number, height: number): void {
+    const size = this.gizmoSize;
+    const margin = this.gizmoMargin;
+    this.syncGizmoCamera();
+
+    this.renderer.setViewport(margin, height - size - margin, size, size);
+    this.renderer.setScissor(margin, height - size - margin, size, size);
+    this.renderer.setScissorTest(true);
+    this.renderer.clearDepth();
+    this.renderer.render(this.gizmoScene, this.gizmoCamera);
+    this.renderer.setScissorTest(false);
+    this.renderer.setViewport(0, 0, width, height);
+  }
+
+  /** Keep the gizmo camera aligned with the main view direction. */
+  private syncGizmoCamera(): void {
+    const direction = this.gizmoDirection.copy(this.camera.position).sub(this.controls.target);
+    if (direction.lengthSq() < 1e-6) {
+      direction.set(0, 0, 1);
+    }
+    direction.normalize().multiplyScalar(6);
+    this.gizmoCamera.position.copy(direction);
+    this.gizmoCamera.quaternion.copy(this.camera.quaternion);
+    this.gizmoCamera.updateMatrixWorld();
+  }
+
+  private localPoint(event: PointerEvent): { x: number; y: number } {
+    const rect = this.host.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  private inGizmo(point: { x: number; y: number }): boolean {
+    const size = this.gizmoSize;
+    const margin = this.gizmoMargin;
+    return (
+      point.x >= margin &&
+      point.x <= margin + size &&
+      point.y >= margin &&
+      point.y <= margin + size
+    );
+  }
+
+  private pickGizmoAxis(point: { x: number; y: number }): ViewAxis | null {
+    const size = this.gizmoSize;
+    const centerX = this.gizmoMargin + size * 0.5;
+    const centerY = this.gizmoMargin + size * 0.5;
+    const threshold = Math.max(16, size * 0.2);
+    this.syncGizmoCamera();
+
+    let best: ViewAxis | null = null;
+    let bestDistance = Infinity;
+    let bestDepth = -Infinity;
+
+    for (const axis of AXIS_ORDER) {
+      this.gizmoProjection.copy(AXIS_VECTORS[axis]);
+      this.gizmoProjection.applyMatrix4(this.gizmoCamera.matrixWorldInverse);
+      const depth = this.gizmoProjection.z;
+      this.gizmoProjection.applyMatrix4(this.gizmoCamera.projectionMatrix);
+      const px = centerX + this.gizmoProjection.x * size * 0.5;
+      const py = centerY - this.gizmoProjection.y * size * 0.5;
+      const distance = Math.hypot(px - point.x, py - point.y);
+      if (distance > threshold) {
+        continue;
+      }
+      // Overlapping axes: prefer the one closer to the viewer (larger view z).
+      if (
+        best == null ||
+        distance < bestDistance - 1 ||
+        (distance < bestDistance + 1 && depth > bestDepth)
+      ) {
+        best = axis;
+        bestDistance = distance;
+        bestDepth = depth;
+      }
+    }
+    return best;
+  }
+
+  private createBackdropTexture(): THREE.Texture {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext('2d');
+    if (context) {
+      const gradient = context.createRadialGradient(64, 64, 18, 64, 64, 62);
+      gradient.addColorStop(0, 'rgba(10, 15, 26, 0.66)');
+      gradient.addColorStop(0.72, 'rgba(10, 15, 26, 0.44)');
+      gradient.addColorStop(1, 'rgba(10, 15, 26, 0)');
+      context.fillStyle = gradient;
+      context.beginPath();
+      context.arc(64, 64, 62, 0, Math.PI * 2);
+      context.fill();
+      context.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(64, 64, 54, 0, Math.PI * 2);
+      context.stroke();
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    this.gizmoTextures.push(texture);
+    return texture;
+  }
+
+  private createLabelTexture(text: string): THREE.Texture {
+    const canvas = document.createElement('canvas');
+    canvas.width = 72;
+    canvas.height = 72;
+    const context = canvas.getContext('2d');
+    if (context) {
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.font = '700 30px "Inter", "Segoe UI", system-ui, sans-serif';
+      context.lineWidth = 5;
+      context.strokeStyle = 'rgba(6, 10, 18, 0.78)';
+      context.strokeText(text, 36, 38);
+      context.fillStyle = '#f4f9ff';
+      context.fillText(text, 36, 38);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    this.gizmoTextures.push(texture);
+    return texture;
+  }
+
+  private createRingTexture(): THREE.Texture {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext('2d');
+    if (context) {
+      context.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+      context.lineWidth = 9;
+      context.beginPath();
+      context.arc(64, 64, 50, 0, Math.PI * 2);
+      context.stroke();
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    this.gizmoTextures.push(texture);
+    return texture;
+  }
+
+  private disposeGizmo(): void {
+    for (const resource of this.gizmoResources) {
+      resource.dispose();
+    }
+    this.gizmoResources.length = 0;
+    this.gizmoScene.clear();
+    for (const texture of this.gizmoTextures) {
+      texture.dispose();
+    }
+    this.gizmoTextures.length = 0;
+    this.gizmoBalls.clear();
+    this.gizmoLabels.clear();
+    this.gizmoSelection = null;
   }
 }
