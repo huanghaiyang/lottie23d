@@ -598,7 +598,10 @@ fn cubic_flat(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], tolerance:
 /// 用四段三次贝塞尔近似椭圆，再扁平化为轮廓。
 ///
 /// `center` / `size` 单位为像素，半径取 `size / 2` 的绝对值；`KAPPA` 是
-/// 圆弧到贝塞尔的标准控制点系数。`direction < 0` 时反转顶点顺序。
+/// 圆弧到贝塞尔的标准控制点系数。顶点顺序必须与 lottie-web 一致：默认从
+/// **正上方**开始顺时针（上 → 右 → 下 → 左）；`d == 3` 时同样从正上方开始
+/// 逆时针（上 → 左 → 下 → 右）。修剪路径（`tm`）的起点按路径起点计算，顺序
+/// 不一致会让扇形/光弧整体转过 90°。
 pub fn ellipse_contour(center: [f32; 2], size: [f32; 2], direction: i32) -> Contour {
     let rx = (size[0] * 0.5).abs();
     let ry = (size[1] * 0.5).abs();
@@ -610,32 +613,51 @@ pub fn ellipse_contour(center: [f32; 2], size: [f32; 2], direction: i32) -> Cont
     }
     // 标准圆弧近似系数：控制点距顶点 = 半径 * 0.552915。
     const KAPPA: f32 = 0.552_915;
-    let mut pts = Vec::with_capacity(4);
-    pts.push([center[0] + rx, center[1]]);
-    pts.push([center[0], center[1] + ry]);
-    pts.push([center[0] - rx, center[1]]);
-    pts.push([center[0], center[1] - ry]);
+    let top = [center[0], center[1] - ry];
+    let right = [center[0] + rx, center[1]];
+    let bottom = [center[0], center[1] + ry];
+    let left = [center[0] - rx, center[1]];
+    // lottie-web 用 d == 1/2 表示顺时针，d == 3 表示逆时针。
+    let (pts, i, o) = if direction == 1 || direction == 2 {
+        (
+            vec![top, right, bottom, left],
+            vec![
+                [-rx * KAPPA, 0.0],
+                [0.0, -ry * KAPPA],
+                [rx * KAPPA, 0.0],
+                [0.0, ry * KAPPA],
+            ],
+            vec![
+                [rx * KAPPA, 0.0],
+                [0.0, ry * KAPPA],
+                [-rx * KAPPA, 0.0],
+                [0.0, -ry * KAPPA],
+            ],
+        )
+    } else {
+        (
+            vec![top, left, bottom, right],
+            vec![
+                [rx * KAPPA, 0.0],
+                [0.0, -ry * KAPPA],
+                [-rx * KAPPA, 0.0],
+                [0.0, ry * KAPPA],
+            ],
+            vec![
+                [-rx * KAPPA, 0.0],
+                [0.0, ry * KAPPA],
+                [rx * KAPPA, 0.0],
+                [0.0, -ry * KAPPA],
+            ],
+        )
+    };
     let path = PathData {
         v: pts,
-        i: vec![
-            [0.0, -ry * KAPPA],
-            [rx * KAPPA, 0.0],
-            [0.0, ry * KAPPA],
-            [-rx * KAPPA, 0.0],
-        ],
-        o: vec![
-            [0.0, ry * KAPPA],
-            [-rx * KAPPA, 0.0],
-            [0.0, -ry * KAPPA],
-            [rx * KAPPA, 0.0],
-        ],
+        i,
+        o,
         closed: true,
     };
-    let mut contour = flatten_path(&path);
-    if direction < 0 {
-        contour.pts.reverse();
-    }
-    contour
+    flatten_path(&path)
 }
 
 /// 生成矩形（可带圆角）轮廓。
