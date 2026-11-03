@@ -931,3 +931,162 @@ pub fn style_animated(shapes: &[Value]) -> bool {
     }
     false
 }
+
+/* ------------------------------------------------------------------ */
+/* 图层遮罩                                                            */
+/* ------------------------------------------------------------------ */
+
+/// 图层遮罩是否需要逐帧裁剪几何。
+///
+/// 目前只支持「单条遮罩 + 加法模式（`mode = "a"`）+ 未反相 + 凸轮廓」，
+/// 且遮罩路径带关键帧的情况（例如海星眼睛的眨眼遮罩：矩形上下滑动）。
+/// 静态遮罩仍按旧行为忽略，避免改变现有示例（如 Dalek）的外观。
+pub fn mask_clips_geometry(masks: &[Value]) -> bool {
+    if masks.len() != 1 {
+        return false;
+    }
+    mask_supported(&masks[0])
+        && masks[0].get("pt").map(is_animated).unwrap_or(false)
+}
+
+/// 按遮罩裁剪当帧的 drawable 轮廓；不支持或求值失败时原样返回。
+///
+/// 被完全裁掉的路径会被丢弃；若某个 drawable 的路径全部被裁掉，
+/// 该帧就写不出几何（播放端表现为该网格当帧不可见）。
+pub fn apply_mask(result: &mut ShapeResult, masks: &[Value], frame: f32) {
+    let Some(outline) = mask_outline(masks, frame) else {
+        return;
+    };
+    for drawable in &mut result.drawables {
+        let mut kept = Vec::with_capacity(drawable.paths.len());
+        for item in std::mem::take(&mut drawable.paths) {
+            let clipped = clip_convex_polygon(&item.contour.pts, &outline.pts);
+            if clipped.len() < 3 {
+                continue;
+            }
+            kept.push(PathItem {
+                contour: Contour {
+                    pts: clipped,
+                    closed: item.contour.closed,
+                },
+                trim: item.trim,
+            });
+        }
+        drawable.paths = kept;
+    }
+}
+
+/// 遮罩是否属于本模块支持的子集（单条、加法、未反相）。
+fn mask_supported(mask: &Value) -> bool {
+    if mask.get("inv").and_then(Value::as_bool).unwrap_or(false) {
+        return false;
+    }
+    mask.get("mode").and_then(Value::as_str).unwrap_or("a") == "a"
+}
+
+/// 求值遮罩路径并展平为凸多边形；不可用（多条、非凸、退化）时返回 `None`。
+fn mask_outline(masks: &[Value], frame: f32) -> Option<Contour> {
+    if masks.len() != 1 || !mask_supported(&masks[0]) {
+        return None;
+    }
+    let data = path::eval_path_property(masks[0].get("pt")?, frame)?;
+    let contour = path::flatten_path(&data);
+    if contour.pts.len() < 3 || !is_convex(&contour.pts) {
+        return None;
+    }
+    Some(contour)
+}
+
+/// 多边形有向面积（顶点顺序决定符号）。
+fn polygon_area(pts: &[[f32; 2]]) -> f32 {
+    let mut sum = 0.0;
+    for index in 0..pts.len() {
+        let a = pts[index];
+        let b = pts[(index + 1) % pts.len()];
+        sum += a[0] * b[1] - b[0] * a[1];
+    }
+    sum * 0.5
+}
+
+/// 是否凸多边形；允许极小凹量，避免浮点误差把矩形判成凹。
+fn is_convex(pts: &[[f32; 2]]) -> bool {
+    let count = pts.len();
+    if count < 3 {
+        return false;
+    }
+    let mut sign = 0.0f32;
+    for index in 0..count {
+        let a = pts[index];
+        let b = pts[(index + 1) % count];
+        let c = pts[(index + 2) % count];
+        let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+        if cross.abs() < 1e-6 {
+            continue;
+        }
+        let current = cross.signum();
+        if sign == 0.0 {
+            sign = current;
+        } else if current != sign {
+            return false;
+        }
+    }
+    sign != 0.0
+}
+
+/// 两条线段的交点参数解（不限制在段内；调用方只在线段跨边界时使用）。
+fn edge_intersection(p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], p4: [f32; 2]) -> Option<[f32; 2]> {
+    let denominator = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0]);
+    if denominator.abs() < 1e-9 {
+        return None;
+    }
+    let t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / denominator;
+    Some([p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1])])
+}
+
+/// Sutherland–Hodgman：用凸多边形裁剪任意多边形，返回交集轮廓。
+fn clip_convex_polygon(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let mut clip_points: Vec<[f32; 2]> = clip.to_vec();
+    // 统一为逆时针，使「内部」等价于裁剪边左侧。
+    if polygon_area(&clip_points) < 0.0 {
+        clip_points.reverse();
+    }
+    let mut output: Vec<[f32; 2]> = subject.to_vec();
+    for index in 0..clip_points.len() {
+        if output.len() < 3 {
+            return Vec::new();
+        }
+        let a = clip_points[index];
+        let b = clip_points[(index + 1) % clip_points.len()];
+        let inside = |p: [f32; 2]| {
+            (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) >= -1e-6
+        };
+        let mut next: Vec<[f32; 2]> = Vec::with_capacity(output.len() + 2);
+        for vertex in 0..output.len() {
+            let current = output[vertex];
+            let previous = output[(vertex + output.len() - 1) % output.len()];
+            let (current_in, previous_in) = (inside(current), inside(previous));
+            if current_in != previous_in {
+                if let Some(point) = edge_intersection(previous, current, a, b) {
+                    next.push(point);
+                }
+            }
+            if current_in {
+                next.push(current);
+            }
+        }
+        output = next;
+    }
+    // 去掉相邻重复点（裁剪边界恰好穿过顶点时会产生），并保证首尾不重复。
+    output.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5);
+    if output.len() >= 2 {
+        let first = output[0];
+        let last = output[output.len() - 1];
+        if (first[0] - last[0]).abs() < 1e-5 && (first[1] - last[1]).abs() < 1e-5 {
+            output.pop();
+        }
+    }
+    if output.len() < 3 {
+        return Vec::new();
+    }
+    output
+}

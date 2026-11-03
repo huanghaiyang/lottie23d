@@ -71,6 +71,9 @@ pub struct Layer {
     /// 形状树原始节点，延迟解析。
     #[serde(default)]
     pub shapes: Vec<Value>,
+    /// 图层遮罩列表（原始节点，延迟解析）；遮罩路径与形状处于同一图层坐标系。
+    #[serde(default, rename = "masksProperties")]
+    pub masks: Vec<Value>,
     /// 图层效果列表（延迟解析）。用于读取 `Pseudo/ADBE Trace Path` 等
     /// 伪效果参数，复现「沿路径分布」的位置表达式。
     #[serde(default)]
@@ -87,6 +90,10 @@ pub struct Layer {
     /// 时间拉伸倍数，`sr != 1` 时子合成时间需再除以它。
     #[serde(default = "default_stretch")]
     pub sr: f32,
+    /// 时间重映射（AE Time Remap）：标量属性，值以秒计，仅预合成图层使用。
+    /// 启用时优先于 `sr`，换算后成为子合成内部的时间轴。
+    #[serde(default)]
+    pub tm: Option<Value>,
     /// 父图层的 `ind`。
     #[serde(default)]
     pub parent: Option<i64>,

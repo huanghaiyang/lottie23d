@@ -225,6 +225,10 @@ struct Plan<'a> {
     trace: Option<TraceSpec>,
     /// 图层位置上的弹性回弹表达式（`Position - Overshoot` 系列滑块）。
     overshoot: Option<OvershootSpec>,
+    /// 文档帧率：把时间重映射的秒值换算成子合成帧号。
+    frame_rate: f32,
+    /// 图层遮罩带关键帧且受支持，需要逐帧裁剪几何（如在眨眼时滑动的眼睑遮罩）。
+    dynamic_mask: bool,
 }
 
 /// 位置弹性回弹表达式参数（已按表达式里的换算系数归一）。
@@ -454,6 +458,8 @@ impl<'a> Compiler<'a> {
                 follows: None,
                 trace: None,
                 overshoot: None,
+                frame_rate: self.frame_rate,
+                dynamic_mask: false,
             });
             ids.push(id);
         }
@@ -514,19 +520,23 @@ impl<'a> Compiler<'a> {
         // 参考几何在图层局部时间采样，与属性求值保持一致。
         let frame = self.plans[id].ref_frame - layer.st;
         let follows = self.collect_follows(id, &layer.shapes);
+        // 带关键帧的遮罩会改变轮廓形状，同样属于几何动画。
+        let dynamic_mask = shape::mask_clips_geometry(&layer.masks);
         // 顶点跟随也是几何动画的来源之一。
         let geometry_animated = shape::geometry_animated(&layer.shapes)
-            || follows.as_ref().map(|specs| !specs.map.is_empty()).unwrap_or(false);
+            || follows.as_ref().map(|specs| !specs.map.is_empty()).unwrap_or(false)
+            || dynamic_mask;
         let style_animated = shape::style_animated(&layer.shapes);
         {
             let plan = &mut self.plans[id];
             plan.geometry_animated = geometry_animated;
             plan.style_animated = style_animated;
             plan.follows = follows.clone();
+            plan.dynamic_mask = dynamic_mask;
         }
 
         // 参考帧使用与烘焙时相同的顶点跟随上下文，保证拓扑一致。
-        let result = match &follows {
+        let mut result = match &follows {
             Some(specs) => {
                 let plan_count = self.plans.len();
                 let mut chain_cache = vec![None; plan_count];
@@ -560,6 +570,10 @@ impl<'a> Compiler<'a> {
             }
             None => shape::eval_shapes(&layer.shapes, frame),
         };
+        // 参考帧同样按遮罩裁剪，保证参考拓扑与烘焙时一致。
+        if dynamic_mask {
+            shape::apply_mask(&mut result, &layer.masks, frame);
+        }
 
         for drawable in result.drawables {
             let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
@@ -1015,7 +1029,7 @@ impl<'a> Compiler<'a> {
                 let local_frame = frame_cache[id].unwrap_or(root_frame);
                 let geometry_animated = plan.geometry_animated;
                 // 只动几何或只动样式时按需求值：纯样式动画跳过路径扁平化。
-                let evaluated = if geometry_animated {
+                let mut evaluated = if geometry_animated {
                     match &plan.follows {
                         Some(specs) => {
                             fill_follow_positions(
@@ -1053,6 +1067,12 @@ impl<'a> Compiler<'a> {
                 } else {
                     None
                 };
+                // 遮罩有关键帧时，按图层局部帧裁剪当帧轮廓。
+                if plan.dynamic_mask {
+                    if let Some(result) = evaluated.as_mut() {
+                        shape::apply_mask(result, &plan.layer.masks, local_frame);
+                    }
+                }
                 let dynamic_color = plan.style_animated || plan.opacity_animated;
 
                 for (drawable_index, blueprint) in plan.blueprints.iter().enumerate() {
@@ -1160,6 +1180,39 @@ impl<'a> Compiler<'a> {
                                         ) {
                                             bucket_index = mesh.push_bucket(surface);
                                         }
+                                    }
+                                }
+
+                                // 采样密度匹配：折叠/遮罩桶只服务当时的姿态。
+                                // 轮廓恢复原状后要回到采样密度接近的桶，否则会用
+                                // 低采样桶把轮廓画成多边形（如眨眼后眼睛变成十边形）。
+                                if mesh.buckets.len() > 1 {
+                                    let natural = mesh::plan_slots(&slots, self.curve_spacing);
+                                    let target: usize = natural.iter().map(|plan| plan.k).sum();
+                                    let active_total: usize = mesh.buckets[bucket_index]
+                                        .slots
+                                        .iter()
+                                        .map(|plan| plan.k)
+                                        .sum();
+                                    let active_gap = active_total.abs_diff(target);
+                                    let mut best = bucket_index;
+                                    let mut best_gap = active_gap;
+                                    for (index, bucket) in mesh.buckets.iter().enumerate() {
+                                        if index == bucket_index || bucket.slots.len() != slots.len()
+                                        {
+                                            continue;
+                                        }
+                                        let total: usize =
+                                            bucket.slots.iter().map(|plan| plan.k).sum();
+                                        let gap = total.abs_diff(target);
+                                        if gap < best_gap {
+                                            best_gap = gap;
+                                            best = index;
+                                        }
+                                    }
+                                    // 只吸收明显更合适的桶，避免把折叠修正抢回参考桶。
+                                    if best != bucket_index && active_gap > best_gap + target / 4 {
+                                        bucket_index = best;
                                     }
                                 }
 
@@ -1696,23 +1749,73 @@ fn affine_matrix(matrix: Affine) -> [f32; 16] {
     ]
 }
 
+/// 读取关键帧的起始时间 `t`。
+fn key_start_time(keyframe: &Value) -> Option<f32> {
+    keyframe.get("t").and_then(Value::as_f64).map(|t| t as f32)
+}
+
+/// 时间重映射是否带 `loopOut('cycle')` 之类的循环表达式。
+///
+/// lottie-web 自带表达式插件，`loopOut` 会以「父合成当前帧」为时间轴，
+/// 超出末关键帧后把时间按关键帧区间循环。未写类型时 AE 默认是 `cycle`；
+/// `pingpong` / `offset` / `continue` 暂不支持。
+fn tm_loops_cycle(tm: &Value) -> bool {
+    let Some(expr) = tm.get("x").and_then(Value::as_str) else {
+        return false;
+    };
+    let expr = expr.to_ascii_lowercase();
+    if !expr.contains("loopout") {
+        return false;
+    }
+    !expr.contains("pingpong") && !expr.contains("offset") && !expr.contains("continue")
+}
+
 /// 计算图层自身坐标系下的时间（单位：帧）。
 ///
-/// 父合成按时间伸缩 `sr` 换算子图层时间（`renderedFrame = num / sr`），
-/// lottie-web 的属性求值再相对图层起始时间 `st` 偏移。
+/// 父合成若启用时间重映射 `tm`，先按 `tm(秒) * 帧率` 换算子合成时间（优先于
+/// `sr`，与 lottie-web 的 `CompElement.prepareFrame` 一致）；否则按时间伸缩
+/// `sr` 换算（`renderedFrame = num / sr`）。最后 lottie-web 的属性求值再相对
+/// 图层起始时间 `st` 偏移。
 fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
     let parent_frame = match plans[id].owner {
         Some(owner) => {
-            // 父合成按时间伸缩 sr 换算子图层时间（renderedFrame = num / sr）。
             let owner_frame = plan_local_frame(plans, owner, root_frame);
-            let owner_layer = plans[owner].layer;
-            let stretch = if owner_layer.sr.abs() > 1e-3 {
-                owner_layer.sr
-            } else {
-                1.0
-            };
-            owner_frame / stretch
+            let owner_plan = &plans[owner];
+            let owner_layer = owner_plan.layer;
+            // 时间重映射：值以秒计，帧率是 lottie-web 里 getProp 的乘数；
+            // 求值失败（属性缺失）时退回 sr 路径。
+            let remapped = owner_layer.tm.as_ref().and_then(|tm| {
+                // loopOut 以「父合成帧」为时间轴：超出末关键帧后按关键帧区间循环，
+                // 这样子合成会反复播放（例如海星眼睛周期性眨眼）。
+                let comp_frame = owner_frame + owner_layer.st;
+                let frame = match tm.get("k").and_then(Value::as_array) {
+                    Some(keyframes) if tm_loops_cycle(tm) => {
+                        let first = keyframes.first().and_then(key_start_time);
+                        let last = keyframes.last().and_then(key_start_time);
+                        match (first, last) {
+                            (Some(first), Some(last)) if last > first && comp_frame > last => {
+                                first + (comp_frame - first) % (last - first)
+                            }
+                            _ => owner_frame,
+                        }
+                    }
+                    _ => owner_frame,
+                };
+                prop::eval(tm, frame).first().copied()
+            });
+            match remapped {
+                Some(seconds) => seconds * owner_plan.frame_rate,
+                None => {
+                    let stretch = if owner_layer.sr.abs() > 1e-3 {
+                        owner_layer.sr
+                    } else {
+                        1.0
+                    };
+                    owner_frame / stretch
+                }
+            }
         }
+
         None => root_frame,
     };
     // lottie-web 的属性时间相对图层起始时间 st。
