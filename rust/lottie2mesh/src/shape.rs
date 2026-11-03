@@ -241,21 +241,27 @@ fn rotation_of(ks: &Value, frame: f32) -> f32 {
 /// 移回原点（即 `T(p) * R * Sk * S * T(-a)`）。`frame` 为局部帧号；
 /// 位置/锚点单位为像素，缩放为百分比（100 = 原始大小），旋转为度。
 pub fn transform_matrix(ks: &Value, frame: f32) -> Affine {
-    transform_matrix_at(ks, frame, None)
+    transform_matrix_at(ks, frame, None, None)
 }
 
-/// 与 [`transform_matrix`] 相同，但允许用外部位置覆盖 `ks.p`。
+/// 与 [`transform_matrix`] 相同，但允许用外部位置 / 旋转覆盖 `ks.p`、`ks.r`。
 ///
-/// 用于复现位置表达式（如 `Trace Path`：图层位置由目标路径上的采样点决定），
-/// 此时 `ks.p` 的静态值不再生效。`position` 为合成/父级空间中的像素坐标。
-pub fn transform_matrix_at(ks: &Value, frame: f32, position: Option<[f32; 2]>) -> Affine {
+/// 用于复现位置与旋转表达式（如 `Trace Path`：图层位置由目标路径上的
+/// 采样点决定，旋转取路径切线方向），此时 `ks.p` / `ks.r` 的静态值不再生效。
+/// `position` 为合成/父级空间中的像素坐标，`rotation` 为角度（度）。
+pub fn transform_matrix_at(
+    ks: &Value,
+    frame: f32,
+    position: Option<[f32; 2]>,
+    rotation: Option<f32>,
+) -> Affine {
     let p = match position {
         Some(p) => [p[0], p[1], 0.0],
         None => position_of(ks, frame),
     };
     let a = prop::eval_in(ks, "a", frame, &[0.0, 0.0, 0.0]);
     let s = prop::eval_in(ks, "s", frame, &[100.0, 100.0, 100.0]);
-    let r = rotation_of(ks, frame);
+    let r = rotation.unwrap_or_else(|| rotation_of(ks, frame));
     let sk = prop::eval_scalar(ks, "sk", frame, 0.0);
     let sa = prop::eval_scalar(ks, "sa", frame, 0.0);
 

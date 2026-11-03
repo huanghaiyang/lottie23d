@@ -248,6 +248,17 @@ struct TraceSpec {
     target: usize,
     /// Progress 属性（可能带关键帧），按图层局部帧求值。
     progress: Value,
+    /// 是否同时用 `tangentOnPath` 覆盖图层旋转（灯泡随电线切线摆动）。
+    rotate: bool,
+}
+
+/// 逐帧的图层变换覆盖（位置 / 旋转表达式的结果）。
+///
+/// 覆盖值只在烘焙时填充；`None` 表示该图层使用自身的关键帧变换。
+#[derive(Clone, Copy)]
+struct PoseOverride {
+    position: Option<[f32; 2]>,
+    rotation: Option<f32>,
 }
 
 /// 编译期的全局状态。
@@ -521,7 +532,7 @@ impl<'a> Compiler<'a> {
                 let mut chain_cache = vec![None; plan_count];
                 let mut frame_cache = vec![None; plan_count];
                 // 参考几何只需顶点跟随；路径目标上没有位置表达式，覆盖表留空。
-                let overrides: Vec<Option<[f32; 2]>> = vec![None; plan_count];
+                let overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
                 let mut positions = vec![None; plan_count];
                 fill_follow_positions(
                     &self.plans,
@@ -707,7 +718,19 @@ impl<'a> Compiler<'a> {
             .iter()
             .position(|plan| plan.owner == owner && plan.layer.nm == name)
             .unwrap_or(usize::MAX);
-        Some(TraceSpec { target, progress })
+        // 旋转表达式与位置表达式同源：都引用同一条路径的 progress。
+        let rotate = layer
+            .ks
+            .get("r")
+            .and_then(|value| value.get("x"))
+            .and_then(Value::as_str)
+            .map(|expression| expression.contains("tangentOnPath"))
+            .unwrap_or(false);
+        Some(TraceSpec {
+            target,
+            progress,
+            rotate,
+        })
     }
 
     /// 解析图层位置上的弹性回弹表达式。
@@ -820,8 +843,8 @@ impl<'a> Compiler<'a> {
         let mut opacity_cache: Vec<Option<f32>> = vec![None; plan_count];
         let mut frame_cache: Vec<Option<f32>> = vec![None; plan_count];
         let mut follow_positions: Vec<Option<[f32; 2]>> = vec![None; plan_count];
-        // 每帧由位置表达式算出的局部位置覆盖（Trace Path 等），对应 plan 下标。
-        let mut position_overrides: Vec<Option<[f32; 2]>> = vec![None; plan_count];
+        // 每帧由位置 / 旋转表达式算出的变换覆盖（Trace Path 等），对应 plan 下标。
+        let mut overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
         let mut scratch = mesh::FrameScratch::default();
 
         // 姿态锚点：把采样区间按 1/7 等分，段起点用当帧几何重建三角化。
@@ -854,7 +877,7 @@ impl<'a> Compiler<'a> {
             for cache in frame_cache.iter_mut() {
                 *cache = None;
             }
-            for slot in position_overrides.iter_mut() {
+            for slot in overrides.iter_mut() {
                 *slot = None;
             }
 
@@ -866,7 +889,10 @@ impl<'a> Compiler<'a> {
                 let position =
                     overshoot_position(&self.plans, id, root_frame, spec, self.frame_rate);
                 if let Some(position) = position {
-                    position_overrides[id] = Some(position);
+                    overrides[id] = Some(PoseOverride {
+                        position: Some(position),
+                        rotation: None,
+                    });
                 }
             }
             // 回弹求值期间缓存了不含覆盖的矩阵，清掉后再算路径采样。
@@ -877,22 +903,25 @@ impl<'a> Compiler<'a> {
                 *cache = None;
             }
 
-            // 位置表达式（Trace Path）依赖目标路径的当帧几何，必须先于世界矩阵求值。
+            // 位置 / 旋转表达式（Trace Path）依赖目标路径的当帧几何，必须先于世界矩阵求值。
             for id in 0..plan_count {
                 if self.plans[id].trace.is_none() {
                     continue;
                 }
-                let position = trace_position(
+                let pose = trace_pose(
                     &self.plans,
                     id,
                     root_frame,
-                    &position_overrides,
+                    &overrides,
                     &mut chain_cache,
                     &mut frame_cache,
                     &mut follow_positions,
                 );
-                if let Some(position) = position {
-                    position_overrides[id] = Some(position);
+                if let Some((position, rotation)) = pose {
+                    overrides[id] = Some(PoseOverride {
+                        position: Some(position),
+                        rotation,
+                    });
                 }
             }
             // 求表达式期间可能缓存了不含覆盖的矩阵，重建一次保证一致。
@@ -913,7 +942,7 @@ impl<'a> Compiler<'a> {
                     &mut chain_cache,
                     &mut opacity_cache,
                     &mut frame_cache,
-                    &position_overrides,
+                    &overrides,
                 );
                 // 每帧每位图层写 16 个 f32（列主序 4×4），轨迹按帧紧密排列。
                 let track = self.plans[id].transform_track;
@@ -940,7 +969,7 @@ impl<'a> Compiler<'a> {
                                 root_frame,
                                 &mut chain_cache,
                                 &mut frame_cache,
-                                &position_overrides,
+                                &overrides,
                                 &mut follow_positions,
                             );
                             let inverse = layer_inverse(
@@ -949,7 +978,7 @@ impl<'a> Compiler<'a> {
                                 root_frame,
                                 &mut chain_cache,
                                 &mut frame_cache,
-                                &position_overrides,
+                                &overrides,
                             );
                             let ctx = FollowContext {
                                 specs,
@@ -1307,9 +1336,9 @@ fn comp_anchor(
     root_frame: f32,
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
 ) -> [f32; 2] {
-    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, positions);
+    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, overrides);
     let frame = plan_local_frame(plans, id, root_frame);
     let anchor = prop::eval_in(&plans[id].layer.ks, "a", frame, &[0.0, 0.0, 0.0]);
     [
@@ -1355,7 +1384,7 @@ fn eval_target_contour(
     plans: &[Plan],
     id: usize,
     root_frame: f32,
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
     follow_positions: &mut Vec<Option<[f32; 2]>>,
@@ -1369,10 +1398,10 @@ fn eval_target_contour(
                 root_frame,
                 chain_cache,
                 frame_cache,
-                positions,
+                overrides,
                 follow_positions,
             );
-            let inverse = layer_inverse(plans, id, root_frame, chain_cache, frame_cache, positions);
+            let inverse = layer_inverse(plans, id, root_frame, chain_cache, frame_cache, overrides);
             shape::eval_shapes_follow(
                 &plans[id].layer.shapes,
                 frame,
@@ -1425,20 +1454,38 @@ fn point_on_contour(contour: &Contour, progress: f32) -> Option<[f32; 2]> {
     points.last().copied()
 }
 
-/// 求位置表达式对应的图层局部位置（父级空间坐标）。
+/// 轮廓在指定弧长百分比处的单位切线（对应 `tangentOnPath`）。
+///
+/// 取 `progress ± 0.5%` 两点的连线方向，跨过折线顶点时也不会瞬间跳变，
+/// 比直接取所在线段更适合驱动旋转。
+fn tangent_on_contour(contour: &Contour, progress: f32) -> Option<[f32; 2]> {
+    let delta = 1.0 / 200.0;
+    let before = point_on_contour(contour, (progress - delta).max(0.0))?;
+    let after = point_on_contour(contour, (progress + delta).min(1.0))?;
+    let dx = after[0] - before[0];
+    let dy = after[1] - before[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= 1e-6 {
+        return None;
+    }
+    Some([dx / length, dy / length])
+}
+
+/// 求位置表达式对应的图层局部位置（父级空间坐标），以及可选的切线旋转。
 ///
 /// 流程：按 Progress 百分比在目标路径上采样 → `toComp` 换算到合成坐标 →
 /// 若当前图层带父级，再用父级链的逆换算回父级空间（`p` 属性所在坐标系）。
-/// 目标缺失或路径取不到时返回 `None`，退回图层自身的关键帧位置。
-fn trace_position(
+/// 旋转表达式（`atan2(tangentOnPath)`）用同一采样点的切线角，扣掉父级
+/// 已有旋转后作为图层局部旋转。目标缺失时返回 `None`，退回关键帧变换。
+fn trace_pose(
     plans: &[Plan],
     id: usize,
     root_frame: f32,
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
     follow_positions: &mut Vec<Option<[f32; 2]>>,
-) -> Option<[f32; 2]> {
+) -> Option<([f32; 2], Option<f32>)> {
     let trace = plans[id].trace.as_ref()?;
     if trace.target >= plans.len() {
         return None;
@@ -1449,7 +1496,7 @@ fn trace_position(
         plans,
         trace.target,
         root_frame,
-        positions,
+        overrides,
         chain_cache,
         frame_cache,
         follow_positions,
@@ -1461,18 +1508,40 @@ fn trace_position(
         root_frame,
         chain_cache,
         frame_cache,
-        positions,
+        overrides,
     );
-    let comp = chain_affine(&target_matrix).apply(local);
-    match plans[id].parent {
+    let target_affine = chain_affine(&target_matrix);
+    let comp = target_affine.apply(local);
+    let rotation = if trace.rotate {
+        tangent_on_contour(&contour, progress).map(|tangent| {
+            // 把切线方向按目标图层链变换到合成空间，再取角度（度）。
+            let dx = target_affine.a * tangent[0] + target_affine.c * tangent[1];
+            let dy = target_affine.b * tangent[0] + target_affine.d * tangent[1];
+            let angle = dy.atan2(dx).to_degrees();
+            match plans[id].parent {
+                Some(parent) => {
+                    let parent_matrix =
+                        plan_chain(plans, parent, root_frame, chain_cache, frame_cache, overrides);
+                    let parent = chain_affine(&parent_matrix);
+                    angle - parent.b.atan2(parent.a).to_degrees()
+                }
+                None => angle,
+            }
+        })
+    } else {
+        None
+    };
+    let position = match plans[id].parent {
         Some(parent) => {
-            let parent_matrix = plan_chain(plans, parent, root_frame, chain_cache, frame_cache, positions);
+            let parent_matrix =
+                plan_chain(plans, parent, root_frame, chain_cache, frame_cache, overrides);
             chain_affine(&parent_matrix)
                 .inverse()
                 .map(|inverse| inverse.apply(comp))
         }
         None => Some(comp),
-    }
+    }?;
+    Some((position, rotation))
 }
 
 /// 求弹性回弹表达式对应的图层局部位置。
@@ -1530,7 +1599,7 @@ fn fill_follow_positions(
     root_frame: f32,
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
     out: &mut Vec<Option<[f32; 2]>>,
 ) {
     out.clear();
@@ -1544,7 +1613,7 @@ fn fill_follow_positions(
                     root_frame,
                     chain_cache,
                     frame_cache,
-                    positions,
+                    overrides,
                 ));
             }
         }
@@ -1560,9 +1629,9 @@ fn layer_inverse(
     root_frame: f32,
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
 ) -> Affine {
-    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, positions);
+    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, overrides);
     Affine {
         a: matrix[0],
         b: matrix[1],
@@ -1671,21 +1740,23 @@ fn plan_chain(
     root_frame: f32,
     cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
 ) -> [f32; 16] {
     if let Some(matrix) = cache[id] {
         return matrix;
     }
     let frame = plan_local_frame(plans, id, root_frame);
+    let pose = overrides.get(id).copied().flatten();
     let local = affine_matrix(shape::transform_matrix_at(
         &plans[id].layer.ks,
         frame,
-        positions.get(id).copied().flatten(),
+        pose.and_then(|pose| pose.position),
+        pose.and_then(|pose| pose.rotation),
     ));
     let matrix = match plans[id].parent {
         Some(parent) => {
             // 父矩阵在左：p' = parent * local * p，即先局部后父级。
-            let parent_matrix = plan_chain(plans, parent, root_frame, cache, frame_cache, positions);
+            let parent_matrix = plan_chain(plans, parent, root_frame, cache, frame_cache, overrides);
             mat_mul(&parent_matrix, &local)
         }
         None => local,
@@ -1709,12 +1780,12 @@ fn plan_world(
     chain_cache: &mut Vec<Option<[f32; 16]>>,
     opacity_cache: &mut Vec<Option<f32>>,
     frame_cache: &mut Vec<Option<f32>>,
-    positions: &[Option<[f32; 2]>],
+    overrides: &[Option<PoseOverride>],
 ) -> ([f32; 16], f32) {
     if let (Some(matrix), Some(opacity)) = (world_cache[id], opacity_cache[id]) {
         return (matrix, opacity);
     }
-    let chain = plan_chain(plans, id, root_frame, chain_cache, frame_cache, positions);
+    let chain = plan_chain(plans, id, root_frame, chain_cache, frame_cache, overrides);
     let (base, base_opacity) = match plans[id].owner {
         Some(owner) => plan_world(
             plans,
@@ -1725,7 +1796,7 @@ fn plan_world(
             chain_cache,
             opacity_cache,
             frame_cache,
-            positions,
+            overrides,
         ),
         None => (*global, 1.0),
     };
