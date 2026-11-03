@@ -28,13 +28,16 @@ use crate::shape::{DrawKind, Drawable};
 /// 每个 1/4 圆角剖面的折线段数；决定圆角插值点数。
 const ROUND_SEGMENTS: usize = 3;
 
-/// 每条轮廓重采样点数 `k` 的下限与上限。
+/// 每条轮廓重采样点数 `k` 的下限与安全上限。
 ///
-/// 上限决定了大轮廓在屏幕上的平滑度：`k` 被截断时，弦长会随轮廓变大而变长，
-/// 挤出后的侧墙与盖面在放大视图下会出现明显折线。480 允许约 1440 像素周长
-/// 的轮廓保持每 3 像素一个采样点。
-const MIN_K: usize = 6;
-const MAX_K: usize = 480;
+/// `k` 直接由轮廓周长和 `curve_spacing` 算出，因此采样间距对长轮廓也能真实
+/// 生效。下限取 3 而不是 6：小轮廓（周长十几像素的圆点、灯泡）在间距调大时
+/// 仍能按 `ceil(length / spacing)` 真实降采样，避免所有档位都被抬到同一点数、
+/// 让滑块看起来失效；3 也是一条闭合轮廓能围成三角形的最小点数，再低会让
+/// 填充三角化退化。8192 只用于防止极端路径（数万像素周长）撑爆显存的兜底，
+/// 正常画布尺寸下的轮廓不会触及。整体内存还会被 8M float 预算进一步约束。
+const MIN_K: usize = 3;
+const MAX_K: usize = 8192;
 /// 每个网格允许的拓扑桶上限（姿态锚点 + 折叠触发 + 拓扑变化共用）。
 ///
 /// 烘焙时按采样区间等距设置“姿态锚点”，并在检测到前盖三角形明显反绕/
@@ -123,15 +126,15 @@ pub fn build_surface(
 }
 
 /// 单条轮廓的自然重采样密度：约每 `spacing` 像素一个点；并钳制到
-/// `[MIN_K, MAX_K]`，近乎零长度时返回 4。
+/// `[MIN_K, MAX_K]`，近乎零长度时返回 `MIN_K`（占位用的最小闭合轮廓）。
 ///
 /// `spacing` 由调用方传入（转换选项 `curve_spacing`，默认 3.0），下限 1 像素、
-/// 上限 8 像素由 [`crate::compile::RawOptions`] 统一钳制；`MAX_K = 480` 决定了
-/// 单条轮廓最多 480 个采样点。
+/// 上限 8 像素由 [`crate::compile::RawOptions`] 统一钳制；`MAX_K = 8192` 仅作
+/// 极端路径的显存兜底，正常轮廓的采样密度由 `spacing` 决定。
 pub fn natural_k(contour: &Contour, spacing: f32) -> usize {
     let length = contour.length();
     if length < 1e-4 {
-        4
+        MIN_K
     } else {
         ((length / spacing).ceil() as usize).clamp(MIN_K, MAX_K)
     }

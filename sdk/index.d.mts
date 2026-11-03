@@ -22,7 +22,7 @@ export interface ConvertOptions {
   edgeRadius?: number;
   /**
    * 轮廓采样间距，单位 Lottie 像素/点（1..8，默认 3）。
-   * 数值越小采样点越多、曲线越平滑；受 `MAX_K = 480` 与 8M float 预算约束。
+   * 数值越小采样点越多、曲线越平滑；受 `MAX_K = 8192` 与 8M float 预算约束。
    */
   curve_spacing?: number;
   /** `curve_spacing` 的 camelCase 别名。 */
