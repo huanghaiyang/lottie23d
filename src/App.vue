@@ -291,6 +291,61 @@ function onNodeSelect(
 }
 
 /**
+ * 节点列表拖拽重排：把 `fromId` 插入到 `toId` 的上方或下方。
+ * 节点 id 不变（显隐/柔光状态保持），只改变列表顺序与 Stage 的层深分配。
+ */
+function onNodeReorder(fromId: number, toId: number, place: 'before' | 'after'): void {
+  const list = nodes.value;
+  const fromIndex = list.findIndex((node) => node.id === fromId);
+  if (fromIndex < 0 || fromId === toId) {
+    return;
+  }
+  const next = [...list];
+  const [moved] = next.splice(fromIndex, 1);
+  // 源节点移除后重新定位目标，避免下标偏移。
+  const target = next.findIndex((node) => node.id === toId);
+  if (target < 0) {
+    return;
+  }
+  const insert = place === 'after' ? target + 1 : target;
+  next.splice(insert, 0, moved);
+  // 顺序未变（例如拖到自身的相邻位置）时不做无意义的重放。
+  if (next.every((node, index) => node.id === list[index].id)) {
+    return;
+  }
+  nodes.value = next;
+  // 选中集合按新顺序重排，保证 Shift 范围选择继续沿列表顺序工作。
+  const selected = new Set(selectedIds.value);
+  selectedIds.value = next.filter((node) => selected.has(node.id)).map((node) => node.id);
+  stage?.setNodeOrder(next.map((node) => node.id));
+}
+
+/**
+ * 重转换后恢复用户拖拽过的层级顺序。
+ * 仅当节点 id 集合与当前完全一致时应用；节点结构变化则保留烘焙顺序。
+ */
+function restoreNodeOrder(ids: readonly number[]): void {
+  if (ids.length !== nodes.value.length || nodes.value.length === 0) {
+    return;
+  }
+  const byId = new Map(nodes.value.map((node) => [node.id, node]));
+  const next: StageNode[] = [];
+  for (const id of ids) {
+    const node = byId.get(id);
+    if (node == null) {
+      return;
+    }
+    byId.delete(id);
+    next.push(node);
+  }
+  if (byId.size > 0) {
+    return;
+  }
+  nodes.value = next;
+  stage?.setNodeOrder(next.map((node) => node.id));
+}
+
+/**
  * 单节点是否发光，与 Stage 的判定保持一致（两者必须同源，否则 UI 圆点会与实际渲染不符）：
  * - 总开关开：默认全部发光，只有显式标记为 `false` 的节点被排除；
  * - 总开关关：默认全部不发光，只有显式标记为 `true` 的节点发光。
@@ -383,10 +438,13 @@ function reconvert(): void {
     return;
   }
   const elapsed = performance.now() - started;
+  const previousOrder = nodes.value.map((node) => node.id);
   convertKey = key;
   model = converted;
   stage?.setModel(converted);
   syncNodes();
+  // 重转换不应丢失用户拖拽出的层级顺序；节点结构一致时重新套用。
+  restoreNodeOrder(previousOrder);
   // 先同步模型再写时间，最后强制刷新一帧让新几何立即上屏。
   time = ratio * duration;
   syncScene(true);
@@ -521,10 +579,24 @@ function onKeyDown(event: KeyboardEvent): void {
 }
 
 /**
+ * 判断这次拖拽是否携带外部文件。
+ * 节点列表的层级拖拽同样会触发 window 的 dragenter，若不加区分会误显示
+ * 全屏“松开以载入 Lottie JSON”遮罩，把整个页面盖住。
+ */
+function isFileDrag(event: DragEvent): boolean {
+  const types = event.dataTransfer?.types;
+  return types != null && Array.from(types).includes('Files');
+}
+
+/**
  * 拖入计数：dragenter/dragleave 会随子元素冒泡反复触发，
  * 用 dragDepth 计数可以保证只有真正离开窗口时才隐藏遮罩。
+ * 仅外部文件拖入时才显示遮罩，内部节点排序不触发。
  */
 function onDragEnter(event: DragEvent): void {
+  if (!isFileDrag(event)) {
+    return;
+  }
   event.preventDefault();
   dragDepth += 1;
   dropVisible.value = true;
@@ -532,7 +604,9 @@ function onDragEnter(event: DragEvent): void {
 
 /** 必须阻止默认行为，否则浏览器会直接打开被拖入的 JSON 文件。 */
 function onDragOver(event: DragEvent): void {
-  event.preventDefault();
+  if (isFileDrag(event)) {
+    event.preventDefault();
+  }
 }
 
 function onDragLeave(): void {
@@ -720,6 +794,7 @@ onBeforeUnmount(() => {
             @select-node="onNodeSelect"
             @toggle-node-glow="toggleNodeGlow"
             @toggle-node-visibility="toggleNodeVisibility"
+            @reorder-node="onNodeReorder"
           />
           <span class="canvas-hint">
             {{

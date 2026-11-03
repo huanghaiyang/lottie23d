@@ -60,6 +60,11 @@ const VIEW_TWEEN_MS = 320;
 
 /** 选中线框颜色（蓝色）。 */
 const SELECTION_COLOR = 0x3d8bff;
+/**
+ * 节点重排时的层深微调步进（世界单位）。
+ * 层深相同的填充/描边子节点靠它获得严格的前后次序，避免同级共面闪烁。
+ */
+const STACK_EPSILON = 0.002;
 /** 柔光渲染目标相对主画布的缩放：1/4 分辨率即可，模糊后叠加。 */
 const GLOW_SCALE = 0.25;
 /** 柔光合成透明度。 */
@@ -117,6 +122,11 @@ interface Entry {
   currentBucket: number;
   /** 由基础 alpha 推导的可见性（尚未叠加手动隐藏）。 */
   staticVisible: boolean;
+  /**
+   * 节点重排产生的额外层深偏移（世界单位）。
+   * 目标深度 = 原始烘焙深度 + stackDelta，因此“层深”滑块仍可整体缩放。
+   */
+  stackDelta: number;
 }
 
 /**
@@ -442,6 +452,8 @@ export class Stage {
         indexAttributes,
         currentBucket: 0,
         staticVisible,
+        // 新载入的模型按烘焙层深排序，尚未发生拖拽重排。
+        stackDelta: 0,
       });
       this.nodes.push({
         id,
@@ -459,9 +471,58 @@ export class Stage {
     this.dirty = true;
   }
 
-  /** 返回按渲染顺序排列的节点列表；其 id 与 setSelection 等接口使用的 id 一致。 */
+  /** 返回当前层级顺序的节点列表；其 id 与 setSelection 等接口使用的 id 一致。 */
   getNodes(): readonly StageNode[] {
     return this.nodes;
+  }
+
+  /**
+   * 按节点列表的新顺序重新安排前后层级。
+   *
+   * 节点 id 与几何缓冲保持稳定，只重排显示列表并重算层深：把原始层深
+   * 升序排列后依次赋给新顺序的节点（列表自上而下对应由后到前），再用
+   * [`STACK_EPSILON`] 打破同层深的平局。层深最终写入矩阵 Z 平移，因此
+   * “层深”滑块仍可在此基础上整体缩放。
+   *
+   * 传入的 id 必须是全部节点的完整排列，缺项或重复时直接忽略。
+   */
+  setNodeOrder(ids: readonly number[]): void {
+    if (ids.length !== this.entries.length || ids.length === 0) {
+      return;
+    }
+
+    // 先校验并收集节点对象；byId 用完后为空才说明传入的是完整排列。
+    const byId = new Map<number, StageNode>();
+    for (const node of this.nodes) {
+      byId.set(node.id, node);
+    }
+    const next: StageNode[] = [];
+    for (const id of ids) {
+      const node = byId.get(id);
+      if (node == null) {
+        return;
+      }
+      byId.delete(id);
+      next.push(node);
+    }
+    if (byId.size > 0) {
+      return;
+    }
+
+    this.nodes.length = 0;
+    this.nodes.push(...next);
+
+    // 原始层深升序：默认列表中越靠上深度越小（越靠后）。
+    const depths = this.entries.map((entry) => entry.data.depth).sort((a, b) => a - b);
+    for (let rank = 0; rank < ids.length; rank += 1) {
+      const entry = this.entries[ids[rank]];
+      const target = depths[rank] + rank * STACK_EPSILON;
+      entry.stackDelta = target - entry.data.depth;
+    }
+
+    // 立即重放当前帧，让新层级即时生效。
+    this.applyFrame(Math.max(0, this.frameIndex));
+    this.dirty = true;
   }
 
   /**
@@ -768,10 +829,12 @@ export class Stage {
         mesh.matrixWorld.fromArray(track, trackOffset);
       }
       const elements = mesh.matrixWorld.elements;
-      if (depthDelta !== 0) {
-        // 深度已经烘焙进轨道的 Z 平移（列主序第 14 个元素），
-        // 滑块只是在原值上叠加 data.depth * (倍率 - 1) 的增量。
-        elements[14] += data.depth * depthDelta;
+      // 深度已经烘焙进轨道的 Z 平移（列主序第 14 个元素）：
+      // - 滑块按 data.depth * (倍率 - 1) 追加增量；
+      // - 拖拽重排的 stackDelta 也随倍率缩放，二者共同得到目标层深。
+      const depthShift = data.depth * depthDelta + entry.stackDelta * this.depthAmount;
+      if (depthShift !== 0) {
+        elements[14] += depthShift;
       }
       if (thickness !== 1) {
         // 等价于在矩阵右侧乘 scale(1, 1, thickness)：只改第三列（Z 基向量）的分量。

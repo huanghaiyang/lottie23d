@@ -34,6 +34,8 @@ const emit = defineEmits<{
   ): void;
   (event: 'toggle-node-glow', id: number, solo: boolean): void;
   (event: 'toggle-node-visibility', id: number): void;
+  /** 拖拽调整节点层级：把 fromId 插入到 toId 之前或之后。 */
+  (event: 'reorder-node', fromId: number, toId: number, place: 'before' | 'after'): void;
 }>();
 
 /** 面板折叠状态；纯 UI 本地状态，不影响场景。 */
@@ -57,8 +59,81 @@ function isVisible(id: number): boolean {
   return props.visible[id] !== false;
 }
 
+// ---- 拖拽重排 ----
+/** 正在拖拽的节点 id；null 表示没有拖拽。 */
+const dragId = ref<number | null>(null);
+/** 当前悬停的目标节点 id，以及插入到它的上方还是下方。 */
+const dropId = ref<number | null>(null);
+const dropAfter = ref(false);
+/** 拖拽结束后浏览器可能补发一次 click，需要忽略它。 */
+let suppressClick = false;
+
+/** 开始拖拽：记录源节点并写入 text/plain，Firefox 才会真正启动拖拽。 */
+function onDragStart(node: StageNode, event: DragEvent): void {
+  dragId.value = node.id;
+  dropId.value = null;
+  dropAfter.value = false;
+  suppressClick = true;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(node.id));
+  }
+}
+
+/** 悬停到某行：按指针位于行的上半/下半决定插入方向。 */
+function onDragOver(node: StageNode, event: DragEvent): void {
+  if (dragId.value == null || dragId.value === node.id) {
+    return;
+  }
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move';
+  }
+  dropId.value = node.id;
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  dropAfter.value = event.clientY > rect.top + rect.height / 2;
+}
+
+/** 离开目标行时清除插入指示，避免残留高亮。 */
+function onDragLeave(node: StageNode): void {
+  if (dropId.value === node.id) {
+    dropId.value = null;
+  }
+}
+
+/** 放下：把源节点插入目标行的上方或下方。 */
+function onDrop(node: StageNode, event: DragEvent): void {
+  event.preventDefault();
+  const fromId = dragId.value;
+  const place: 'before' | 'after' = dropAfter.value ? 'after' : 'before';
+  resetDrag();
+  if (fromId == null || fromId === node.id) {
+    return;
+  }
+  emit('reorder-node', fromId, node.id, place);
+}
+
+/** 拖拽结束（包括拖到列表外取消）时清理全部临时状态。 */
+function onDragEnd(): void {
+  resetDrag();
+  // click 通常紧随 dragend 同步派发，延后一拍再恢复选择响应。
+  window.setTimeout(() => {
+    suppressClick = false;
+  }, 0);
+}
+
+function resetDrag(): void {
+  dragId.value = null;
+  dropId.value = null;
+  dropAfter.value = false;
+}
+
 /** 把鼠标修饰键映射成 App 约定的选择语义（macOS 的 meta 视作 ctrl）。 */
 function onNodeClick(id: number, event: MouseEvent): void {
+  // 刚结束一次拖拽时忽略补发的 click，避免误切换选中项。
+  if (suppressClick) {
+    return;
+  }
   emit('select-node', id, {
     shift: event.shiftKey,
     alt: event.altKey,
@@ -134,7 +209,19 @@ function onNodeClick(id: number, event: MouseEvent): void {
             v-for="node in nodes"
             :key="node.id"
             class="node-row"
-            :class="{ 'is-selected': isSelected(node.id), 'is-hidden': !isVisible(node.id) }"
+            :class="{
+              'is-selected': isSelected(node.id),
+              'is-hidden': !isVisible(node.id),
+              'is-dragging': dragId === node.id,
+              'is-drop-before': dropId === node.id && !dropAfter,
+              'is-drop-after': dropId === node.id && dropAfter,
+            }"
+            draggable="true"
+            @dragstart="onDragStart(node, $event)"
+            @dragover="onDragOver(node, $event)"
+            @dragleave="onDragLeave(node)"
+            @drop="onDrop(node, $event)"
+            @dragend="onDragEnd"
             @click="onNodeClick(node.id, $event)"
           >
             <span
@@ -164,7 +251,9 @@ function onNodeClick(id: number, event: MouseEvent): void {
             </button>
           </div>
         </div>
-        <p class="node-hint">点选/再点取消 · Shift 范围 · Alt 加选 · Alt+黄点：单节点柔光</p>
+        <p class="node-hint">
+          拖拽调整层级（上=后，下=前） · 点选/再点取消 · Shift 范围 · Alt 加选 · Alt+黄点：单节点柔光
+        </p>
       </div>
     </div>
   </aside>
