@@ -486,7 +486,7 @@ geometry.setIndex(indexAttributes[frameBuckets[f]])   // 拓扑变化时切换
 ## 14. 已知限制与取舍
 
 1. **2.5D**：不还原真实 3D 图层的 `rx/ry`、Z 位置与透视相机；只使用 `rz` 与自动分层深度。
-2. **不支持图层**：图片（`ty:2`）、文本（`ty:5`）、蒙版、轨道遮罩、效果器。表达式只识别“顶点跟随空对象”一种模式（见 §14.2），其余表达式忽略。
+2. **不支持图层**：图片（`ty:2`）、文本（`ty:5`）、蒙版、轨道遮罩、效果器。表达式只识别“顶点跟随空对象”“沿路径分布（Trace Path）”“位置弹性回弹”三种模式（见 §14.2、§14.3），其余表达式忽略。
 3. **形变按桶切换**：姿态锚点、前盖折叠超阈值或轮廓槽位变化时切换索引桶（最多 24 套），桶内按弧长对应；达到上限后沿用当前桶。
 4. **渐变近似**：`gf` / `gs` 取首色作为纯色。
 5. **`ind` 必须唯一**：同一合成内重复 `ind` 会导致父级挂错（lottie-web 按 `ind` 遍历所有图层，重复属于非法数据）。
@@ -527,6 +527,27 @@ $bm_rt = createPath(origPoints, origInTang, origOutTang, origPath.isClosed());
 1. `vertex_follow_names` 识别 `fromCompToSurface` + `Layer Control` 表达式，按括号深度解析 `nullLayerNames` 数组（层名本身含 `[1.0]`，不能用第一个 `]` 收尾）。
 2. 每帧对每个空对象求 `comp_anchor = plan_chain(null) × anchorPoint`，得到 comp 坐标。
 3. 用形状层链条矩阵的逆（`fromCompToSurface`）变回图层局部坐标，替换原路径顶点；切线保持不变。
+4. 因此这类图层视为几何动画，逐帧烘焙；拓扑固定（顶点数不变），通常只产生一个桶。
+
+这解释了此前“海星主体不动”的原因：表达式未被求值，10 个顶点停留在参考帧位置；现在会随空对象与父级 `main` 一起运动。
+
+### 14.3 位置表达式：沿路径分布与弹性回弹
+
+`lights.json` 的彩灯示例同时用到了两种位置表达式，任意一种缺失都会让效果失真：
+
+1. **沿路径分布（Trace Path）**：灯泡空对象的位置写成
+   ```js
+   thisComp.layer('wire').toComp(pathToTrace.pointOnPath(progress))
+   ```
+   转换器从图层的 `Pseudo/ADBE Trace Path` 效果读取 `progress`（百分比），在目标路径图层当帧展开的轮廓上按弧长取点，再用目标层链条矩阵换算到合成坐标（`toComp`）。由于目标路径本身带顶点跟随表达式，电线回弹时灯泡会一并移动。
+2. **弹性回弹（Position Overshoot）**：电线中点的位置表达式在关键帧之后叠加衰减正弦：
+   ```js
+   v = velocityAtTime(key(n).time - thisComp.frameDuration / 10)
+   value + v / 100 * amp * sin(2π * freq * t) / exp(decay * t)
+   ```
+   `amp/freq/decay` 分别取自 `Position - Overshoot / Bounce / Friction` 滑块（按 2.5、20、20 归一）。转换器用关键帧曲线在 `keyTime - 0.1 帧` 处做数值微分得到速度，再按上式叠加位移。
+
+每帧求值顺序：先算弹性回弹覆盖位置 → 再算沿路径分布（其目标路径依赖回弹后的顶点和空对象坐标）→ 最后写世界矩阵。两类表达式都只影响图层位置，不改变网格拓扑。
 4. 因此这类图层视为几何动画，逐帧烘焙；拓扑固定（顶点数不变），通常只产生一个桶。
 
 这解释了此前“海星主体不动”的原因：表达式未被求值，10 个顶点停留在参考帧位置；现在会随空对象与父级 `main` 一起运动。

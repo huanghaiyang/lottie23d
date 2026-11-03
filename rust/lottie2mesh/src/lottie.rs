@@ -71,6 +71,10 @@ pub struct Layer {
     /// 形状树原始节点，延迟解析。
     #[serde(default)]
     pub shapes: Vec<Value>,
+    /// 图层效果列表（延迟解析）。用于读取 `Pseudo/ADBE Trace Path` 等
+    /// 伪效果参数，复现「沿路径分布」的位置表达式。
+    #[serde(default)]
+    pub ef: Vec<Value>,
     /// 图层入点（父合成时间轴上的帧号）。
     #[serde(default)]
     pub ip: f32,

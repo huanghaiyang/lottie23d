@@ -221,11 +221,41 @@ struct Plan<'a> {
     ref_frame: f32,
     /// 该图层形状路径上的顶点跟随空对象表达式。
     follows: Option<FollowSpecs>,
+    /// 图层位置上的「沿路径分布」表达式（`Pseudo/ADBE Trace Path`）。
+    trace: Option<TraceSpec>,
+    /// 图层位置上的弹性回弹表达式（`Position - Overshoot` 系列滑块）。
+    overshoot: Option<OvershootSpec>,
+}
+
+/// 位置弹性回弹表达式参数（已按表达式里的换算系数归一）。
+///
+/// 对应 AE 表达式：在关键帧之后叠加一段衰减正弦位移
+/// `v/100 * amp * sin(2π*freq*t) / exp(decay*t)`，
+/// 其中 `v` 为关键帧前一刻的速度，`amp/freq/decay` 来自三个滑块效果。
+struct OvershootSpec {
+    amp: f32,
+    freq: f32,
+    decay: f32,
+}
+
+/// 图层位置表达式：把图层放到目标路径的指定百分比处。
+///
+/// 对应 AE 表达式
+/// `thisComp.layer('wire').toComp(pathToTrace.pointOnPath(progress))`，
+/// `progress` 取自图层效果 `Pseudo/ADBE Trace Path` 的 Progress 参数（0..100）。
+struct TraceSpec {
+    /// 目标路径图层在 `plans` 中的下标；`usize::MAX` 表示未找到。
+    target: usize,
+    /// Progress 属性（可能带关键帧），按图层局部帧求值。
+    progress: Value,
 }
 
 /// 编译期的全局状态。
 struct Compiler<'a> {
+    /// 实际采样帧数（可能因 8M float 预算降采样而少于请求值）。
     frame_count: usize,
+    /// 文档帧率（帧/秒），用于把关键帧位移换算成速度、把帧换算成秒。
+    frame_rate: f32,
     /// 采样区间起点（帧）与跨度（帧）。
     sample_start: f32,
     sample_span: f32,
@@ -292,6 +322,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
 
     let mut compiler = Compiler {
         frame_count,
+        frame_rate,
         sample_start: ip,
         sample_span: op - ip,
         half,
@@ -410,6 +441,8 @@ impl<'a> Compiler<'a> {
                 opacity_animated: false,
                 ref_frame,
                 follows: None,
+                trace: None,
+                overshoot: None,
             });
             ids.push(id);
         }
@@ -425,6 +458,12 @@ impl<'a> Compiler<'a> {
                     self.plans[id].parent = Some(parent);
                 }
             }
+        }
+
+        // 位置表达式按图层名引用同合成内的路径图层，此时所有 plan 已建立。
+        for &id in &ids {
+            self.plans[id].trace = self.collect_trace(id);
+            self.plans[id].overshoot = self.collect_overshoot(id);
         }
 
         for id in ids {
@@ -481,6 +520,8 @@ impl<'a> Compiler<'a> {
                 let plan_count = self.plans.len();
                 let mut chain_cache = vec![None; plan_count];
                 let mut frame_cache = vec![None; plan_count];
+                // 参考几何只需顶点跟随；路径目标上没有位置表达式，覆盖表留空。
+                let overrides: Vec<Option<[f32; 2]>> = vec![None; plan_count];
                 let mut positions = vec![None; plan_count];
                 fill_follow_positions(
                     &self.plans,
@@ -488,6 +529,7 @@ impl<'a> Compiler<'a> {
                     self.plans[id].ref_frame,
                     &mut chain_cache,
                     &mut frame_cache,
+                    &overrides,
                     &mut positions,
                 );
                 let inverse = layer_inverse(
@@ -496,6 +538,7 @@ impl<'a> Compiler<'a> {
                     self.plans[id].ref_frame,
                     &mut chain_cache,
                     &mut frame_cache,
+                    &overrides,
                 );
                 let ctx = FollowContext {
                     specs,
@@ -627,6 +670,77 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// 解析图层位置上的「沿路径分布」表达式（`Trace Path`）。
+    ///
+    /// 识别条件：`ks.p` 带字符串表达式，且同时出现 `pointOnPath` 与
+    /// `thisComp.layer(...)`；Progress 从同名伪效果中读取。目标路径图层
+    /// 按「同 owner + 同图层名」解析，未找到时保留 `usize::MAX`，烘焙期
+    /// 退回 `ks.p` 的静态/关键帧位置。
+    fn collect_trace(&self, id: usize) -> Option<TraceSpec> {
+        let layer = &self.plans[id].layer;
+        let expression = layer.ks.get("p")?.get("x")?.as_str()?;
+        if !expression.contains("pointOnPath") {
+            return None;
+        }
+        let name = trace_layer_name(expression)?;
+        let progress = layer
+            .ef
+            .iter()
+            .find(|effect| {
+                effect.get("mn").and_then(Value::as_str) == Some("Pseudo/ADBE Trace Path")
+            })
+            .and_then(|effect| effect.get("ef"))
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("mn")
+                        .and_then(Value::as_str)
+                        .map(|mn| mn.ends_with("-0001"))
+                        .unwrap_or(false)
+                })
+            })
+            .and_then(|item| item.get("v"))
+            .cloned()?;
+        let owner = self.plans[id].owner;
+        let target = self
+            .plans
+            .iter()
+            .position(|plan| plan.owner == owner && plan.layer.nm == name)
+            .unwrap_or(usize::MAX);
+        Some(TraceSpec { target, progress })
+    }
+
+    /// 解析图层位置上的弹性回弹表达式。
+    ///
+    /// 识别条件：`ks.p` 表达式包含 `velocityAtTime` 与 `Math.sin`，且图带上
+    /// `Position - Overshoot / Bounce / Friction` 三个滑块效果。参数按表达式
+    /// 中的换算系数归一：`amp = overshoot / 2.5`、`freq = bounce / 20`、
+    /// `decay = friction / 20`。
+    fn collect_overshoot(&self, id: usize) -> Option<OvershootSpec> {
+        let layer = &self.plans[id].layer;
+        let expression = layer.ks.get("p")?.get("x")?.as_str()?;
+        if !expression.contains("velocityAtTime") || !expression.contains("Math.sin") {
+            return None;
+        }
+        let slider = |name: &str, fallback: f32| -> f32 {
+            layer
+                .ef
+                .iter()
+                .find(|effect| effect.get("nm").and_then(Value::as_str) == Some(name))
+                .and_then(|effect| effect.get("ef"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("v"))
+                .and_then(|value| prop::eval(value, 0.0).first().copied())
+                .unwrap_or(fallback)
+        };
+        Some(OvershootSpec {
+            amp: slider("Position - Overshoot", 20.0) / 2.5,
+            freq: slider("Position - Bounce", 40.0) / 20.0,
+            decay: slider("Position - Friction", 40.0) / 20.0,
+        })
+    }
+
     /// 标记采样区间内图层 alpha 会变化的 plan。
     ///
     /// 合成 owner 的 plan 下标总小于其子图层，因此单次正序遍历即可把
@@ -706,6 +820,8 @@ impl<'a> Compiler<'a> {
         let mut opacity_cache: Vec<Option<f32>> = vec![None; plan_count];
         let mut frame_cache: Vec<Option<f32>> = vec![None; plan_count];
         let mut follow_positions: Vec<Option<[f32; 2]>> = vec![None; plan_count];
+        // 每帧由位置表达式算出的局部位置覆盖（Trace Path 等），对应 plan 下标。
+        let mut position_overrides: Vec<Option<[f32; 2]>> = vec![None; plan_count];
         let mut scratch = mesh::FrameScratch::default();
 
         // 姿态锚点：把采样区间按 1/7 等分，段起点用当帧几何重建三角化。
@@ -738,6 +854,54 @@ impl<'a> Compiler<'a> {
             for cache in frame_cache.iter_mut() {
                 *cache = None;
             }
+            for slot in position_overrides.iter_mut() {
+                *slot = None;
+            }
+
+            // 弹性回弹：位置表达式依赖关键帧速度，先求值，作为后续路径采样的输入。
+            for id in 0..plan_count {
+                let Some(spec) = self.plans[id].overshoot.as_ref() else {
+                    continue;
+                };
+                let position =
+                    overshoot_position(&self.plans, id, root_frame, spec, self.frame_rate);
+                if let Some(position) = position {
+                    position_overrides[id] = Some(position);
+                }
+            }
+            // 回弹求值期间缓存了不含覆盖的矩阵，清掉后再算路径采样。
+            for cache in chain_cache.iter_mut() {
+                *cache = None;
+            }
+            for cache in frame_cache.iter_mut() {
+                *cache = None;
+            }
+
+            // 位置表达式（Trace Path）依赖目标路径的当帧几何，必须先于世界矩阵求值。
+            for id in 0..plan_count {
+                if self.plans[id].trace.is_none() {
+                    continue;
+                }
+                let position = trace_position(
+                    &self.plans,
+                    id,
+                    root_frame,
+                    &position_overrides,
+                    &mut chain_cache,
+                    &mut frame_cache,
+                    &mut follow_positions,
+                );
+                if let Some(position) = position {
+                    position_overrides[id] = Some(position);
+                }
+            }
+            // 求表达式期间可能缓存了不含覆盖的矩阵，重建一次保证一致。
+            for cache in chain_cache.iter_mut() {
+                *cache = None;
+            }
+            for cache in frame_cache.iter_mut() {
+                *cache = None;
+            }
 
             for id in 0..plan_count {
                 let (matrix, _opacity) = plan_world(
@@ -749,6 +913,7 @@ impl<'a> Compiler<'a> {
                     &mut chain_cache,
                     &mut opacity_cache,
                     &mut frame_cache,
+                    &position_overrides,
                 );
                 // 每帧每位图层写 16 个 f32（列主序 4×4），轨迹按帧紧密排列。
                 let track = self.plans[id].transform_track;
@@ -775,6 +940,7 @@ impl<'a> Compiler<'a> {
                                 root_frame,
                                 &mut chain_cache,
                                 &mut frame_cache,
+                                &position_overrides,
                                 &mut follow_positions,
                             );
                             let inverse = layer_inverse(
@@ -783,6 +949,7 @@ impl<'a> Compiler<'a> {
                                 root_frame,
                                 &mut chain_cache,
                                 &mut frame_cache,
+                                &position_overrides,
                             );
                             let ctx = FollowContext {
                                 specs,
@@ -1140,14 +1307,218 @@ fn comp_anchor(
     root_frame: f32,
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
+    positions: &[Option<[f32; 2]>],
 ) -> [f32; 2] {
-    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache);
+    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, positions);
     let frame = plan_local_frame(plans, id, root_frame);
     let anchor = prop::eval_in(&plans[id].layer.ks, "a", frame, &[0.0, 0.0, 0.0]);
     [
         matrix[0] * anchor[0] + matrix[4] * anchor[1] + matrix[12],
         matrix[1] * anchor[0] + matrix[5] * anchor[1] + matrix[13],
     ]
+}
+
+/// 从位置表达式里取出 `thisComp.layer('...')` 引用的图层名。
+///
+/// 只识别单/双引号包裹的常量图层名；表达式更复杂（`layer(index)` 等）时
+/// 返回 `None`，由上层退回图层自身的关键帧位置。
+fn trace_layer_name(expression: &str) -> Option<String> {
+    let marker = "thisComp.layer(";
+    let start = expression.find(marker)? + marker.len();
+    let rest = expression[start..].trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let body = &rest[1..];
+    let end = body.find(quote)?;
+    Some(body[..end].to_string())
+}
+
+/// 把 4×4 列主序矩阵的 2D 仿射部分取出来（忽略 Z 旋转/透视）。
+fn chain_affine(matrix: &[f32; 16]) -> Affine {
+    Affine {
+        a: matrix[0],
+        b: matrix[1],
+        c: matrix[4],
+        d: matrix[5],
+        tx: matrix[12],
+        ty: matrix[13],
+    }
+}
+
+/// 目标图层当帧路径的第一个轮廓（含其顶点跟随表达式）。
+///
+/// 对应表达式里 `pathToTrace` 指向的形状路径；灯泡沿电线分布时，取到的
+/// 就是被三条空对象坐标驱动、正在回弹的那条线。
+fn eval_target_contour(
+    plans: &[Plan],
+    id: usize,
+    root_frame: f32,
+    positions: &[Option<[f32; 2]>],
+    chain_cache: &mut [Option<[f32; 16]>],
+    frame_cache: &mut [Option<f32>],
+    follow_positions: &mut Vec<Option<[f32; 2]>>,
+) -> Option<Contour> {
+    let frame = plan_local_frame(plans, id, root_frame);
+    let result = match &plans[id].follows {
+        Some(specs) => {
+            fill_follow_positions(
+                plans,
+                specs,
+                root_frame,
+                chain_cache,
+                frame_cache,
+                positions,
+                follow_positions,
+            );
+            let inverse = layer_inverse(plans, id, root_frame, chain_cache, frame_cache, positions);
+            shape::eval_shapes_follow(
+                &plans[id].layer.shapes,
+                frame,
+                &FollowContext {
+                    specs,
+                    layer_inverse: inverse,
+                    positions: follow_positions.as_slice(),
+                },
+            )
+        }
+        None => shape::eval_shapes(&plans[id].layer.shapes, frame),
+    };
+    result
+        .drawables
+        .iter()
+        .find_map(|drawable| drawable.paths.first())
+        .map(|item| item.contour.clone())
+}
+
+/// 按弧长百分比取轮廓上的点（对应 `pointOnPath`）。
+fn point_on_contour(contour: &Contour, progress: f32) -> Option<[f32; 2]> {
+    let points = &contour.pts;
+    let first = *points.first()?;
+    if points.len() < 2 {
+        return Some(first);
+    }
+    let total = contour.length();
+    if total <= 1e-4 {
+        return Some(first);
+    }
+    let target = progress.clamp(0.0, 1.0) * total;
+    let segments = if contour.closed {
+        points.len()
+    } else {
+        points.len() - 1
+    };
+    let mut walked = 0.0;
+    for i in 0..segments {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let length = (dx * dx + dy * dy).sqrt();
+        if walked + length >= target && length > 1e-6 {
+            let t = (target - walked) / length;
+            return Some([a[0] + dx * t, a[1] + dy * t]);
+        }
+        walked += length;
+    }
+    points.last().copied()
+}
+
+/// 求位置表达式对应的图层局部位置（父级空间坐标）。
+///
+/// 流程：按 Progress 百分比在目标路径上采样 → `toComp` 换算到合成坐标 →
+/// 若当前图层带父级，再用父级链的逆换算回父级空间（`p` 属性所在坐标系）。
+/// 目标缺失或路径取不到时返回 `None`，退回图层自身的关键帧位置。
+fn trace_position(
+    plans: &[Plan],
+    id: usize,
+    root_frame: f32,
+    positions: &[Option<[f32; 2]>],
+    chain_cache: &mut [Option<[f32; 16]>],
+    frame_cache: &mut [Option<f32>],
+    follow_positions: &mut Vec<Option<[f32; 2]>>,
+) -> Option<[f32; 2]> {
+    let trace = plans[id].trace.as_ref()?;
+    if trace.target >= plans.len() {
+        return None;
+    }
+    let progress = prop::eval(&trace.progress, plan_local_frame(plans, id, root_frame));
+    let progress = progress.first().copied().unwrap_or(0.0) / 100.0;
+    let contour = eval_target_contour(
+        plans,
+        trace.target,
+        root_frame,
+        positions,
+        chain_cache,
+        frame_cache,
+        follow_positions,
+    )?;
+    let local = point_on_contour(&contour, progress)?;
+    let target_matrix = plan_chain(
+        plans,
+        trace.target,
+        root_frame,
+        chain_cache,
+        frame_cache,
+        positions,
+    );
+    let comp = chain_affine(&target_matrix).apply(local);
+    match plans[id].parent {
+        Some(parent) => {
+            let parent_matrix = plan_chain(plans, parent, root_frame, chain_cache, frame_cache, positions);
+            chain_affine(&parent_matrix)
+                .inverse()
+                .map(|inverse| inverse.apply(comp))
+        }
+        None => Some(comp),
+    }
+}
+
+/// 求弹性回弹表达式对应的图层局部位置。
+///
+/// 复现 AE 里常见的「关键帧之后衰减振荡」写法：取关键帧前一刻的速度，
+/// 叠加 `v/100 * amp * sin(2π*freq*t) / exp(decay*t)`。速度通过关键帧
+/// 曲线在 `keyTime - 0.1 帧` 处做数值微分得到，单位换算为像素/秒。
+/// 时间在首个关键帧之前时没有回弹，返回 `None` 走关键帧插值。
+fn overshoot_position(
+    plans: &[Plan],
+    id: usize,
+    root_frame: f32,
+    spec: &OvershootSpec,
+    frame_rate: f32,
+) -> Option<[f32; 2]> {
+    let ks = &plans[id].layer.ks;
+    let keys = ks.get("p")?.get("k")?.as_array()?;
+    let frame = plan_local_frame(plans, id, root_frame);
+    let mut last_key: Option<(usize, f32)> = None;
+    for (index, key) in keys.iter().enumerate() {
+        let time = key.get("t").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        if time <= frame {
+            last_key = Some((index, time));
+        }
+    }
+    let (_, key_time) = last_key?;
+    let base = prop::eval_in(ks, "p", frame, &[0.0, 0.0, 0.0]);
+    let t = (frame - key_time) / frame_rate;
+    if t <= 0.0 {
+        return Some([base[0], base[1]]);
+    }
+    // 关键帧前 0.1 帧处的瞬时速度（px/秒）。
+    let sample = key_time - 0.1;
+    let h = 0.1;
+    let now = prop::eval_in(ks, "p", sample, &[0.0, 0.0, 0.0]);
+    let prev = prop::eval_in(ks, "p", sample - h, &[0.0, 0.0, 0.0]);
+    let scale = if h > 0.0 { frame_rate / h } else { 0.0 };
+    let vx = (now[0] - prev[0]) * scale;
+    let vy = (now.get(1).copied().unwrap_or(0.0) - prev.get(1).copied().unwrap_or(0.0)) * scale;
+    let damping = (spec.decay * t).exp();
+    if !damping.is_finite() || damping <= 0.0 {
+        return Some([base[0], base[1]]);
+    }
+    let wave = (2.0 * std::f32::consts::PI * spec.freq * t).sin();
+    let k = spec.amp / 100.0 * wave / damping;
+    Some([base[0] + vx * k, base[1] + vy * k])
 }
 
 /// 每帧把被引用的空对象锚点位置解析到 `out`，按 plan 下标索引。
@@ -1159,6 +1530,7 @@ fn fill_follow_positions(
     root_frame: f32,
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
+    positions: &[Option<[f32; 2]>],
     out: &mut Vec<Option<[f32; 2]>>,
 ) {
     out.clear();
@@ -1172,6 +1544,7 @@ fn fill_follow_positions(
                     root_frame,
                     chain_cache,
                     frame_cache,
+                    positions,
                 ));
             }
         }
@@ -1187,8 +1560,9 @@ fn layer_inverse(
     root_frame: f32,
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
+    positions: &[Option<[f32; 2]>],
 ) -> Affine {
-    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache);
+    let matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, positions);
     Affine {
         a: matrix[0],
         b: matrix[1],
@@ -1297,16 +1671,21 @@ fn plan_chain(
     root_frame: f32,
     cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
+    positions: &[Option<[f32; 2]>],
 ) -> [f32; 16] {
     if let Some(matrix) = cache[id] {
         return matrix;
     }
     let frame = plan_local_frame(plans, id, root_frame);
-    let local = affine_matrix(shape::transform_matrix(&plans[id].layer.ks, frame));
+    let local = affine_matrix(shape::transform_matrix_at(
+        &plans[id].layer.ks,
+        frame,
+        positions.get(id).copied().flatten(),
+    ));
     let matrix = match plans[id].parent {
         Some(parent) => {
             // 父矩阵在左：p' = parent * local * p，即先局部后父级。
-            let parent_matrix = plan_chain(plans, parent, root_frame, cache, frame_cache);
+            let parent_matrix = plan_chain(plans, parent, root_frame, cache, frame_cache, positions);
             mat_mul(&parent_matrix, &local)
         }
         None => local,
@@ -1330,11 +1709,12 @@ fn plan_world(
     chain_cache: &mut Vec<Option<[f32; 16]>>,
     opacity_cache: &mut Vec<Option<f32>>,
     frame_cache: &mut Vec<Option<f32>>,
+    positions: &[Option<[f32; 2]>],
 ) -> ([f32; 16], f32) {
     if let (Some(matrix), Some(opacity)) = (world_cache[id], opacity_cache[id]) {
         return (matrix, opacity);
     }
-    let chain = plan_chain(plans, id, root_frame, chain_cache, frame_cache);
+    let chain = plan_chain(plans, id, root_frame, chain_cache, frame_cache, positions);
     let (base, base_opacity) = match plans[id].owner {
         Some(owner) => plan_world(
             plans,
@@ -1345,6 +1725,7 @@ fn plan_world(
             chain_cache,
             opacity_cache,
             frame_cache,
+            positions,
         ),
         None => (*global, 1.0),
     };
