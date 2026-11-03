@@ -195,6 +195,16 @@ export class Stage {
   /** 复用的临时包围盒，避免每次更新都分配 Three 对象。 */
   private readonly boxScratch = new THREE.Box3();
 
+  // ---- 透视补偿 ----
+  /** 上一帧相机的逆矩阵（每帧重算一次，所有图层共用）。 */
+  private readonly cameraInverse = new THREE.Matrix4();
+  /** 相机到观察目标的距离，即补偿后的投影参考平面。 */
+  private referenceDistance = 1;
+  /** 复用向量：把图层原点换到相机空间求深度，避免逐层分配。 */
+  private readonly cameraSpacePoint = new THREE.Vector3();
+  /** 复用矩阵：拼装相机空间的补偿变换。 */
+  private readonly matrixScratch = new THREE.Matrix4();
+
   /** 通过节点列表隐藏的节点 id；隐藏后跳过逐帧计算与绘制。 */
   private readonly hiddenNodes = new Set<number>();
 
@@ -799,6 +809,8 @@ export class Stage {
 
     const width = Math.max(1, this.host.clientWidth);
     const height = Math.max(1, this.host.clientHeight);
+    // 相机可能刚移动：透视补偿依赖相机位姿，必须重写各层世界矩阵。
+    this.writeMatrices();
     this.updateSelectionBoxes();
     // 主场景：先铺满视口清屏，再绘制；柔光与 gizmo 叠加在其上。
     this.renderer.setViewport(0, 0, width, height);
@@ -824,7 +836,88 @@ export class Stage {
   }
 
   /**
-   * 逐帧核心：写世界矩阵、颜色、顶点与索引桶。
+   * 写入所有图层的世界矩阵：轨道取值 → 层深 / 厚度倍率 → 透视补偿。
+   *
+   * 透视补偿的由来：层深被烘焙进矩阵的 Z 平移，而相机是 40° 透视，
+   * 于是越远的图层被压向画面中心、越近的被推离中心（离中心越远偏差越大），
+   * 平移动画里各层相互错位，与 Lottie 原画对不上。这里把每层的原点换到
+   * 相机空间，按沿视线方向的深度 d 做一次 XY 缩放：
+   * `k = d / 相机到观察目标的距离`，投影因此退化为统一尺度的正交投影，
+   * 任意视角下各层位置都与原画重合；层深仍保留在 Z 上负责遮挡与排序，
+   * 绕转视角时也会照常显出前后错位（错位来自旋转而非透视除法）。
+   */
+  private writeMatrices(): void {
+    if (this.model == null) {
+      return;
+    }
+    this.camera.updateMatrixWorld();
+    this.cameraInverse.copy(this.camera.matrixWorldInverse);
+    // 参考平面：过观察目标、垂直于视线的平面（默认即原画所在的 Z=0 平面）。
+    this.referenceDistance = Math.max(
+      1e-4,
+      this.camera.position.distanceTo(this.controls.target),
+    );
+
+    // 每条轨道是帧连续的 16 float 块，这里算好当前帧的起点。
+    const trackOffset = Math.min(this.frameIndex, this.model.frameCount - 1) * 16;
+    // 层深与厚度都是“倍率”，1 表示保持烘焙值。
+    const depthDelta = this.depthAmount - 1;
+    const thickness = this.thicknessAmount;
+    const cameraMatrix = this.camera.matrixWorld;
+
+    for (let id = 0; id < this.entries.length; id += 1) {
+      const entry = this.entries[id];
+      const matrix = entry.mesh.matrixWorld;
+      // 所有图层都挂在场景根节点下，没有父级矩阵需要相乘；常量轨道复用
+      // 预先算好的 base，避免每帧从 Float32Array 重新组装。
+      if (entry.transformStatic) {
+        matrix.copy(entry.base);
+      } else if (entry.track != null) {
+        matrix.fromArray(entry.track, trackOffset);
+      }
+      const elements = matrix.elements;
+      // 深度已经烘焙进轨道的 Z 平移（列主序第 14 个元素）：
+      // - 滑块按 data.depth * (倍率 - 1) 追加增量；
+      // - 拖拽重排的 stackDelta 也随倍率缩放，二者共同得到目标层深。
+      const depthShift = entry.data.depth * depthDelta + entry.stackDelta * this.depthAmount;
+      if (depthShift !== 0) {
+        elements[14] += depthShift;
+      }
+      if (thickness !== 1) {
+        // 等价于在矩阵右侧乘 scale(1, 1, thickness)：只改第三列（Z 基向量）的分量。
+        elements[2] *= thickness;
+        elements[6] *= thickness;
+        elements[10] *= thickness;
+      }
+
+      // 图层原点在相机空间的深度（相机朝 -Z 看，故取负 z）。
+      this.cameraSpacePoint
+        .set(elements[12], elements[13], elements[14])
+        .applyMatrix4(this.cameraInverse);
+      const depth = -this.cameraSpacePoint.z;
+      if (depth <= 1e-4) {
+        continue;
+      }
+      const scale = depth / this.referenceDistance;
+      // 落在参考平面上的图层无需补偿（绝大多数静态层走这条捷径）。
+      if (scale > 0.999 && scale < 1.001) {
+        continue;
+      }
+      // matrix = cameraMatrix · diag(scale, scale, 1) · cameraInverse · matrix
+      this.matrixScratch.multiplyMatrices(this.cameraInverse, matrix);
+      const scaled = this.matrixScratch.elements;
+      // 左乘 diag(scale, scale, 1, 1) 等价于把前两行按 scale 缩放
+      // （列主序下每列 4 个元素，前两个即第 0、1 行）。
+      for (let col = 0; col < 16; col += 4) {
+        scaled[col] *= scale;
+        scaled[col + 1] *= scale;
+      }
+      matrix.multiplyMatrices(cameraMatrix, this.matrixScratch);
+    }
+  }
+
+  /**
+   * 逐帧核心：写颜色、顶点与索引桶（世界矩阵由 [`writeMatrices`] 负责）。
    * 只做内存拷贝和少量标量运算，不做任何几何计算。
    *
    * @param frame 目标帧（调用方已保证在 [0, frameCount - 1] 内）
@@ -834,44 +927,18 @@ export class Stage {
       return;
     }
     this.frameIndex = frame;
-    const frameCount = this.model.frameCount;
-    // 每条轨道是帧连续的 16 float 块，这里算好当前帧的起点。
-    const trackOffset = Math.min(frame, frameCount - 1) * 16;
-    // 层深与厚度都是“倍率”，1 表示保持烘焙值。
-    const depthDelta = this.depthAmount - 1;
-    const thickness = this.thicknessAmount;
+    // 换帧后立即刷新矩阵，保证调用方读到一致的世界矩阵；相机移动时
+    // 由 render() 再调用一次以更新透视补偿。
+    this.writeMatrices();
 
     for (let id = 0; id < this.entries.length; id += 1) {
       const entry = this.entries[id];
-      const { data, mesh, material, position, colors, track } = entry;
+      const { data, mesh, material, position, colors } = entry;
 
       // 隐藏节点跳过全部逐帧工作（矩阵、颜色、顶点、索引），直到重新显示。
       if (this.hiddenNodes.has(id)) {
         mesh.visible = false;
         continue;
-      }
-
-      // 直接写 matrixWorld：所有图层都挂在场景根节点下，没有父级矩阵需要相乘，
-      // 也没有 matrixWorldNeedsUpdate 之类的失效传播要维护。
-      // 常量轨道复用预先算好的 base，避免每帧从 Float32Array 重新组装。
-      if (entry.transformStatic) {
-        mesh.matrixWorld.copy(entry.base);
-      } else if (track != null) {
-        mesh.matrixWorld.fromArray(track, trackOffset);
-      }
-      const elements = mesh.matrixWorld.elements;
-      // 深度已经烘焙进轨道的 Z 平移（列主序第 14 个元素）：
-      // - 滑块按 data.depth * (倍率 - 1) 追加增量；
-      // - 拖拽重排的 stackDelta 也随倍率缩放，二者共同得到目标层深。
-      const depthShift = data.depth * depthDelta + entry.stackDelta * this.depthAmount;
-      if (depthShift !== 0) {
-        elements[14] += depthShift;
-      }
-      if (thickness !== 1) {
-        // 等价于在矩阵右侧乘 scale(1, 1, thickness)：只改第三列（Z 基向量）的分量。
-        elements[2] *= thickness;
-        elements[6] *= thickness;
-        elements[10] *= thickness;
       }
 
       // 逐帧颜色：每帧 4 个 float（RGBA），alpha 过低直接整帧不可见。
