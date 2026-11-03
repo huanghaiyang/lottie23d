@@ -5,8 +5,8 @@
 import { ref } from 'vue';
 import type { StageNode } from '../scene/stage';
 
-// 以下 8 个参数通过 defineModel 与 App.vue 双向绑定（模板中使用 kebab-case 名称）。
-// 厚度/层深是渲染期增量，边缘平滑/曲线采样/采样帧率会触发重转换。
+// 以下 10 个参数通过 defineModel 与 App.vue 双向绑定（模板中使用 kebab-case 名称）。
+// 厚度/层深/柔光强度/柔光半径是渲染期增量，边缘平滑/曲线采样/采样帧率会触发重转换。
 const thickness = defineModel<number>('thickness', { required: true });
 const depth = defineModel<number>('depth', { required: true });
 const edgeRatio = defineModel<number>('edge-ratio', { required: true });
@@ -16,6 +16,10 @@ const curveSpacing = defineModel<number>('curve-spacing', { required: true });
 const autoRotate = defineModel<boolean>('auto-rotate', { required: true });
 const axisLock = defineModel<boolean>('axis-lock', { required: true });
 const softGlow = defineModel<boolean>('soft-glow', { required: true });
+/** 柔光强度倍率：1 为默认，0 相当于关闭叠加。 */
+const glowIntensity = defineModel<number>('glow-intensity', { required: true });
+/** 柔光半径倍率：1 为默认，越大越柔和。 */
+const glowRadius = defineModel<number>('glow-radius', { required: true });
 
 /** App.vue 注入的只读状态：节点列表、选中集合，以及逐节点柔光/显隐标记。 */
 const props = defineProps<{
@@ -196,6 +200,18 @@ function onNodeClick(id: number, event: MouseEvent): void {
         <input v-model="softGlow" type="checkbox" />
         <span class="toggle-track"><span class="toggle-thumb"></span></span>
         <span>柔光</span>
+      </label>
+
+      <label class="inspector-row" title="柔光叠加的亮度，0 相当于关闭，1 为默认">
+        <span class="inspector-label">柔光强度</span>
+        <input v-model.number="glowIntensity" type="range" min="0" max="2" step="0.05" />
+        <output>{{ glowIntensity.toFixed(2) }}×</output>
+      </label>
+
+      <label class="inspector-row" title="模糊半径越大越柔和，过高会因 5 抽样出现轻微分层">
+        <span class="inspector-label">柔光半径</span>
+        <input v-model.number="glowRadius" type="range" min="0.2" max="3" step="0.05" />
+        <output>{{ glowRadius.toFixed(2) }}×</output>
       </label>
 
       <div class="node-section">

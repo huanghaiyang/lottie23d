@@ -67,7 +67,7 @@ const SELECTION_COLOR = 0x3d8bff;
 const STACK_EPSILON = 0.002;
 /** 柔光渲染目标相对主画布的缩放：1/4 分辨率即可，模糊后叠加。 */
 const GLOW_SCALE = 0.25;
-/** 柔光合成透明度。 */
+/** 柔光合成基础透明度；实际叠加值再乘以强度倍率。 */
 const GLOW_OPACITY = 0.8;
 
 /** 全屏四边形顶点着色器：直接把裁剪空间坐标铺满，只传 uv 给片元。 */
@@ -199,6 +199,11 @@ export class Stage {
   private readonly hiddenNodes = new Set<number>();
 
   // ---- 柔光后处理 ----
+  /** 柔光强度倍率（0..2）：合成叠加的不透明度 = 基础值 × 该倍率。 */
+  private glowIntensity = 1;
+  /** 柔光半径倍率（0.2..3）：高斯模糊的采样步长按它缩放。 */
+  private glowRadius = 1;
+
   /** 总柔光开关：开启时默认所有节点都发光，关闭时仅显式开启的节点发光。 */
   private softGlow = false;
   /** 单节点覆盖标记（显式开 / 关），与总开关组合出最终语义。 */
@@ -608,6 +613,32 @@ export class Stage {
       return;
     }
     this.syncGlowMeshes();
+    this.dirty = true;
+  }
+
+  /**
+   * 调整柔光强度（0..2，1 为默认）：只改合成叠加的不透明度，
+   * 不重建渲染目标，暂停时也会立即重绘。
+   */
+  setGlowIntensity(value: number): void {
+    const next = Math.max(0, Math.min(2, value));
+    if (this.glowIntensity === next) {
+      return;
+    }
+    this.glowIntensity = next;
+    this.dirty = true;
+  }
+
+  /**
+   * 调整柔光半径（0.2..3，1 为默认）：按倍率放大高斯模糊的采样步长，
+   * 半径越大越柔和；倍率过高时 5 抽样会出现轻微分层，属于性能取舍。
+   */
+  setGlowRadius(value: number): void {
+    const next = Math.max(0.2, Math.min(3, value));
+    if (this.glowRadius === next) {
+      return;
+    }
+    this.glowRadius = next;
     this.dirty = true;
   }
 
@@ -1104,7 +1135,7 @@ export class Stage {
    * 只要有一个节点发光就会执行，即使总柔光开关关闭。
    */
   private renderGlow(width: number, height: number): void {
-    if (this.glowMeshes.size === 0) {
+    if (this.glowMeshes.size === 0 || this.glowIntensity <= 0) {
       return;
     }
     this.ensureGlowTargets(width, height);
@@ -1134,11 +1165,11 @@ export class Stage {
     this.renderer.clear(true, false, false);
     this.renderer.render(this.glowScene, this.camera);
 
-    // 第一遍模糊：横向，步长 = 1 / 目标宽度（纹理坐标单位）。
+    // 第一遍模糊：横向，步长 = 半径倍率 / 目标宽度（纹理坐标单位）。
     this.glowQuad.material = this.glowBlurMaterial;
     this.glowBlurMaterial.uniforms.source.value = read.texture;
     (this.glowBlurMaterial.uniforms.direction.value as THREE.Vector2).set(
-      1 / this.glowWidth,
+      this.glowRadius / this.glowWidth,
       0,
     );
     this.renderer.setRenderTarget(write);
@@ -1149,7 +1180,7 @@ export class Stage {
     this.glowBlurMaterial.uniforms.source.value = write.texture;
     (this.glowBlurMaterial.uniforms.direction.value as THREE.Vector2).set(
       0,
-      1 / this.glowHeight,
+      this.glowRadius / this.glowHeight,
     );
     this.renderer.setRenderTarget(read);
     this.renderer.clear(true, false, false);
@@ -1175,6 +1206,8 @@ export class Stage {
         composite.needsUpdate = true;
       }
     }
+    // 强度倍率只影响叠加不透明度，样式参数变化无需重建材质。
+    composite.opacity = GLOW_OPACITY * this.glowIntensity;
 
     // 回到主画布：只清深度（保留已渲染的颜色），再用加性混合叠加柔光。
     this.renderer.setRenderTarget(null);

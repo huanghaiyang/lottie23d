@@ -50,6 +50,10 @@ const nodes = ref<StageNode[]>([]);
 const selectedIds = ref<number[]>([]);
 /** 总柔光开关：开启时所有节点默认发光。 */
 const softGlow = ref(false);
+/** 柔光强度倍率（0..2）：1 为默认，0 相当于关闭叠加。 */
+const glowIntensity = ref(1);
+/** 柔光半径倍率（0.2..3）：1 为默认，越大越柔和。 */
+const glowRadius = ref(1);
 /** 单节点柔光覆盖：true 强制发光，false 强制排除（与总开关组合）。 */
 const nodeGlow = reactive<Record<number, boolean>>({});
 /** 单节点显隐，缺省（undefined）视为可见。 */
@@ -705,6 +709,9 @@ watch(softGlow, (value) => {
   stage?.setAllNodeGlow(value);
   stage?.setSoftGlow(value);
 });
+// 柔光强度 / 半径是渲染期参数，无需重新转换，暂停时也会立即重绘。
+watch(glowIntensity, (value) => stage?.setGlowIntensity(value));
+watch(glowRadius, (value) => stage?.setGlowRadius(value));
 
 // 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
 onMounted(() => {
@@ -787,6 +794,8 @@ onBeforeUnmount(() => {
             v-model:auto-rotate="autoRotate"
             v-model:axis-lock="axisLock"
             v-model:soft-glow="softGlow"
+            v-model:glow-intensity="glowIntensity"
+            v-model:glow-radius="glowRadius"
             :nodes="nodes"
             :selected="selectedIds"
             :glow="nodeGlow"
