@@ -200,6 +200,10 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
             let offset = (meta_size + data.len()) as u32;
             data.extend_from_slice(&mesh.frame_buckets);
             put_u32(&mut blob, record + 88, offset);
+            // u8 序列长度不一定是 4 的倍数；补齐到 4 字节，保证后续网格的
+            // f32/u32 数据块起始偏移仍满足 TypedArray 的对齐要求。
+            let padding = (4 - (data.len() % 4)) % 4;
+            data.extend(std::iter::repeat(0u8).take(padding));
         }
 
         // 名称按 4 字节对齐存放：不足部分补 0，偏移 68/72 记录起点与长度。

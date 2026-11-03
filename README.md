@@ -59,6 +59,7 @@ const model = converter.convert(lottieJson, {
   max_frames: 600,     // 烘焙帧上限
   thickness: 8,        // 挤出半厚度（Lottie 像素）
   edge_radius: 3,      // 边缘平滑半径（仅填充，会被 clamp 到半厚度）
+  curve_spacing: 3,    // 轮廓采样间距（像素/点，1–8；越小曲线越平滑）
 });
 
 console.log(model.width, model.height, model.frameCount, model.meshCount);
@@ -80,7 +81,7 @@ console.log(model.width, model.height, model.frameCount, model.meshCount);
 ### CLI
 
 ```bash
-node sdk/cli.mjs input.json output.l2d3 --fps=30 --max-frames=600 --thickness=8 --edge-radius=3
+node sdk/cli.mjs input.json output.l2d3 --fps=30 --max-frames=600 --thickness=8 --edge-radius=3 --curve-spacing=3
 ```
 
 不传输出路径时会把二进制模型输出到 stdout。
@@ -109,6 +110,7 @@ let bytes = lottie2mesh::output::encode(&model);
 | `max_frames` | SDK / CLI | 600 | 烘焙帧上限（1–1200），超出会降低采样率 |
 | `thickness` | SDK / CLI | 画布最大边的 1.2% | 挤出半厚度（Lottie 像素），限制在 0.01–8% |
 | `edge_radius` / `edgeRadius` | SDK / CLI / 右侧面板 | 0 | 填充边缘平滑半径，会被 clamp 到半厚度 |
+| `curve_spacing` / `curveSpacing` | SDK / CLI / 右侧面板 | 3 | 轮廓采样间距（像素/点，1–8），越小曲线越平滑、顶点越多 |
 | 厚度倍率 | 右侧面板 | 1× | 渲染期沿 Z 缩放，无需重新转换 |
 | 层深 | 右侧面板 | 1 | 渲染期放大层间 Z 间距 |
 | 采样帧率 | 右侧面板 | 文档帧率 | 修改后自动重新转换并保持播放进度 |

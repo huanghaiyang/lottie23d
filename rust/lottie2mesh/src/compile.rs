@@ -5,7 +5,7 @@
 //! * 建立图层 `Plan` 树（含预合成 owner、parent 链、深度）；
 //! * 生成参考帧网格（`CompiledMesh::from_surface`）；
 //! * 逐帧计算世界矩阵、透明度、几何/颜色，写入轨迹；
-//! * B 方案拓扑分桶：按 `MeshBucket` 签名缓存多套 indices，帧间切换索引；
+//! * B 方案拓扑分桶：按姿态锚点与折叠检测缓存多套 indices，帧间切换索引；
 //! * 解析并烘焙 AE「顶点跟随空对象」表达式。
 //!
 //! 关键数据流：
@@ -34,6 +34,10 @@ use crate::path::Contour;
 use crate::prop;
 use crate::shape::{self, Affine, DrawKind, Drawable, FollowContext, FollowSpecs, PathItem};
 
+/// 前盖折叠判定阈值：`Σ|三角形面积| / |Σ有符号面积|` 超过该值时，
+/// 认为现有三角化已不适合当前姿态，需要按当帧几何重建一套桶。
+const FOLD_RATIO_THRESHOLD: f32 = 1.015;
+
 /// 转换选项，可由 CLI 参数、C ABI 的 JSON 或默认值构造。
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct RawOptions {
@@ -47,11 +51,17 @@ pub struct RawOptions {
     /// 边缘圆角半径，单位 Lottie 像素，钳制到半厚度以内；缺省 0。
     #[serde(default, alias = "edgeRadius")]
     pub edge_radius: Option<f32>,
+    /// 轮廓采样间距，单位 Lottie 像素/点；越小曲线越平滑，缺省 3.0，
+    /// 钳制到 1..8。`curveSpacing` 为 camelCase 别名。
+    #[serde(default, alias = "curveSpacing")]
+    pub curve_spacing: Option<f32>,
 }
 
-/// 一套缓存拓扑：签名 + 该签名下构建的 indices 与顶点规模。
+/// 一套缓存拓扑：该姿态下的采样计划、indices 与顶点规模。
+///
+/// 同一个网格最多 [`mesh::MAX_BUCKETS`] 套；各帧通过 `frame_buckets`
+/// 指向自己使用的那一套，运行时切换索引即可。
 pub struct MeshBucket {
-    pub signature: u64,
     pub slots: Vec<SlotPlan>,
     pub indices: Vec<u32>,
     pub point_count: u32,
@@ -90,6 +100,38 @@ pub struct CompiledMesh {
 }
 
 impl CompiledMesh {
+    /// 用一套新采样计划替换指定桶（基础桶按首帧姿态重建时使用）。
+    fn replace_bucket(&mut self, index: usize, surface: MeshSurface) {
+        let point_count = surface.point_count as u32;
+        let vertex_count = (surface.point_count * surface.stride) as u32;
+        let MeshSurface { slots, indices, .. } = surface;
+        if index == 0 {
+            // 单桶编码路径仍使用 indices 副本，需要同步。
+            self.indices = indices.clone();
+        }
+        self.point_count = self.point_count.max(point_count);
+        let bucket = &mut self.buckets[index];
+        bucket.slots = slots;
+        bucket.indices = indices;
+        bucket.point_count = point_count;
+        bucket.vertex_count = vertex_count;
+    }
+
+    /// 追加一套新桶（姿态锚点或段内拓扑变化时），返回其下标。
+    fn push_bucket(&mut self, surface: MeshSurface) -> usize {
+        let point_count = surface.point_count as u32;
+        let vertex_count = (surface.point_count * surface.stride) as u32;
+        let MeshSurface { slots, indices, .. } = surface;
+        self.point_count = self.point_count.max(point_count);
+        self.buckets.push(MeshBucket {
+            slots,
+            indices,
+            point_count,
+            vertex_count,
+        });
+        self.buckets.len() - 1
+    }
+
     /// 由参考帧表面创建网格；`animated` 为真时预置空的逐帧顶点轨迹。
     fn from_surface(
         surface: MeshSurface,
@@ -101,7 +143,6 @@ impl CompiledMesh {
         name: String,
         animated: bool,
     ) -> CompiledMesh {
-        let signature = mesh::slot_signature(&surface.slots).unwrap_or(0);
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
         let frames = if animated { Some(Vec::new()) } else { None };
@@ -115,7 +156,6 @@ impl CompiledMesh {
             frame_offsets: Vec::new(),
             frame_buckets: Vec::new(),
             buckets: vec![MeshBucket {
-                signature,
                 slots: surface.slots,
                 indices: surface.indices.clone(),
                 point_count,
@@ -191,6 +231,8 @@ struct Compiler<'a> {
     sample_span: f32,
     half: f32,
     edge_radius: f32,
+    /// 轮廓采样间距（Lottie 像素/点），越小采样点越多、曲线越平滑。
+    curve_spacing: f32,
     /// 全局矩阵（列主序 4×4，含 3.6 缩放与 Y 翻转）。
     global: [f32; 16],
     meshes: Vec<CompiledMesh>,
@@ -238,6 +280,11 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         .edge_radius
         .unwrap_or(0.0)
         .clamp(0.0, half);
+    // 曲线采样间距：缺省 3 像素/点；小于 1 会迅速放大顶点/显存，大于 8 折线明显。
+    let curve_spacing = raw_options
+        .curve_spacing
+        .unwrap_or(3.0)
+        .clamp(1.0, 8.0);
 
     let global = global_matrix(width, height);
     // 参考帧取动画中点，兼顾开头与结尾的几何形态。
@@ -249,6 +296,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         sample_span: op - ip,
         half,
         edge_radius,
+        curve_spacing,
         global,
         meshes: Vec::new(),
         transforms: Vec::new(),
@@ -460,7 +508,7 @@ impl<'a> Compiler<'a> {
         };
 
         for drawable in result.drawables {
-            let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius) else {
+            let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
                 self.plans[id].blueprints.push(None);
                 continue;
             };
@@ -519,7 +567,7 @@ impl<'a> Compiler<'a> {
                 trim: None,
             }],
         };
-        let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius) else {
+        let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
             return;
         };
         let mesh_index = self.meshes.len();
@@ -633,10 +681,14 @@ impl<'a> Compiler<'a> {
     /// 逐帧烘焙：写出所有图层的世界矩阵、动态颜色与几何顶点。
     ///
     /// 第 i 帧根合成时间为 `sample_start + sample_span * i / frame_count`。
-    /// 变换写入 16 float 列主序矩阵；几何变化时按拓扑签名选桶，把该帧顶点
+    /// 变换写入 16 float 列主序矩阵；几何变化时按“姿态锚点”选桶，把该帧顶点
     /// 追加到 `frame_positions`，并在 `frame_offsets` 中记录每帧起始的 float
     /// 下标（末尾再补一个总数作为结束哨兵）。最后把初始顶点补齐到所有桶中
     /// 的最大顶点数，保证播放时可直接按桶切换索引。
+    ///
+    /// 姿态锚点：把采样区间等分为若干段，每段起点都用当帧几何重新三角化。
+    /// 只靠一套参考三角化套全程时，形状剧烈形变会让三角形反绕/重叠，
+    /// 填充上出现裂缝或穿插；分段的索引拓扑能把这些误差限制在一小段内。
     fn bake(&mut self) {
         let frame_count = self.frame_count;
         let sample_start = self.sample_start;
@@ -656,7 +708,22 @@ impl<'a> Compiler<'a> {
         let mut follow_positions: Vec<Option<[f32; 2]>> = vec![None; plan_count];
         let mut scratch = mesh::FrameScratch::default();
 
+        // 姿态锚点：把采样区间按 1/7 等分，段起点用当帧几何重建三角化。
+        // 基础桶（下标 0）在每段起点之外还负责首帧，故这里只排 1/7..6/7。
+        let mut anchor_frames: Vec<usize> = Vec::new();
+        for step in 1..7 {
+            let frame = step * frame_count / 7;
+            if frame > 0 && frame < frame_count && anchor_frames.last() != Some(&frame) {
+                anchor_frames.push(frame);
+            }
+        }
+        // 每个网格当前使用的桶下标，以及基础桶是否已按首帧姿态重建。
+        let mut active_bucket = vec![0usize; self.meshes.len()];
+        let mut pose_ready = vec![false; self.meshes.len()];
+
         for frame_index in 0..frame_count {
+            // 当前帧是否落在某个姿态锚点上。
+            let anchor_slot = anchor_frames.binary_search(&frame_index).ok();
             // 根合成时间按采样区间线性分摊到 frame_count 帧。
             let root_frame = sample_start + sample_span * (frame_index as f32 / frame_count as f32);
             for cache in world_cache.iter_mut() {
@@ -783,7 +850,8 @@ impl<'a> Compiler<'a> {
                             .as_ref()
                             .map(|track| track.len())
                             .unwrap_or(0);
-                        let mut bucket_index = 0usize;
+                        let mesh_index = blueprint.mesh_index;
+                        let mut bucket_index = active_bucket[mesh_index];
                         if let Some(drawable) = evaluated
                             .as_ref()
                             .and_then(|result| result.drawables.get(drawable_index))
@@ -791,18 +859,47 @@ impl<'a> Compiler<'a> {
                             let half = mesh.half_thickness;
                             let slots = shape::drawable_slots(drawable);
                             if !slots.is_empty() {
-                                let natural = mesh::plan_slots(&slots);
-                                let signature = mesh::slot_signature(&natural);
-                                if let Some(sig) = signature {
-                                    // 量化签名相同则复用已有桶；否则在桶上限内
-                                    // 新建一套（槽位计划 + indices + 点数）。
+                                if !pose_ready[mesh_index] {
+                                    // 首个有效帧：用当帧姿态重建基础桶，取代
+                                    // 建立在别处（通常是动画中点）的参考三角化。
+                                    let natural = mesh::plan_slots(&slots, self.curve_spacing);
+                                    if let Some(surface) = mesh::build_surface_from_slots(
+                                        drawable,
+                                        &slots,
+                                        natural,
+                                        half,
+                                        edge_radius,
+                                    ) {
+                                        mesh.replace_bucket(0, surface);
+                                        bucket_index = 0;
+                                        pose_ready[mesh_index] = true;
+                                    }
+                                } else if anchor_slot.is_some()
+                                    && mesh.buckets.len() < mesh::MAX_BUCKETS
+                                {
+                                    // 姿态锚点：为这一段形变新建一套三角化。
+                                    let natural = mesh::plan_slots(&slots, self.curve_spacing);
+                                    if let Some(surface) = mesh::build_surface_from_slots(
+                                        drawable,
+                                        &slots,
+                                        natural,
+                                        half,
+                                        edge_radius,
+                                    ) {
+                                        bucket_index = mesh.push_bucket(surface);
+                                    }
+                                } else if slots.len() != mesh.buckets[bucket_index].slots.len() {
+                                    // 段内轮廓槽位数量发生变化（如 trim）：优先
+                                    // 复用槽位数一致的桶，桶还有空位则新建一套。
                                     if let Some(position) = mesh
                                         .buckets
                                         .iter()
-                                        .position(|bucket| bucket.signature == sig)
+                                        .position(|bucket| bucket.slots.len() == slots.len())
                                     {
                                         bucket_index = position;
                                     } else if mesh.buckets.len() < mesh::MAX_BUCKETS {
+                                        let natural =
+                                            mesh::plan_slots(&slots, self.curve_spacing);
                                         if let Some(surface) = mesh::build_surface_from_slots(
                                             drawable,
                                             &slots,
@@ -810,31 +907,31 @@ impl<'a> Compiler<'a> {
                                             half,
                                             edge_radius,
                                         ) {
-                                            mesh.point_count = mesh
-                                                .point_count
-                                                .max(surface.point_count as u32);
-                                            mesh.buckets.push(MeshBucket {
-                                                signature: sig,
-                                                slots: surface.slots,
-                                                indices: surface.indices,
-                                                point_count: surface.point_count as u32,
-                                                vertex_count: (surface.point_count * surface.stride)
-                                                    as u32,
-                                            });
-                                            bucket_index = mesh.buckets.len() - 1;
+                                            bucket_index = mesh.push_bucket(surface);
                                         }
                                     }
                                 }
 
-                                let (count, bucket_plans) = {
+                                // 本帧顶点追加到轨迹尾部；写入失败则回滚长度。
+                                let mut wrote = false;
+                                let mut write_start = 0usize;
+                                let (count, stride, bucket_plans) = {
                                     let bucket = &mesh.buckets[bucket_index];
-                                    (bucket.vertex_count as usize * 3, bucket.slots.as_slice())
+                                    let stride = if bucket.point_count > 0 {
+                                        (bucket.vertex_count / bucket.point_count) as usize
+                                    } else {
+                                        1
+                                    };
+                                    (
+                                        bucket.vertex_count as usize * 3,
+                                        stride,
+                                        bucket.slots.as_slice(),
+                                    )
                                 };
                                 if let Some(track) = mesh.frame_positions.as_mut() {
-                                    // 本帧顶点追加到轨迹尾部；写入失败则回滚长度。
-                                    let write_start = track.len();
+                                    write_start = track.len();
                                     track.resize(write_start + count, 0.0);
-                                    if !mesh::write_frame_with_slots(
+                                    wrote = mesh::write_frame_with_slots(
                                         drawable,
                                         &slots,
                                         bucket_plans,
@@ -842,12 +939,70 @@ impl<'a> Compiler<'a> {
                                         edge_radius,
                                         &mut track[write_start..],
                                         &mut scratch,
-                                    ) {
+                                    );
+                                    if !wrote {
                                         track.truncate(write_start);
+                                    }
+                                }
+                                // 折叠检测：填充前盖若出现反绕/重叠（有符号面积和明显
+                                // 小于绝对面积和），立即用当前姿态重建一套三角化并重写
+                                // 本帧顶点，避免把裂缝留到下一帧。描边的环形带有符号
+                                // 面积和接近 0，不参与该判定。
+                                if wrote && mesh.kind == 0 && mesh.buckets.len() < mesh::MAX_BUCKETS {
+                                    let ratio = match mesh.frame_positions.as_ref() {
+                                        Some(track) => cap_fold_ratio(
+                                            &mesh.buckets[bucket_index].indices,
+                                            stride,
+                                            &track[write_start..write_start + count],
+                                        ),
+                                        None => 1.0,
+                                    };
+                                    if ratio > FOLD_RATIO_THRESHOLD {
+                                        let natural =
+                                            mesh::plan_slots(&slots, self.curve_spacing);
+                                        if let Some(surface) = mesh::build_surface_from_slots(
+                                            drawable,
+                                            &slots,
+                                            natural,
+                                            half,
+                                            edge_radius,
+                                        ) {
+                                            let new_index = mesh.push_bucket(surface);
+                                            let (new_count, new_plans) = {
+                                                let bucket = &mesh.buckets[new_index];
+                                                (
+                                                    bucket.vertex_count as usize * 3,
+                                                    bucket.slots.as_slice(),
+                                                )
+                                            };
+                                            let mut rewritten = false;
+                                            if let Some(track) = mesh.frame_positions.as_mut() {
+                                                // 回滚旧拓扑写入的本帧顶点，再按新桶重写。
+                                                track.truncate(write_start);
+                                                track.resize(write_start + new_count, 0.0);
+                                                rewritten = mesh::write_frame_with_slots(
+                                                    drawable,
+                                                    &slots,
+                                                    new_plans,
+                                                    half,
+                                                    edge_radius,
+                                                    &mut track[write_start..],
+                                                    &mut scratch,
+                                                );
+                                                if !rewritten {
+                                                    track.truncate(write_start);
+                                                }
+                                            }
+                                            if rewritten {
+                                                bucket_index = new_index;
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                        // 记录本网格接下来继续使用的桶（无几何的帧沿用上一段）。
+                        active_bucket[mesh_index] = bucket_index;
                         // 即使本帧没有有效 drawable，偏移表也要保持每帧一项。
                         // frame_offsets 记录 float 下标（不是顶点数），与
                         // frame_positions 的长度单位一致。
@@ -885,6 +1040,44 @@ impl<'a> Compiler<'a> {
             mesh.frame_offsets.push(total as u32);
         }
     }
+}
+
+/// 计算某网格前盖三角形的折叠程度：`Σ|面积| / |Σ有符号面积|`。
+///
+/// `indices` 是挤出后的索引缓冲，前盖顶点都满足 `index % stride == 0`，
+/// 用该条件把它们从侧墙/后盖三角形中筛出来；`frame` 是本帧顶点缓冲切片
+/// （`[x, y, z]` 连续排列）。返回值 1.0 表示三角形绕向一致且互不重叠，
+/// 大于 1 说明存在反绕/重叠，越大越严重。面积和接近 0（完全退化）时
+/// 返回 1.0，避免除零把结果放大。
+fn cap_fold_ratio(indices: &[u32], stride: usize, frame: &[f32]) -> f32 {
+    if stride == 0 || frame.len() < 3 {
+        return 1.0;
+    }
+    let mask = stride as u32;
+    let mut abs_sum = 0.0f64;
+    let mut signed_sum = 0.0f64;
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0], tri[1], tri[2]);
+        if a % mask != 0 || b % mask != 0 || c % mask != 0 {
+            continue;
+        }
+        let va = a as usize * 3;
+        let vb = b as usize * 3;
+        let vc = c as usize * 3;
+        if va + 2 >= frame.len() || vb + 2 >= frame.len() || vc + 2 >= frame.len() {
+            continue;
+        }
+        // 2D 有符号面积（鞋带公式）；绕向一致时为同一符号。
+        let area = ((frame[vb] - frame[va]) * (frame[vc + 1] - frame[va + 1])
+            - (frame[vc] - frame[va]) * (frame[vb + 1] - frame[va + 1]))
+            * 0.5;
+        abs_sum += (area as f64).abs();
+        signed_sum += area as f64;
+    }
+    if abs_sum < 1e-6 || signed_sum.abs() < 1e-6 {
+        return 1.0;
+    }
+    (abs_sum / signed_sum.abs()) as f32
 }
 
 /* ------------------------------------------------------------------ */

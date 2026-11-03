@@ -2,9 +2,10 @@
 //!
 //! 模块职责：
 //! * 把 `shape::Drawable` 的轮廓槽位重采样到固定点数，生成 2D 顶点；
-//! * 填充用 earcut 三角化（含孔洞分组），描边生成左右偏移的 ribbon；
+//! * 填充用 earcut 三角化（含孔洞分组），并做 Delaunay 边翻转改善三角形质量；
+//! * 描边生成左右偏移的 ribbon；
 //! * 用边界边（只被一个三角形引用的边）生成侧墙，前后盖按 `stride` 复制；
-//! * 支持按拓扑桶（不同 `k` / 闭合状态）逐帧重写顶点。
+//! * 支持按姿态桶（不同采样计划）逐帧重写顶点。
 //!
 //! 关键数据流：
 //! ```text
@@ -19,6 +20,7 @@
 //! `stride = 2 * ROUND_SEGMENTS + 2 = 8`。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::path::{self, Contour};
 use crate::shape::{DrawKind, Drawable};
@@ -27,10 +29,19 @@ use crate::shape::{DrawKind, Drawable};
 const ROUND_SEGMENTS: usize = 3;
 
 /// 每条轮廓重采样点数 `k` 的下限与上限。
+///
+/// 上限决定了大轮廓在屏幕上的平滑度：`k` 被截断时，弦长会随轮廓变大而变长，
+/// 挤出后的侧墙与盖面在放大视图下会出现明显折线。480 允许约 1440 像素周长
+/// 的轮廓保持每 3 像素一个采样点。
 const MIN_K: usize = 6;
-const MAX_K: usize = 128;
-/// 每个网格允许的拓扑桶上限（超出的帧复用最近的桶）。
-pub const MAX_BUCKETS: usize = 8;
+const MAX_K: usize = 480;
+/// 每个网格允许的拓扑桶上限（姿态锚点 + 折叠触发 + 拓扑变化共用）。
+///
+/// 烘焙时按采样区间等距设置“姿态锚点”，并在检测到前盖三角形明显反绕/
+/// 重叠时额外新建一套三角化，避免拿相隔很远的姿态去套当前形变（剧烈形变
+/// 会让三角形反绕、重叠，填充出现裂缝）。上限 24 能覆盖常见形变，又不会
+/// 让索引内存与播放端索引缓冲无限膨胀。
+pub const MAX_BUCKETS: usize = 24;
 
 /// 单个轮廓槽位的采样计划：`k` 为每轮廓重采样点数，`closed` 决定首尾是否相连。
 #[derive(Clone, Debug)]
@@ -95,63 +106,47 @@ fn ring_profile(index: usize, radius: f32, half: f32) -> (f32, f32) {
 /// 基于 drawable 的槽位构建参考网格与固定拓扑。
 ///
 /// `half_thickness` 为挤出半厚（像素），`edge_radius` 为圆角半径（像素，
-/// 仅填充生效并钳制到半厚）。无有效轮廓或三角化失败时返回 `None`。
+/// 仅填充生效并钳制到半厚）；`curve_spacing` 为轮廓采样间距（像素/点，
+/// 越小越平滑）。无有效轮廓或三角化失败时返回 `None`。
 pub fn build_surface(
     drawable: &Drawable,
     half_thickness: f32,
     edge_radius: f32,
+    curve_spacing: f32,
 ) -> Option<MeshSurface> {
     let slots = crate::shape::drawable_slots(drawable);
     if slots.is_empty() {
         return None;
     }
-    let plans = plan_slots(&slots);
+    let plans = plan_slots(&slots, curve_spacing);
     build_surface_from_slots(drawable, &slots, plans, half_thickness, edge_radius)
 }
 
-/// 单条轮廓的自然重采样密度：约每 4 像素一个点（对齐 lottie-web），
-/// 并钳制到 `[MIN_K, MAX_K]`；近乎零长度时返回 4。
-pub fn natural_k(contour: &Contour) -> usize {
+/// 单条轮廓的自然重采样密度：约每 `spacing` 像素一个点；并钳制到
+/// `[MIN_K, MAX_K]`，近乎零长度时返回 4。
+///
+/// `spacing` 由调用方传入（转换选项 `curve_spacing`，默认 3.0），下限 1 像素、
+/// 上限 8 像素由 [`crate::compile::RawOptions`] 统一钳制；`MAX_K = 480` 决定了
+/// 单条轮廓最多 480 个采样点。
+pub fn natural_k(contour: &Contour, spacing: f32) -> usize {
     let length = contour.length();
     if length < 1e-4 {
         4
     } else {
-        ((length / 4.0).ceil() as usize).clamp(MIN_K, MAX_K)
+        ((length / spacing).ceil() as usize).clamp(MIN_K, MAX_K)
     }
 }
 
 /// 为每个槽位生成采样计划（此时孔洞标记未知，统一置 `false`）。
-pub fn plan_slots(slots: &[(Cow<'_, Contour>, bool, bool)]) -> Vec<SlotPlan> {
+pub fn plan_slots(slots: &[(Cow<'_, Contour>, bool, bool)], spacing: f32) -> Vec<SlotPlan> {
     slots
         .iter()
         .map(|(contour, closed, _)| SlotPlan {
-            k: natural_k(contour),
+            k: natural_k(contour, spacing),
             closed: *closed,
             hole: false,
         })
         .collect()
-}
-
-/// B 方案「拓扑分桶缓存」的签名：轮廓数量 + 每槽的量化采样密度与闭合状态。
-///
-/// 位布局：
-/// * bit 0..3：槽位数量（最多 8）；
-/// * 每个槽位占 6 bit，起始位 `4 + index * 6`：`kq << 1 | closed`，
-///   其中 `kq = ceil(k / 8)` 为量化后的密度（最多 16，恰好占 5 bit）。
-///
-/// 量化 `k` 可以让密度随形状大小变化但仍落入少量桶；槽位超过 8 个时返回
-/// `None`，回调 A 行为（沿用基础拓扑）。
-pub fn slot_signature(plans: &[SlotPlan]) -> Option<u64> {
-    if plans.len() > 8 {
-        return None;
-    }
-    let mut signature = plans.len() as u64;
-    for (index, plan) in plans.iter().enumerate() {
-        let kq = ((plan.k + 7) / 8) as u64;
-        let bits = (kq << 1) | plan.closed as u64;
-        signature |= bits << (4 + index * 6);
-    }
-    Some(signature)
 }
 
 /// 用显式槽位和采样计划构建网格（烘焙时发现新拓扑桶会走这条路径）。
@@ -215,15 +210,13 @@ pub fn build_surface_from_slots(
 
 /// 逐帧烘焙时复用的缓冲区，避免每帧重新分配。
 ///
-/// 所有网格共享一个实例；`sampled` 按槽位复用，`plans` 保存当前帧的自然
-/// 采样计划（用作拓扑签名输入）。
+/// 所有网格共享一个实例；`sampled` 按槽位复用，`points` / `normals`
+/// 保存当前帧中间结果。
 #[derive(Default)]
 pub struct FrameScratch {
     sampled: Vec<Vec<[f32; 2]>>,
     points: Vec<[f32; 2]>,
     normals: Vec<[f32; 2]>,
-    /// 当前帧的自然槽位计划（拓扑签名输入）。
-    pub plans: Vec<SlotPlan>,
 }
 
 /// 为另一帧重建顶点位置，保持参考拓扑并直接写入目标轨迹切片。
@@ -242,7 +235,7 @@ pub fn write_frame(
     write_frame_with_slots(drawable, &slots, plans, half_thickness, edge_radius, out, scratch)
 }
 
-/// 与 [`write_frame`] 相同，但复用调用方已算好的槽位（编译器在签名阶段已
+/// 与 [`write_frame`] 相同，但复用调用方已算好的槽位（编译器选桶时已
 /// 取得），避免重复展开 trim 槽位。
 pub fn write_frame_with_slots(
     drawable: &Drawable,
@@ -522,6 +515,15 @@ fn tessellate_fill(points: &[[f32; 2]], plans: &[SlotPlan]) -> Vec<u32> {
     }
 
     let offsets = contour_offsets(plans);
+    // 每个全局采样点所属的轮廓槽位；边翻转只允许发生在同一轮廓内部。
+    let mut contour_id = vec![0u32; points.len()];
+    for (index, plan) in plans.iter().enumerate() {
+        let start = offsets[index];
+        let end = (start + plan.k).min(points.len());
+        for id in &mut contour_id[start..end] {
+            *id = index as u32;
+        }
+    }
     let mut indices = Vec::new();
     // 只处理作为组根的外轮廓；每组把外轮廓与孔洞顶点拼成 earcut 输入。
     for group in groups {
@@ -558,7 +560,134 @@ fn tessellate_fill(points: &[[f32; 2]], plans: &[SlotPlan]) -> Vec<u32> {
             }
         }
     }
+    // earcut 只保证覆盖，不保证三角形质量：它常产生横跨多个凹口的细长三角形。
+    // 形变时这些长边极易反绕，填充会出现折叠/裂缝。这里用 Delaunay 边翻转
+    // 把三角形改造成更“局部”的形状（只翻同一条轮廓内部的公共边，不改边界）。
+    reduce_long_triangles(points, &contour_id, &mut indices);
     indices
+}
+
+/// 对 earcut 结果做若干轮 Delaunay 边翻转（Lawson flip），减少横跨凹口的长三角形。
+///
+/// 只处理被两个三角形共享、且两端点属于同一条轮廓的内部边；边界边和跨越
+/// 孔洞/不同轮廓的连接边保持不变，因此不会破坏外轮廓或孔洞。每轮把一条
+/// 公共边 `uv` 换成 `ab`（四顶点严格凸且满足空圆条件时），并保持三角形
+/// 绕向一致，保证挤出后的前后盖与侧墙仍然合法。
+fn reduce_long_triangles(points: &[[f32; 2]], contour_id: &[u32], indices: &mut [u32]) {
+    let triangle_count = indices.len() / 3;
+    if triangle_count < 2 {
+        return;
+    }
+    // 统一为逆时针绕向，后续空圆测试与翻转都依赖这一约定。
+    for triangle in 0..triangle_count {
+        let base = triangle * 3;
+        let a = points[indices[base] as usize];
+        let b = points[indices[base + 1] as usize];
+        let c = points[indices[base + 2] as usize];
+        if orient(a, b, c) < 0.0 {
+            indices.swap(base + 1, base + 2);
+        }
+    }
+
+    // 每轮最多翻转一遍；同一轮内被改写的三角形不再参与，避免状态互相干扰。
+    const MAX_PASSES: usize = 6;
+    for _ in 0..MAX_PASSES {
+        // (无向边) → 两侧三角形的 (下标, 对顶点, 该三角形是否沿键的正方向使用此边)。
+        let mut edges: HashMap<(u32, u32), Vec<(usize, u32, bool)>> = HashMap::new();
+        for triangle in 0..triangle_count {
+            let base = triangle * 3;
+            let tri = [indices[base], indices[base + 1], indices[base + 2]];
+            for corner in 0..3 {
+                let u = tri[corner];
+                let v = tri[(corner + 1) % 3];
+                if u == v {
+                    continue;
+                }
+                let key = if u < v { (u, v) } else { (v, u) };
+                let forward = u < v;
+                edges
+                    .entry(key)
+                    .or_default()
+                    .push((triangle, tri[(corner + 2) % 3], forward));
+            }
+        }
+
+        let mut touched = vec![false; triangle_count];
+        let mut flipped = 0usize;
+        for (&(u, v), owners) in edges.iter() {
+            // 只翻转内部边：恰好两个三角形共享，且四顶点都在同一条轮廓上。
+            if owners.len() != 2 {
+                continue;
+            }
+            // 两个三角形应以相反方向共享此边；否则说明拓扑已异常，跳过。
+            if owners[0].2 == owners[1].2 {
+                continue;
+            }
+            let forward = if owners[0].2 { owners[0] } else { owners[1] };
+            let backward = if owners[0].2 { owners[1] } else { owners[0] };
+            let (t0, a) = (forward.0, forward.1);
+            let (t1, b) = (backward.0, backward.1);
+            if touched[t0] || touched[t1] {
+                continue;
+            }
+            let (u, v, a, b) = (u as usize, v as usize, a as usize, b as usize);
+            if contour_id[u] != contour_id[v]
+                || contour_id[a] != contour_id[u]
+                || contour_id[b] != contour_id[u]
+            {
+                continue;
+            }
+            let pu = points[u];
+            let pv = points[v];
+            let pa = points[a];
+            let pb = points[b];
+            // 四边形必须严格凸，否则新对角线会跑到形状外面。
+            if orient(pu, pv, pa) * orient(pu, pv, pb) >= 0.0
+                || orient(pa, pb, pu) * orient(pa, pb, pv) >= 0.0
+            {
+                continue;
+            }
+            // 空圆测试：b 落在三角形 (u, v, a) 的外接圆内则翻转。
+            if !in_circle(pu, pv, pa, pb) {
+                continue;
+            }
+            let base0 = t0 * 3;
+            indices[base0] = a as u32;
+            indices[base0 + 1] = u as u32;
+            indices[base0 + 2] = b as u32;
+            let base1 = t1 * 3;
+            indices[base1] = b as u32;
+            indices[base1 + 1] = v as u32;
+            indices[base1 + 2] = a as u32;
+            touched[t0] = true;
+            touched[t1] = true;
+            flipped += 1;
+        }
+        if flipped == 0 {
+            break;
+        }
+    }
+}
+
+/// 二维叉积（带符号面积的两倍）；用于判断绕向与凸性。
+fn orient(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f64 {
+    let (ax, ay) = (a[0] as f64, a[1] as f64);
+    let (bx, by) = (b[0] as f64, b[1] as f64);
+    let (cx, cy) = (c[0] as f64, c[1] as f64);
+    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+}
+
+/// 空圆测试：`d` 是否落在逆时针三角形 `abc` 的外接圆内。
+fn in_circle(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> bool {
+    let (adx, ady) = ((a[0] - d[0]) as f64, (a[1] - d[1]) as f64);
+    let (bdx, bdy) = ((b[0] - d[0]) as f64, (b[1] - d[1]) as f64);
+    let (cdx, cdy) = ((c[0] - d[0]) as f64, (c[1] - d[1]) as f64);
+    let ab = adx * bdy - ady * bdx;
+    let bc = bdx * cdy - bdy * cdx;
+    let ca = cdx * ady - cdy * adx;
+    let det = ab * (cdx * cdx + cdy * cdy) + bc * (adx * adx + ady * ady)
+        + ca * (bdx * bdx + bdy * bdy);
+    det > 0.0
 }
 
 /// 计算每个槽位在拼接点缓冲中的起始下标。

@@ -38,6 +38,8 @@ const depth = ref(1);
 const thickness = ref(1);
 const edgeRatio = ref(0);
 const sampleFps = ref(30);
+/** 轮廓采样间距（Lottie 像素/点，1..8）：越小曲线越平滑、顶点越多。 */
+const curveSpacing = ref(3);
 const autoRotate = ref(false);
 const axisLock = ref(false);
 const activeAxis = ref<ViewAxis | null>(null);
@@ -331,7 +333,11 @@ function toggleNodeVisibility(id: number): void {
  * 而 ABI 期望的是像素值，所以要乘上第 0 个网格已烘焙的 `halfThickness`。
  */
 function convertOptions(): ConvertOptions {
-  const options: ConvertOptions = { fps: sampleFps.value };
+  const options: ConvertOptions = {
+    fps: sampleFps.value,
+    // 轮廓采样间距（像素/点）：1..8，越小越平滑，由 Rust 侧再次钳制。
+    curve_spacing: curveSpacing.value,
+  };
   const half = model?.meshes[0]?.halfThickness ?? 0;
   // 圆角半径以半厚度百分比表示，避免不同尺寸图层看起来圆角不一致。
   if (edgeRatio.value > 0 && half > 0) {
@@ -342,7 +348,7 @@ function convertOptions(): ConvertOptions {
 
 /** 转换选项指纹：与上一次一致说明无需重转换。 */
 function optionsKey(): string {
-  return `${sampleFps.value}|${edgeRatio.value}`;
+  return `${sampleFps.value}|${edgeRatio.value}|${curveSpacing.value}`;
 }
 
 /** 把本次转换结果的统计写入各面板标签（耗时、帧数、三角形数、二进制体积）。 */
@@ -612,9 +618,10 @@ watch(axisLock, (value) => {
   }
   stage?.setRotationLock(value);
 });
-// 这两个参数会改变几何/采样，需要重新跑 Rust 转换（经过 90ms 防抖）。
+// 这三个参数会改变几何/采样，需要重新跑 Rust 转换（经过 90ms 防抖）。
 watch(edgeRatio, scheduleReconvert);
 watch(sampleFps, scheduleReconvert);
+watch(curveSpacing, scheduleReconvert);
 // 柔光总开关：一次性把标记铺到所有节点，保证 UI 圆点与 Stage 判定一致。
 // 之后仍可单独覆盖某个节点，即使总开关保持关闭。
 watch(softGlow, (value) => {
@@ -702,6 +709,7 @@ onBeforeUnmount(() => {
             v-model:depth="depth"
             v-model:edge-ratio="edgeRatio"
             v-model:sample-fps="sampleFps"
+            v-model:curve-spacing="curveSpacing"
             v-model:auto-rotate="autoRotate"
             v-model:axis-lock="axisLock"
             v-model:soft-glow="softGlow"

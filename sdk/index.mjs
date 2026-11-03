@@ -370,7 +370,7 @@ export async function loadConverter(source) {
    *   6. status == 0：读 l2d_output_ptr()/l2d_output_len()，slice() 拷贝出 wasm 内存后 release。
    *
    * @param lottie Lottie JSON 字符串或可直接 JSON.stringify 的对象
-   * @param options 转换选项（fps / max_frames / thickness / edge_radius）
+   * @param options 转换选项（fps / max_frames / thickness / edge_radius / curve_spacing）
    * @returns `.l2d3` 字节（已脱离 wasm 内存，可长期持有）
    */
   function convertBytes(lottie, options = {}) {
