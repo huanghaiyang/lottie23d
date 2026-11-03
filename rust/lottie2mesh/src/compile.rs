@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::lottie::{Layer, Lottie};
 use crate::mesh::{self, MeshSurface, SlotPlan};
-use crate::path::Contour;
+use crate::path::{Contour, PathData, PathLengths};
 use crate::prop;
 use crate::shape::{self, Affine, DrawKind, Drawable, FollowContext, FollowSpecs, PathItem};
 
@@ -847,6 +847,60 @@ impl<'a> Compiler<'a> {
         let mut overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
         let mut scratch = mesh::FrameScratch::default();
 
+        // lottie-web 的 `pointOnPath` 在首次调用时缓存分段长度并一直复用；
+        // 这里按首帧（采样起点）的目标路径构造参考表，逐帧只按它映射 progress。
+        let mut trace_lengths: Vec<Option<PathLengths>> = vec![None; plan_count];
+        {
+            let root_frame = sample_start;
+            for id in 0..plan_count {
+                let Some(spec) = self.plans[id].overshoot.as_ref() else {
+                    continue;
+                };
+                if let Some(position) =
+                    overshoot_position(&self.plans, id, root_frame, spec, self.frame_rate)
+                {
+                    overrides[id] = Some(PoseOverride {
+                        position: Some(position),
+                        rotation: None,
+                    });
+                }
+            }
+            for cache in chain_cache.iter_mut() {
+                *cache = None;
+            }
+            for cache in frame_cache.iter_mut() {
+                *cache = None;
+            }
+            for id in 0..plan_count {
+                let Some(spec) = self.plans[id].trace.as_ref() else {
+                    continue;
+                };
+                if spec.target >= plan_count {
+                    continue;
+                }
+                if let Some(path) = eval_trace_path_data(
+                    &self.plans,
+                    spec.target,
+                    root_frame,
+                    &overrides,
+                    &mut chain_cache,
+                    &mut frame_cache,
+                    &mut follow_positions,
+                ) {
+                    trace_lengths[id] = Some(PathLengths::from_path(&path));
+                }
+            }
+            for slot in overrides.iter_mut() {
+                *slot = None;
+            }
+            for cache in chain_cache.iter_mut() {
+                *cache = None;
+            }
+            for cache in frame_cache.iter_mut() {
+                *cache = None;
+            }
+        }
+
         // 姿态锚点：把采样区间按 1/7 等分，段起点用当帧几何重建三角化。
         // 基础桶（下标 0）在每段起点之外还负责首帧，故这里只排 1/7..6/7。
         let mut anchor_frames: Vec<usize> = Vec::new();
@@ -916,6 +970,7 @@ impl<'a> Compiler<'a> {
                     &mut chain_cache,
                     &mut frame_cache,
                     &mut follow_positions,
+                    &trace_lengths,
                 );
                 if let Some((position, rotation)) = pose {
                     overrides[id] = Some(PoseOverride {
@@ -1376,11 +1431,11 @@ fn chain_affine(matrix: &[f32; 16]) -> Affine {
     }
 }
 
-/// 目标图层当帧路径的第一个轮廓（含其顶点跟随表达式）。
+/// 目标图层当帧路径的原始贝塞尔数据（含其顶点跟随表达式）。
 ///
 /// 对应表达式里 `pathToTrace` 指向的形状路径；灯泡沿电线分布时，取到的
 /// 就是被三条空对象坐标驱动、正在回弹的那条线。
-fn eval_target_contour(
+fn eval_trace_path_data(
     plans: &[Plan],
     id: usize,
     root_frame: f32,
@@ -1388,9 +1443,9 @@ fn eval_target_contour(
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
     follow_positions: &mut Vec<Option<[f32; 2]>>,
-) -> Option<Contour> {
+) -> Option<PathData> {
     let frame = plan_local_frame(plans, id, root_frame);
-    let result = match &plans[id].follows {
+    match &plans[id].follows {
         Some(specs) => {
             fill_follow_positions(
                 plans,
@@ -1402,73 +1457,15 @@ fn eval_target_contour(
                 follow_positions,
             );
             let inverse = layer_inverse(plans, id, root_frame, chain_cache, frame_cache, overrides);
-            shape::eval_shapes_follow(
-                &plans[id].layer.shapes,
-                frame,
-                &FollowContext {
-                    specs,
-                    layer_inverse: inverse,
-                    positions: follow_positions.as_slice(),
-                },
-            )
+            let ctx = FollowContext {
+                specs,
+                layer_inverse: inverse,
+                positions: follow_positions.as_slice(),
+            };
+            shape::eval_trace_path(&plans[id].layer.shapes, frame, Some(&ctx))
         }
-        None => shape::eval_shapes(&plans[id].layer.shapes, frame),
-    };
-    result
-        .drawables
-        .iter()
-        .find_map(|drawable| drawable.paths.first())
-        .map(|item| item.contour.clone())
-}
-
-/// 按弧长百分比取轮廓上的点（对应 `pointOnPath`）。
-fn point_on_contour(contour: &Contour, progress: f32) -> Option<[f32; 2]> {
-    let points = &contour.pts;
-    let first = *points.first()?;
-    if points.len() < 2 {
-        return Some(first);
+        None => shape::eval_trace_path(&plans[id].layer.shapes, frame, None),
     }
-    let total = contour.length();
-    if total <= 1e-4 {
-        return Some(first);
-    }
-    let target = progress.clamp(0.0, 1.0) * total;
-    let segments = if contour.closed {
-        points.len()
-    } else {
-        points.len() - 1
-    };
-    let mut walked = 0.0;
-    for i in 0..segments {
-        let a = points[i];
-        let b = points[(i + 1) % points.len()];
-        let dx = b[0] - a[0];
-        let dy = b[1] - a[1];
-        let length = (dx * dx + dy * dy).sqrt();
-        if walked + length >= target && length > 1e-6 {
-            let t = (target - walked) / length;
-            return Some([a[0] + dx * t, a[1] + dy * t]);
-        }
-        walked += length;
-    }
-    points.last().copied()
-}
-
-/// 轮廓在指定弧长百分比处的单位切线（对应 `tangentOnPath`）。
-///
-/// 取 `progress ± 0.5%` 两点的连线方向，跨过折线顶点时也不会瞬间跳变，
-/// 比直接取所在线段更适合驱动旋转。
-fn tangent_on_contour(contour: &Contour, progress: f32) -> Option<[f32; 2]> {
-    let delta = 1.0 / 200.0;
-    let before = point_on_contour(contour, (progress - delta).max(0.0))?;
-    let after = point_on_contour(contour, (progress + delta).min(1.0))?;
-    let dx = after[0] - before[0];
-    let dy = after[1] - before[1];
-    let length = (dx * dx + dy * dy).sqrt();
-    if length <= 1e-6 {
-        return None;
-    }
-    Some([dx / length, dy / length])
 }
 
 /// 求位置表达式对应的图层局部位置（父级空间坐标），以及可选的切线旋转。
@@ -1477,6 +1474,10 @@ fn tangent_on_contour(contour: &Contour, progress: f32) -> Option<[f32; 2]> {
 /// 若当前图层带父级，再用父级链的逆换算回父级空间（`p` 属性所在坐标系）。
 /// 旋转表达式（`atan2(tangentOnPath)`）用同一采样点的切线角，扣掉父级
 /// 已有旋转后作为图层局部旋转。目标缺失时返回 `None`，退回关键帧变换。
+///
+/// 采样必须使用首帧缓存的分段长度表 `lengths`：lottie-web 的
+/// `pointOnPath` 只在首次调用时计算 `_segmentsLength`，此后每帧都用这张
+/// 表把百分比映射到「段索引 + 段内比例」，再在当帧曲线上取点。
 fn trace_pose(
     plans: &[Plan],
     id: usize,
@@ -1485,6 +1486,7 @@ fn trace_pose(
     chain_cache: &mut [Option<[f32; 16]>],
     frame_cache: &mut [Option<f32>],
     follow_positions: &mut Vec<Option<[f32; 2]>>,
+    lengths: &[Option<PathLengths>],
 ) -> Option<([f32; 2], Option<f32>)> {
     let trace = plans[id].trace.as_ref()?;
     if trace.target >= plans.len() {
@@ -1492,7 +1494,7 @@ fn trace_pose(
     }
     let progress = prop::eval(&trace.progress, plan_local_frame(plans, id, root_frame));
     let progress = progress.first().copied().unwrap_or(0.0) / 100.0;
-    let contour = eval_target_contour(
+    let path = eval_trace_path_data(
         plans,
         trace.target,
         root_frame,
@@ -1501,7 +1503,8 @@ fn trace_pose(
         frame_cache,
         follow_positions,
     )?;
-    let local = point_on_contour(&contour, progress)?;
+    let table = lengths[id].as_ref()?;
+    let local = table.point_on_path(&path, progress)?;
     let target_matrix = plan_chain(
         plans,
         trace.target,
@@ -1513,7 +1516,7 @@ fn trace_pose(
     let target_affine = chain_affine(&target_matrix);
     let comp = target_affine.apply(local);
     let rotation = if trace.rotate {
-        tangent_on_contour(&contour, progress).map(|tangent| {
+        table.tangent_on_path(&path, progress).map(|tangent| {
             // 把切线方向按目标图层链变换到合成空间，再取角度（度）。
             let dx = target_affine.a * tangent[0] + target_affine.c * tangent[1];
             let dy = target_affine.b * tangent[0] + target_affine.d * tangent[1];

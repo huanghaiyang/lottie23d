@@ -539,7 +539,8 @@ $bm_rt = createPath(origPoints, origInTang, origOutTang, origPath.isClosed());
    ```js
    thisComp.layer('wire').toComp(pathToTrace.pointOnPath(progress))
    ```
-   转换器从图层的 `Pseudo/ADBE Trace Path` 效果读取 `progress`（百分比），在目标路径图层当帧展开的轮廓上按弧长取点，再用目标层链条矩阵换算到合成坐标（`toComp`）。由于目标路径本身带顶点跟随表达式，电线回弹时灯泡会一并移动。
+   转换器从图层的 `Pseudo/ADBE Trace Path` 效果读取 `progress`（百分比），按 lottie-web `pointOnPath` 的采样语义在目标路径当帧展开的曲线上取点，再用目标层链条矩阵换算到合成坐标（`toComp`）。由于目标路径本身带顶点跟随表达式，电线回弹时灯泡会一并移动。
+   注意 lottie-web 的 `_segmentsLength` **只在首次调用时缓存**（源帧 0），此后每帧都用这张首帧长度表把百分比映射到「段索引 + 段内比例」，再在当帧曲线上按对应贝塞尔参数取点；路径变形时若按当帧弧长重算，灯泡会沿电线滑动（实测最大偏差约 13.5px），故转换器在采样起点预先固化一张 `PathLengths` 参考表。
 2. **弹性回弹（Position Overshoot）**：电线中点的位置表达式在关键帧之后叠加衰减正弦：
    ```js
    v = velocityAtTime(key(n).time - thisComp.frameDuration / 10)
@@ -551,7 +552,7 @@ $bm_rt = createPath(origPoints, origInTang, origOutTang, origPath.isClosed());
    var pathTan = pathToTrace.tangentOnPath(progress);
    radiansToDegrees(Math.atan2(pathTan[1], pathTan[0]))
    ```
-   转换器在同一采样点用 `progress ± 0.5%` 两点的连线求单位切线（跨折线顶点时不会跳变），经目标层链条矩阵变换到合成空间后取 `atan2` 得角度；若当前图层有父级，再减去父级链条的旋转，得到图层局部 `r`。因此灯泡随电线上下振动同步摆动，角度与电线切线一致（回归实测各帧误差 ≤ 0.7°）。
+   转换器复现 `tangentOnPath` 的取法：在 `progress` 与 `progress + 0.1%` 两点（首尾端点另有 0.999 / 闭合标志的特殊处理）求连线方向得到单位切线，经目标层链条矩阵变换到合成空间后取 `atan2` 得角度；若当前图层有父级，再减去父级链条的旋转，得到图层局部 `r`。因此灯泡随电线上下振动同步摆动，角度与电线切线一致（回归实测各帧误差 ≤ 0.7°）。
 
 每帧求值顺序：先算弹性回弹覆盖位置 → 再算沿路径分布与切线旋转（目标路径依赖回弹后的顶点和空对象坐标）→ 最后写世界矩阵。三类表达式都只影响图层位姿（位置 / 旋转），不改变网格拓扑。
 

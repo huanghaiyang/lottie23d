@@ -76,6 +76,259 @@ pub fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
 }
 
 /* ------------------------------------------------------------------ */
+/* lottie-web pointOnPath 语义                                          */
+/* ------------------------------------------------------------------ */
+
+/// 每段曲线的长度采样数，与 lottie-web `getDefaultCurveSegments()` 的缺省值一致。
+const POINT_ON_PATH_SAMPLES: usize = 150;
+
+/// 单段三次贝塞尔的长度采样表（对应 lottie-web `getBezierLength` 的返回值）。
+///
+/// lottie-web 用 150 个等参数采样点累计折线长度，把「弧长百分比」换算成
+/// 贝塞尔参数 `t` 时再线性插值 `percents` / `lengths` 两张表。
+#[derive(Clone, Debug)]
+pub struct BezierLengthTable {
+    /// 采样参数（0..1），逐点递增。
+    percents: [f32; POINT_ON_PATH_SAMPLES],
+    /// 与 `percents` 对应的累计折线长度。
+    lengths: [f32; POINT_ON_PATH_SAMPLES],
+    /// 该段的总折线长度。
+    added: f32,
+}
+
+impl BezierLengthTable {
+    /// `p0` / `p1` 为端点，`c0` / `c1` 为两端的**绝对**控制点。
+    fn new(p0: [f32; 2], p1: [f32; 2], c0: [f32; 2], c1: [f32; 2]) -> Self {
+        let mut percents = [0.0f32; POINT_ON_PATH_SAMPLES];
+        let mut lengths = [0.0f32; POINT_ON_PATH_SAMPLES];
+        let mut added = 0.0f32;
+        let mut last = [0.0f32; 2];
+        let mut started = false;
+        for k in 0..POINT_ON_PATH_SAMPLES {
+            let perc = k as f32 / (POINT_ON_PATH_SAMPLES - 1) as f32;
+            let u = 1.0 - perc;
+            let x = u * u * u * p0[0]
+                + 3.0 * u * u * perc * c0[0]
+                + 3.0 * u * perc * perc * c1[0]
+                + perc * perc * perc * p1[0];
+            let y = u * u * u * p0[1]
+                + 3.0 * u * u * perc * c0[1]
+                + 3.0 * u * perc * perc * c1[1]
+                + perc * perc * perc * p1[1];
+            if started {
+                let dx = x - last[0];
+                let dy = y - last[1];
+                added += (dx * dx + dy * dy).sqrt();
+            }
+            last = [x, y];
+            started = true;
+            percents[k] = perc;
+            lengths[k] = added;
+        }
+        BezierLengthTable {
+            percents,
+            lengths,
+            added,
+        }
+    }
+}
+
+/// 整条路径的分段长度表（对应 lottie-web `getSegmentsLength`）。
+///
+/// lottie-web 在 `pointOnPath` 第一次调用时缓存该表，之后每帧都用**首帧**
+/// 的长度把百分比映射到「第几段 + 段内比例」，再在当帧曲线上取点。
+/// 路径变形时弧长会变化，因此这里也必须保留首帧结果而不是逐帧重算。
+#[derive(Clone, Debug)]
+pub struct PathLengths {
+    segments: Vec<BezierLengthTable>,
+    /// 首帧路径总弧长（折线近似）。
+    total: f32,
+    /// 是否闭合路径（决定末段是否连回首点）。
+    closed: bool,
+}
+
+impl PathLengths {
+    /// 用一条路径的当前值构造长度表；调用方只在首帧调用一次。
+    pub fn from_path(path: &PathData) -> Self {
+        let n = path.v.len();
+        let mut segments = Vec::with_capacity(n);
+        let mut total = 0.0f32;
+        for i in 0..n.saturating_sub(1) {
+            let table = BezierLengthTable::new(
+                path.v[i],
+                path.v[i + 1],
+                out_control(path, i),
+                in_control(path, i + 1),
+            );
+            total += table.added;
+            segments.push(table);
+        }
+        if path.closed && n > 0 {
+            let table = BezierLengthTable::new(
+                path.v[n - 1],
+                path.v[0],
+                out_control(path, n - 1),
+                in_control(path, 0),
+            );
+            total += table.added;
+            segments.push(table);
+        }
+        PathLengths {
+            segments,
+            total,
+            closed: path.closed,
+        }
+    }
+
+    /// 按 lottie-web `pointOnPath` 语义在 `path`（当帧路径）上取点。
+    ///
+    /// `progress` 为 0..1 的弧长比例；段索引与段内比例来自缓存的长度表，
+    /// 贝塞尔求值使用当帧的顶点与控制点，与原版行为一致。
+    pub fn point_on_path(&self, path: &PathData, progress: f32) -> Option<[f32; 2]> {
+        let first = *path.v.first()?;
+        let n = path.v.len();
+        if self.segments.is_empty() || n < 2 || self.total <= 1e-6 {
+            return Some(first);
+        }
+        let length_pos = self.total * progress;
+        let mut accumulated = 0.0f32;
+        for (i, segment) in self.segments.iter().enumerate() {
+            if accumulated + segment.added > length_pos {
+                let init = i;
+                let end = if self.closed && i == self.segments.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                };
+                if init >= n || end >= n {
+                    return None;
+                }
+                let segment_perc = if segment.added > 0.0 {
+                    (length_pos - accumulated) / segment.added
+                } else {
+                    0.0
+                };
+                let t = distance_to_percent(segment_perc, segment);
+                return Some(bezier_point(
+                    path.v[init],
+                    path.v[end],
+                    out_control(path, init),
+                    in_control(path, end),
+                    t,
+                ));
+            }
+            accumulated += segment.added;
+        }
+        if self.closed {
+            Some(first)
+        } else {
+            path.v.last().copied()
+        }
+    }
+
+    /// 路径切线（对应 lottie-web `tangentOnPath` / `vectorOnPath`）。
+    ///
+    /// 原版用 `progress` 与 `progress + 0.1%` 两点的连线方向，且在端点处
+    /// 有特殊处理（0 取 0.999、1 取闭合标志），这里逐条复现。
+    pub fn tangent_on_path(&self, path: &PathData, progress: f32) -> Option<[f32; 2]> {
+        let mut perc = progress;
+        if perc == 1.0 {
+            perc = if self.closed { 1.0 } else { 0.0 };
+        } else if perc == 0.0 {
+            perc = 0.999;
+        }
+        let before = self.point_on_path(path, perc)?;
+        let after = self.point_on_path(path, perc + 0.001)?;
+        let dx = after[0] - before[0];
+        let dy = after[1] - before[1];
+        let magnitude = (dx * dx + dy * dy).sqrt();
+        if magnitude <= 1e-6 {
+            return None;
+        }
+        Some([dx / magnitude, dy / magnitude])
+    }
+}
+
+/// 顶点 `index` 的绝对出控制点（lottie-web 在加载时已把偏移换算成绝对坐标）。
+fn out_control(path: &PathData, index: usize) -> [f32; 2] {
+    let v = path.v[index];
+    let o = path.o.get(index).copied().unwrap_or([0.0; 2]);
+    [v[0] + o[0], v[1] + o[1]]
+}
+
+/// 顶点 `index` 的绝对入控制点。
+fn in_control(path: &PathData, index: usize) -> [f32; 2] {
+    let v = path.v[index];
+    let i = path.i.get(index).copied().unwrap_or([0.0; 2]);
+    [v[0] + i[0], v[1] + i[1]]
+}
+
+/// 把「段内弧长比例」换算成贝塞尔参数 `t`（对应 `getDistancePerc`）。
+fn distance_to_percent(percent: f32, table: &BezierLengthTable) -> f32 {
+    let len = table.percents.len();
+    let percent = if percent.is_finite() {
+        percent.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut index = ((len - 1) as f32 * percent).floor() as isize;
+    index = index.max(0).min(len as isize - 1);
+    let length_pos = percent * table.added;
+    if index == len as isize - 1
+        || index == 0
+        || length_pos == table.lengths[index as usize]
+    {
+        return table.percents[index as usize];
+    }
+    let step: isize = if table.lengths[index as usize] > length_pos {
+        -1
+    } else {
+        1
+    };
+    loop {
+        let current = index as usize;
+        if table.lengths[current] <= length_pos && table.lengths[current + 1] > length_pos {
+            let span = table.lengths[current + 1] - table.lengths[current];
+            let fraction = if span > 0.0 {
+                (length_pos - table.lengths[current]) / span
+            } else {
+                0.0
+            };
+            return table.percents[current]
+                + (table.percents[current + 1] - table.percents[current]) * fraction;
+        }
+        index += step;
+        if index < 0 || index >= len as isize - 1 {
+            if index == len as isize - 1 {
+                return table.percents[len - 1];
+            }
+            break;
+        }
+    }
+    table.percents[(index.max(0) as usize).min(len - 1)]
+}
+
+/// 在三次贝塞尔上按参数 `t` 取点（对应 `getPointInSegment`，保留 3 位小数）。
+fn bezier_point(
+    p0: [f32; 2],
+    p1: [f32; 2],
+    c0: [f32; 2],
+    c1: [f32; 2],
+    t: f32,
+) -> [f32; 2] {
+    let u = 1.0 - t;
+    let x = u * u * u * p0[0]
+        + 3.0 * t * u * u * c0[0]
+        + 3.0 * t * t * u * c1[0]
+        + t * t * t * p1[0];
+    let y = u * u * u * p0[1]
+        + 3.0 * t * u * u * c0[1]
+        + 3.0 * t * t * u * c1[1]
+        + t * t * t * p1[1];
+    [(x * 1000.0).round() / 1000.0, (y * 1000.0).round() / 1000.0]
+}
+
+/* ------------------------------------------------------------------ */
 /* Lottie path property                                                */
 /* ------------------------------------------------------------------ */
 

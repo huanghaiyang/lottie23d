@@ -314,6 +314,65 @@ pub fn eval_styles(shapes: &[Value], frame: f32) -> ShapeResult {
     eval_with_geometry(shapes, frame, false, None)
 }
 
+/// 取形状树中第一个可见 `sh` 路径的原始贝塞尔数据，用于 `pointOnPath` 语义。
+///
+/// 与 [`eval_shapes`] 的遍历顺序一致（深度优先）；只叠加「顶点跟随空对象」
+/// 的顶点替换，**不应用组变换**——lottie-web 的 `pointOnPath` 返回的是
+/// 形状属性自身的坐标，组变换由渲染阶段单独处理。
+pub fn eval_trace_path(
+    shapes: &[Value],
+    frame: f32,
+    ctx: Option<&FollowContext<'_>>,
+) -> Option<path::PathData> {
+    eval_trace_path_inner(shapes, frame, ctx, &mut Vec::new())
+}
+
+fn eval_trace_path_inner(
+    items: &[Value],
+    frame: f32,
+    ctx: Option<&FollowContext<'_>>,
+    path: &mut Vec<usize>,
+) -> Option<path::PathData> {
+    for (item_index, item) in items.iter().enumerate() {
+        if hidden(item) {
+            continue;
+        }
+        match item.get("ty").and_then(Value::as_str).unwrap_or("") {
+            "sh" => {
+                let ks = item.get("ks")?;
+                let mut data = path::eval_path_property(ks, frame)?;
+                if let Some(ctx) = ctx {
+                    path.push(item_index);
+                    if let Some(targets) = ctx.specs.map.get(path.as_slice()) {
+                        for (index, target) in targets.iter().enumerate() {
+                            if index >= data.v.len() {
+                                break;
+                            }
+                            if let Some(position) = ctx.positions.get(*target).copied().flatten() {
+                                data.v[index] = ctx.layer_inverse.apply(position);
+                            }
+                        }
+                    }
+                    path.pop();
+                }
+                return Some(data);
+            }
+            "gr" => {
+                if let Some(children) = item.get("it").and_then(Value::as_array) {
+                    path.push(item_index);
+                    let found = eval_trace_path_inner(children, frame, ctx, path);
+                    path.pop();
+                    if found.is_some() {
+                        return found;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 形状求值的统一实现；`geometry = false` 时只收集样式与路径计数。
 fn eval_with_geometry(
     shapes: &[Value],
