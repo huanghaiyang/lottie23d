@@ -609,52 +609,52 @@ impl<'a> Compiler<'a> {
     }
 
     /// 构建纯色层：把矩形区域当作一个填充 drawable，颜色从 `#rrggbb` 解析。
+    ///
+    /// 纯色层同样可能带遮罩，且遮罩路径可以是动画的（`dalek.json` 的
+    /// `cuadrado` 就靠遮罩从矩形变成梯形）。这类遮罩会改变可见轮廓，必须
+    /// 与形状层一样逐帧裁剪，否则整块矩形会以“立方体”形态盖住身体。
     fn build_solid_layer(&mut self, id: usize, layer: &'a Layer) {
-        let sw = layer.solid_width.max(1.0);
-        let sh = layer.solid_height.max(1.0);
-        let rgb = parse_hex(&layer.solid_color);
-        let contour = Contour {
-            // 纯色层局部坐标原点为左上角，尺寸单位为像素。
-            pts: vec![
-                [0.0, 0.0],
-                [sw, 0.0],
-                [sw, sh],
-                [0.0, sh],
-            ],
-            closed: true,
-        };
-        let drawable = Drawable {
-            kind: DrawKind::Fill,
-            color: [rgb[0], rgb[1], rgb[2], 1.0],
-            opacity: 1.0,
-            width: 0.0,
-            cap: 2,
-            join: 2,
-            miter: 4.0,
-            name: layer.nm.clone(),
-            paths: vec![PathItem {
-                contour,
-                trim: None,
-            }],
+        let dynamic_mask = shape::mask_clips_geometry(&layer.masks);
+        {
+            let plan = &mut self.plans[id];
+            plan.dynamic_mask = dynamic_mask;
+            plan.geometry_animated = dynamic_mask;
+        }
+        let drawable = solid_drawable(layer);
+        let drawable = if dynamic_mask {
+            // 参考帧按遮罩裁剪，保证参考拓扑与烘焙时一致。
+            let mut result = shape::ShapeResult {
+                drawables: vec![drawable],
+            };
+            shape::apply_mask(&mut result, &layer.masks, self.plans[id].ref_frame);
+            match result.drawables.pop() {
+                Some(clipped) if !clipped.paths.is_empty() => clipped,
+                // 参考帧恰好被遮罩裁空时重新取未裁矩形，网格仍需存在；
+                // 其余帧由逐帧裁剪决定可见性。
+                _ => solid_drawable(layer),
+            }
+        } else {
+            drawable
         };
         let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
             return;
         };
+        let rgb = drawable.color;
         let mesh_index = self.meshes.len();
         self.meshes.push(CompiledMesh::from_surface(
             surface,
             self.half,
             0,
-            [rgb[0], rgb[1], rgb[2], 1.0],
+            rgb,
             self.plans[id].depth,
             self.plans[id].transform_track,
             layer.nm.clone(),
-            false,
+            dynamic_mask,
         ));
         self.plans[id].meshes.push(mesh_index);
         self.plans[id].blueprints.push(Some(Blueprint {
             mesh_index,
-            color: [rgb[0], rgb[1], rgb[2], 1.0],
+            color: rgb,
         }));
     }
 
@@ -1032,37 +1032,45 @@ impl<'a> Compiler<'a> {
                 let geometry_animated = plan.geometry_animated;
                 // 只动几何或只动样式时按需求值：纯样式动画跳过路径扁平化。
                 let mut evaluated = if geometry_animated {
-                    match &plan.follows {
-                        Some(specs) => {
-                            fill_follow_positions(
-                                plans,
-                                specs,
-                                root_frame,
-                                &mut chain_cache,
-                                &mut frame_cache,
-                                &overrides,
-                                &mut follow_positions,
-                            );
-                            let inverse = layer_inverse(
-                                plans,
-                                id,
-                                root_frame,
-                                &mut chain_cache,
-                                &mut frame_cache,
-                                &overrides,
-                            );
-                            let ctx = FollowContext {
-                                specs,
-                                layer_inverse: inverse,
-                                positions: &follow_positions,
-                            };
-                            Some(shape::eval_shapes_follow(
-                                &plan.layer.shapes,
-                                local_frame,
-                                &ctx,
-                            ))
+                    // 纯色层没有 shapes，几何动画只可能来自遮罩：用其矩形构造
+                    // 唯一 drawable，后面统一按遮罩裁剪。
+                    if plan.layer.ty == 1 {
+                        Some(shape::ShapeResult {
+                            drawables: vec![solid_drawable(plan.layer)],
+                        })
+                    } else {
+                        match &plan.follows {
+                            Some(specs) => {
+                                fill_follow_positions(
+                                    plans,
+                                    specs,
+                                    root_frame,
+                                    &mut chain_cache,
+                                    &mut frame_cache,
+                                    &overrides,
+                                    &mut follow_positions,
+                                );
+                                let inverse = layer_inverse(
+                                    plans,
+                                    id,
+                                    root_frame,
+                                    &mut chain_cache,
+                                    &mut frame_cache,
+                                    &overrides,
+                                );
+                                let ctx = FollowContext {
+                                    specs,
+                                    layer_inverse: inverse,
+                                    positions: &follow_positions,
+                                };
+                                Some(shape::eval_shapes_follow(
+                                    &plan.layer.shapes,
+                                    local_frame,
+                                    &ctx,
+                                ))
+                            }
+                            None => Some(shape::eval_shapes(&plan.layer.shapes, local_frame)),
                         }
-                        None => Some(shape::eval_shapes(&plan.layer.shapes, local_frame)),
                     }
                 } else if plan.style_animated {
                     Some(shape::eval_styles(&plan.layer.shapes, local_frame))
@@ -1936,6 +1944,34 @@ fn plan_world(
     world_cache[id] = Some(world);
     opacity_cache[id] = Some(opacity);
     (world, opacity)
+}
+
+/// 把纯色层描述成一个填充 drawable（矩形，局部坐标原点在左上角）。
+///
+/// 参考帧构建与逐帧烘焙共用同一份构造，保证两者的轮廓槽位完全一致。
+fn solid_drawable(layer: &Layer) -> Drawable {
+    let sw = layer.solid_width.max(1.0);
+    let sh = layer.solid_height.max(1.0);
+    let rgb = parse_hex(&layer.solid_color);
+    let contour = Contour {
+        // 纯色层局部坐标原点为左上角，尺寸单位为像素。
+        pts: vec![[0.0, 0.0], [sw, 0.0], [sw, sh], [0.0, sh]],
+        closed: true,
+    };
+    Drawable {
+        kind: DrawKind::Fill,
+        color: [rgb[0], rgb[1], rgb[2], 1.0],
+        opacity: 1.0,
+        width: 0.0,
+        cap: 2,
+        join: 2,
+        miter: 4.0,
+        name: layer.nm.clone(),
+        paths: vec![PathItem {
+            contour,
+            trim: None,
+        }],
+    }
 }
 
 /// 解析 `#RRGGBB`（或 6 位十六进制）颜色为归一化 RGB（0..1）；
