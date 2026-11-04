@@ -92,14 +92,15 @@ function clearSelection(): void {
   selection.clear();
 }
 
-/** 改名方式：加前缀 / 加后缀 / 查找替换 / 序号命名。 */
-type RenameMode = 'prefix' | 'suffix' | 'replace' | 'sequence';
+/** 改名方式：加前缀 / 加后缀 / 数字后缀（后缀 + 递增序号）/ 查找替换 / 序号命名。 */
+type RenameMode = 'prefix' | 'suffix' | 'number' | 'replace' | 'sequence';
 
 const renameOpen = ref(false);
 const renameMode = ref<RenameMode>('prefix');
 /** 前缀与序号模式下复用同一个输入，减少表单项。 */
 const renamePrefix = ref('shot_');
-const renameSuffix = ref('_3d');
+/** 后缀与数字后缀模式共用；默认下划线，便于拼出 `名字_01`。 */
+const renameSuffix = ref('_');
 const renameFind = ref('');
 const renameReplace = ref('');
 const renameStart = ref(1);
@@ -119,6 +120,10 @@ const renamePlan = computed<Array<{ from: string; to: string }>>(() => {
       next = `${renamePrefix.value}${base}`;
     } else if (renameMode.value === 'suffix') {
       next = `${base}${renameSuffix.value}`;
+    } else if (renameMode.value === 'number') {
+      // 数字后缀：保留原名，再追加后缀与递增序号，例如 `batch-01_01`。
+      const serial = String(renameStart.value + index).padStart(Math.max(1, renamePad.value), '0');
+      next = `${base}${renameSuffix.value}${serial}`;
     } else if (renameMode.value === 'replace') {
       // 查找串为空时不做任何事，避免出现无意义的替换。
       if (renameFind.value === '') {
@@ -315,6 +320,7 @@ function formatTime(value: number): string {
           <select v-model="renameMode">
             <option value="prefix">加前缀</option>
             <option value="suffix">加后缀</option>
+            <option value="number">数字后缀</option>
             <option value="replace">查找替换</option>
             <option value="sequence">序号命名</option>
           </select>
@@ -323,9 +329,9 @@ function formatTime(value: number): string {
           {{ renameMode === 'sequence' ? '名称前缀' : '前缀' }}
           <input v-model="renamePrefix" type="text" placeholder="shot_" />
         </label>
-        <label v-if="renameMode === 'suffix'" class="library-field">
-          后缀
-          <input v-model="renameSuffix" type="text" placeholder="_3d" />
+        <label v-if="renameMode === 'suffix' || renameMode === 'number'" class="library-field">
+          {{ renameMode === 'number' ? '连接符' : '后缀' }}
+          <input v-model="renameSuffix" type="text" placeholder="_" />
         </label>
         <label v-if="renameMode === 'replace'" class="library-field">
           查找
@@ -335,11 +341,11 @@ function formatTime(value: number): string {
           替换为
           <input v-model="renameReplace" type="text" placeholder="新片段" />
         </label>
-        <label v-if="renameMode === 'sequence'" class="library-field">
+        <label v-if="renameMode === 'sequence' || renameMode === 'number'" class="library-field">
           起始
           <input v-model.number="renameStart" type="number" min="0" max="9999" />
         </label>
-        <label v-if="renameMode === 'sequence'" class="library-field">
+        <label v-if="renameMode === 'sequence' || renameMode === 'number'" class="library-field">
           位数
           <input v-model.number="renamePad" type="number" min="1" max="6" />
         </label>
