@@ -11,6 +11,7 @@ import {
   deleteLibraryFile,
   listLibrary,
   readLibraryFile,
+  renameLibraryFiles,
   saveLibraryFile,
   type LibraryFile,
 } from './library';
@@ -689,6 +690,32 @@ async function removeLibraryEntry(name: string): Promise<void> {
 }
 
 /**
+ * 批量改名：面板算好新旧文件名后一次性提交，服务端两阶段重命名。
+ * 成功后刷新列表；若当前加载的文档正好被改名，同步更新来源 id 以保持高亮。
+ */
+async function renameLibraryEntries(items: Array<{ from: string; to: string }>): Promise<void> {
+  libraryBusy.value = true;
+  try {
+    await renameLibraryFiles(items);
+    for (const item of items) {
+      if (activeSource.value === `lib:${item.from}`) {
+        activeSource.value = `lib:${item.to}`;
+      }
+    }
+    // 校验结果以文件名为 key，改名后全部失效。
+    for (const key of Object.keys(libraryStatus)) {
+      delete libraryStatus[key];
+    }
+    await refreshLibrary();
+    showToast(`已重命名 ${items.length} 个文件`);
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  } finally {
+    libraryBusy.value = false;
+  }
+}
+
+/**
  * 批量转换校验：按当前参数逐个转换资源库文件，把网格数 / 三角形数 / 耗时
  * 写进列表。转换是同步的，每处理完一个让出主线程，避免大批量时页面卡死。
  */
@@ -1031,6 +1058,7 @@ onBeforeUnmount(() => {
     @remove="removeLibraryEntry"
     @upload="pickFile"
     @check="checkLibrary"
+    @rename="renameLibraryEntries"
   />
 
   <div class="toast" :class="{ 'is-visible': toastVisible }" role="status">

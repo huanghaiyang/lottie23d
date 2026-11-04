@@ -853,8 +853,8 @@ input[type="range"]::-moz-range-thumb {
 .library-panel {
   display: flex;
   flex-direction: column;
-  width: min(760px, 100%);
-  max-height: min(76vh, 640px);
+  width: min(980px, 100%);
+  max-height: min(82vh, 720px);
   border: 1px solid var(--line-strong);
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(15, 21, 34, 0.97), rgba(7, 10, 18, 0.98));
@@ -1035,6 +1035,228 @@ input[type="range"]::-moz-range-thumb {
   text-align: center;
 }
 
+/* 列表与预览并排：列表吃满剩余宽度，预览固定 268px。 */
+.library-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.library-list {
+  padding: 6px 0 10px 8px;
+}
+
+.library-row {
+  cursor: pointer;
+}
+
+/* 勾选态（批量改名）与预览态：两种高亮并存时以预览色为准。 */
+.library-row.is-preview {
+  border-color: rgba(122, 162, 255, 0.45);
+  background: rgba(122, 162, 255, 0.1);
+}
+
+.library-row.is-active.is-preview {
+  border-color: rgba(99, 230, 190, 0.6);
+}
+
+.library-check,
+.library-select-all input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: #63e6be;
+  cursor: pointer;
+}
+
+.library-select-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.library-load {
+  flex-shrink: 0;
+  padding: 3px 9px;
+  font-size: 10px;
+}
+
+/* 批量改名：勾选提示条、规则表单与错误提示。 */
+.library-batch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(99, 230, 190, 0.06);
+  font-size: 11px;
+  color: #cfd8ee;
+}
+
+.library-batch .chip {
+  padding: 4px 11px;
+}
+
+.library-rename {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(122, 162, 255, 0.06);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.library-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.library-rename input[type="text"],
+.library-rename input[type="number"],
+.library-rename select,
+.library-page-size {
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(6, 9, 16, 0.8);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.library-rename input[type="text"] {
+  width: 110px;
+}
+
+.library-rename input[type="number"] {
+  width: 62px;
+}
+
+.library-rename-hint {
+  color: #cfd8ee;
+}
+
+.library-error {
+  margin: 0;
+  padding: 6px 16px 8px;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+/* 预览区：固定尺寸画布 + 元信息，切换文件只重建这一个 lottie 实例。 */
+.library-preview {
+  flex: 0 0 268px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0 10px;
+  border-left: 1px solid var(--line);
+}
+
+.library-preview-stage {
+  position: relative;
+  height: 200px;
+  margin: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    radial-gradient(70% 60% at 50% 45%, rgba(122, 162, 255, 0.08), transparent 70%),
+    repeating-linear-gradient(0deg, transparent 0 24px, rgba(148, 163, 184, 0.05) 24px 25px),
+    repeating-linear-gradient(90deg, transparent 0 24px, rgba(148, 163, 184, 0.05) 24px 25px);
+  overflow: hidden;
+}
+
+.library-preview-mount {
+  position: absolute;
+  inset: 0;
+}
+
+.library-preview-mount canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.library-preview-hint {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  pointer-events: none;
+}
+
+.library-preview-hint.is-error {
+  color: var(--danger);
+}
+
+.library-preview-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  min-width: 0;
+  padding: 0 10px;
+}
+
+.library-preview-info .library-title {
+  max-height: 3em;
+  overflow: hidden;
+  white-space: normal;
+  word-break: break-all;
+}
+
+.library-preview-info .chip {
+  padding: 4px 12px;
+  font-size: 11px;
+}
+
+.library-preview-info button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 分页脚：页码信息 + 每页条数 + 上下页。 */
+.library-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.library-foot-info {
+  font-variant-numeric: tabular-nums;
+}
+
+.library-page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.library-page-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* 响应式：窄屏时统计换行、双栏改为上下堆叠并隐藏副标题。 */
 @media (max-width: 1080px) {
   .stats {
@@ -1050,5 +1272,14 @@ input[type="range"]::-moz-range-thumb {
 
   .brand-copy p {
     display: none;
+  }
+
+  /* 窄屏优先保证列表宽度，预览改成列表下方的小画布会打乱分页高度，直接隐藏。 */
+  .library-preview {
+    display: none;
+  }
+
+  .library-panel {
+    max-height: 88vh;
   }
 }

@@ -1,16 +1,17 @@
 // Vite 插件：把上传的 Lottie 写进项目根目录的 data/，作为本地测试资源库。
 //
-// 前端只依赖四个同源接口（无需 CORS）：
+// 前端只依赖五个同源接口（无需 CORS）：
 //   GET    /api/library            列出 data/ 下的 .json 文件
 //   POST   /api/library?name=x.json 请求体为原始 JSON 文本，写入 data/
 //   GET    /api/library/file?name=x 读取单个文件原文
 //   DELETE /api/library?name=x.json 删除单个文件
+//   POST   /api/library/rename      批量改名：{ items: [{ from, to }] }
 //
 // 这些接口只在 `npm run dev` / `npm run preview` 下可用；纯静态部署时
 // 前端会隐藏资源库入口，原有“拖入即预览”的流程不受影响。
 
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -92,6 +93,16 @@ function validateLottie(text) {
   }
 }
 
+/** 读取请求体并解析为 JSON 对象。 */
+async function readJsonBody(req) {
+  const text = await readBody(req);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new LibraryError('请求体不是合法的 JSON');
+  }
+}
+
 /** 列出资源库文件；按名称自然排序，便于按批次顺序逐个查看。 */
 async function listFiles() {
   await mkdir(dataDir, { recursive: true });
@@ -142,6 +153,66 @@ export function createLibraryMiddleware() {
         }
         await rm(target);
         sendJson(res, 200, { ok: true, name });
+        return;
+      }
+      if (url.pathname === '/rename' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        const items = Array.isArray(body?.items) ? body.items : [];
+        if (items.length === 0) {
+          throw new LibraryError('没有需要改名的文件');
+        }
+        if (items.length > 500) {
+          throw new LibraryError('单次改名最多 500 个文件');
+        }
+        const sources = items.map((item) => sanitizeName(item?.from));
+        const targets = items.map((item) => sanitizeName(item?.to));
+        if (new Set(sources).size !== sources.length) {
+          throw new LibraryError('源文件名重复');
+        }
+        if (new Set(targets).size !== targets.length) {
+          throw new LibraryError('目标文件名重复');
+        }
+        await mkdir(dataDir, { recursive: true });
+        for (const name of sources) {
+          if (!existsSync(join(dataDir, name))) {
+            throw new LibraryError(`文件不存在：${name}`, 404);
+          }
+        }
+        const sourceSet = new Set(sources);
+        for (const name of targets) {
+          if (existsSync(join(dataDir, name)) && !sourceSet.has(name)) {
+            throw new LibraryError(`目标文件已存在：${name}`, 409);
+          }
+        }
+
+        // 两阶段改名：先把源文件挪到临时名，再落到目标名。
+        // 否则 a→b、b→c 这类链式改名会在第一步就撞上还没挪走的 b。
+        const stamp = Date.now();
+        const temps = sources.map((_, index) => `.rename-${stamp}-${index}.tmp`);
+        const moved = [];
+        try {
+          for (const [index, from] of sources.entries()) {
+            await rename(join(dataDir, from), join(dataDir, temps[index]));
+            moved.push(index);
+          }
+        } catch (error) {
+          // 中途失败时把已挪走的文件放回原名，避免资源库出现半成品状态。
+          for (const index of moved.reverse()) {
+            try {
+              await rename(join(dataDir, temps[index]), join(dataDir, sources[index]));
+            } catch {
+              // 回滚失败只能保留临时文件，交由调用方看到原始错误。
+            }
+          }
+          throw error;
+        }
+        for (const [index, to] of targets.entries()) {
+          await rename(join(dataDir, temps[index]), join(dataDir, to));
+        }
+        sendJson(res, 200, {
+          ok: true,
+          renamed: sources.map((from, index) => ({ from, to: targets[index] })),
+        });
         return;
       }
       if (url.pathname === '/file' && req.method === 'GET') {

@@ -65,3 +65,12 @@ export async function readLibraryFile(name: string): Promise<LottieData> {
 export async function deleteLibraryFile(name: string): Promise<void> {
   await request(endpoint(`?name=${encodeURIComponent(name)}`), { method: 'DELETE' });
 }
+
+/** 批量改名：一次提交新旧文件名，服务端做两阶段重命名以避免链式冲突。 */
+export async function renameLibraryFiles(items: Array<{ from: string; to: string }>): Promise<void> {
+  await request(endpoint('/rename'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  });
+}
