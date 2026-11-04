@@ -339,22 +339,22 @@ fn bezier_point(
 /// * 路径 morph 逐顶点、逐分量线性插值 `v` / `i` / `o`（控制点偏移同理）；
 /// * 两帧顶点数不一致时无法 morph，按进度取较近的一帧。
 /// 返回 `None` 表示路径为空或格式不合法。
-pub fn eval_path_property(ks: &Value, frame: f32) -> Option<PathData> {
+pub fn eval_path_property(ks: &Value, frame: f32, closed: Option<bool>) -> Option<PathData> {
     let k = ks.get("k").unwrap_or(ks);
     if !crate::prop::is_keyframed(ks) {
-        return parse_path_value(k);
+        return parse_path_value(k, closed);
     }
     let list = k.as_array()?;
     if list.is_empty() {
         return None;
     }
     if list.len() == 1 {
-        return key_path(&list[0]);
+        return key_path(&list[0], closed);
     }
 
     let first_t = key_time(&list[0]);
     if frame <= first_t {
-        return key_path(&list[0]);
+        return key_path(&list[0], closed);
     }
 
     // 与 prop 一致：定位最后一个 `t <= frame` 的关键帧区间。
@@ -367,7 +367,7 @@ pub fn eval_path_property(ks: &Value, frame: f32) -> Option<PathData> {
         }
     }
     if index >= list.len() - 1 {
-        return key_path(&list[list.len() - 1]);
+        return key_path(&list[list.len() - 1], closed);
     }
 
     let start = &list[index];
@@ -380,9 +380,9 @@ pub fn eval_path_property(ks: &Value, frame: f32) -> Option<PathData> {
         0.0
     };
     let held = start.get("h").and_then(Value::as_i64).unwrap_or(0) == 1;
-    let a = key_path(start);
+    let a = key_path(start, closed);
     // lottie-web 的终值取法：`nextKeyData.s ? nextKeyData.s[0] : keyData.e[0]`。
-    let b = key_path(next).or_else(|| end_path(start));
+    let b = key_path(next, closed).or_else(|| end_path(start, closed));
     if held {
         return a;
     }
@@ -437,21 +437,21 @@ fn key_time(key: &Value) -> f32 {
 }
 
 /// 动画路径关键帧把路径包在单元素数组里（`s[0]`），静态属性则直接是路径对象。
-fn parse_path_value(value: &Value) -> Option<PathData> {
+fn parse_path_value(value: &Value, closed: Option<bool>) -> Option<PathData> {
     match value {
-        Value::Array(items) => items.first().and_then(parse_path),
-        other => parse_path(other),
+        Value::Array(items) => items.first().and_then(|item| parse_path(item, closed)),
+        other => parse_path(other, closed),
     }
 }
 
 /// 读取关键帧起始路径 `s`。
-fn key_path(key: &Value) -> Option<PathData> {
-    key.get("s").and_then(parse_path_value)
+fn key_path(key: &Value, closed: Option<bool>) -> Option<PathData> {
+    key.get("s").and_then(|value| parse_path_value(value, closed))
 }
 
 /// 读取关键帧结束路径 `e`（仅当下一帧没有 `s` 时作为 morph 终值）。
-fn end_path(key: &Value) -> Option<PathData> {
-    key.get("e").and_then(parse_path_value)
+fn end_path(key: &Value, closed: Option<bool>) -> Option<PathData> {
+    key.get("e").and_then(|value| parse_path_value(value, closed))
 }
 
 /// 标量线性插值：`t = 0` 返回 `a`，`t = 1` 返回 `b`。
@@ -460,7 +460,13 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// 解析一个路径对象；`i` / `o` 缺失时用零偏移补齐。
-fn parse_path(value: &Value) -> Option<PathData> {
+///
+/// 闭合标记优先取调用方传入的 `closed`：旧版 Bodymovin（`v` 低于 4.4.18）
+/// 把闭合标记放在 `sh` 节点的 `closed` 上，而不是路径对象的 `c` 上；
+/// lottie-web 的 `completeClosingShapes` 会把它补写进 `ks.k.c`。
+/// 缺少该处理时，闭合路径会被当成缺一段的开放曲线（`dalek.json` 的眼圈
+/// 因此少掉四分之一圆）。
+fn parse_path(value: &Value, closed: Option<bool>) -> Option<PathData> {
     let v = parse_points(value.get("v")?)?;
     let i = value
         .get("i")
@@ -477,7 +483,9 @@ fn parse_path(value: &Value) -> Option<PathData> {
         v,
         i,
         o,
-        closed: value.get("c").and_then(Value::as_bool).unwrap_or(false),
+        closed: closed
+            .or_else(|| value.get("c").and_then(Value::as_bool))
+            .unwrap_or(false),
     })
 }
 

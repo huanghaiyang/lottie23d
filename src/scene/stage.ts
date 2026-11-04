@@ -127,6 +127,8 @@ interface Entry {
    * 目标深度 = 原始烘焙深度 + stackDelta，因此“层深”滑块仍可整体缩放。
    */
   stackDelta: number;
+  /** 同层共面网格的绘制层序偏移（世界单位，见 setModel 里的说明）。 */
+  stackOffset: number;
 }
 
 /**
@@ -146,6 +148,25 @@ function isConstantTrack(track: Float32Array, frameCount: number): boolean {
     }
   }
   return true;
+}
+
+/**
+ * 统计相邻图层深度之间的最小正间距（世界单位）。
+ *
+ * `model.meshes` 已按 `renderOrder`（即深度）升序排列，因此只需比较相邻项；
+ * 同一图层内的网格深度相同（差值为 0）会被跳过。没有两层不同深度时返回 0，
+ * 调用方据此关闭共面偏移。子合成内部的深度差（±0.01 量级）也会被计入，
+ * 因此得到的值足以保护跨层遮挡。
+ */
+function measureMinLayerGap(meshes: readonly MeshModel[]): number {
+  let gap = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < meshes.length; i += 1) {
+    const delta = meshes[i].depth - meshes[i - 1].depth;
+    if (delta > 1e-5 && delta < gap) {
+      gap = delta;
+    }
+  }
+  return gap === Number.POSITIVE_INFINITY ? 0 : gap;
 }
 
 /**
@@ -314,6 +335,12 @@ export class Stage {
       antialias: true,
       alpha: true,
       powerPreference: 'high-performance',
+      // 对数深度缓冲：同一图层的多个 drawable 挤出面完全共面，只能靠极小的 Z
+      // 偏移还原 Lottie 的绘制顺序；线性深度在 z≈7 处每个 16 位深度单位约合
+      // 0.0037 世界单位，这类百分之一量级的偏移会被量化成 z-fighting 虚线
+      // （dalek 拔塞器蓝色内圈因此被切成斜虚线）。对数深度按相对量均匀分配
+      // 精度，同一偏移可得到成百上千个深度单位。
+      logarithmicDepthBuffer: true,
     });
     // 限制 DPR，避免高分屏 4K 画布带来 4 倍以上填充率开销。
     this.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
@@ -387,7 +414,29 @@ export class Stage {
     // 避免对几千条相同轨道重复逐帧比较。
     const staticTracks = new Map<number, boolean>();
 
+    // 同一图层的所有 drawable 共用一条变换轨道，因此它们的挤出面完全共面；
+    // Lottie 靠绘制顺序决定上下，3D 里只能把该顺序转成极小的 Z 偏移，否则
+    // 共面片之间的深度差会把下层颜色从缝隙里切出一道虚线。偏移必须限制在
+    // “相邻图层最小层距”的一半以内，否则本图层最后几个 drawable 会跨到
+    // 邻层前面，破坏跨层遮挡。
+    const minLayerGap = measureMinLayerGap(model.meshes);
+    // 每个图层（transformIndex）包含的 drawable 数量：决定该层的偏移步长。
+    const stackTotals = new Map<number, number>();
+    for (const data of model.meshes) {
+      stackTotals.set(data.transformIndex, (stackTotals.get(data.transformIndex) ?? 0) + 1);
+    }
+    const stackCounts = new Map<number, number>();
+
     for (const [id, data] of model.meshes.entries()) {
+      const stackIndex = stackCounts.get(data.transformIndex) ?? 0;
+      stackCounts.set(data.transformIndex, stackIndex + 1);
+      // 该层共面网格的 Z 步长：整层偏移带宽不超过层距的一半（且不超过
+      // STACK_EPSILON）；数量只有 1 的图层无需偏移。
+      const stackTotal = stackTotals.get(data.transformIndex) ?? 1;
+      const stackStep =
+        stackTotal > 1
+          ? Math.min(STACK_EPSILON, (minLayerGap * 0.45) / (stackTotal - 1))
+          : 0;
       // 动画网格必须独占一份顶点缓冲（会逐帧覆盖）；静态网格可直接引用 SDK 的数组。
       const positionsAnimated = data.animated && data.framePositions != null;
       const positions = positionsAnimated
@@ -469,6 +518,8 @@ export class Stage {
         staticVisible,
         // 新载入的模型按烘焙层深排序，尚未发生拖拽重排。
         stackDelta: 0,
+        // 同层共面网格按绘制顺序微移：后画的（stackIndex 更大）更靠前。
+        stackOffset: stackIndex * stackStep,
       });
       this.nodes.push({
         id,
@@ -882,6 +933,10 @@ export class Stage {
       const depthShift = entry.data.depth * depthDelta + entry.stackDelta * this.depthAmount;
       if (depthShift !== 0) {
         elements[14] += depthShift;
+      }
+      // 同层共面网格的绘制层序：后画的网格沿 +Z（朝相机）微移，消除共面闪烁。
+      if (entry.stackOffset !== 0) {
+        elements[14] += entry.stackOffset;
       }
       if (thickness !== 1) {
         // 等价于在矩阵右侧乘 scale(1, 1, thickness)：只改第三列（Z 基向量）的分量。

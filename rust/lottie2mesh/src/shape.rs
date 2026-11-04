@@ -340,7 +340,9 @@ fn eval_trace_path_inner(
         match item.get("ty").and_then(Value::as_str).unwrap_or("") {
             "sh" => {
                 let ks = item.get("ks")?;
-                let mut data = path::eval_path_property(ks, frame)?;
+                // 旧版 Bodymovin 把闭合标记放在 `sh.closed` 上；映射到路径本身的 `c`。
+                let closed = item.get("closed").and_then(Value::as_bool);
+                let mut data = path::eval_path_property(ks, frame, closed)?;
                 if let Some(ctx) = ctx {
                     path.push(item_index);
                     if let Some(targets) = ctx.specs.map.get(path.as_slice()) {
@@ -383,6 +385,12 @@ fn eval_with_geometry(
     let mut result = GroupResult::default();
     let mut path = Vec::new();
     eval_group_items(shapes, frame, &mut result, geometry, ctx, &mut path);
+    // 绘制顺序取反：AE 的形状树按「上层在前」存储，lottie-web 的
+    // `searchShapes` 也是从末尾向前遍历再逐级 append，因此数组里越靠前的
+    // 组/样式画得越晚（越在上）。这里对拍平后的绘制项整体取反即可等价还原；
+    // 若按数组顺序直接绘制，靠后的样式会盖住靠前的样式（`dalek.json` 的
+    // 拔塞器因此丢掉蓝色内圈）。
+    result.drawables.reverse();
     ShapeResult {
         drawables: result.drawables,
     }
@@ -434,7 +442,8 @@ fn eval_group_items(
                     continue;
                 }
                 if let Some(ks) = item.get("ks") {
-                    if let Some(shape_path) = path::eval_path_property(ks, frame) {
+                    let closed = item.get("closed").and_then(Value::as_bool);
+                    if let Some(shape_path) = path::eval_path_property(ks, frame, closed) {
                         let mut data = shape_path;
                         if let Some(ctx) = ctx {
                             // 顶点跟随：按形状树下标路径查表，把前面若干
@@ -1006,7 +1015,7 @@ fn mask_outline(masks: &[Value], frame: f32) -> Option<Contour> {
     if masks.len() != 1 || !mask_supported(&masks[0]) {
         return None;
     }
-    let data = path::eval_path_property(masks[0].get("pt")?, frame)?;
+    let data = path::eval_path_property(masks[0].get("pt")?, frame, None)?;
     let contour = path::flatten_path(&data);
     if contour.pts.len() < 3 || !is_convex(&contour.pts) {
         return None;
