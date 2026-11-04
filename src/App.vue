@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import lottie, { type AnimationItem } from 'lottie-web';
-import { onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { loadConverter } from '../sdk/index.mjs';
 import type { Converter, ConvertOptions, Model } from '../sdk/index.mjs';
 import TopBar from './components/TopBar.vue';
 import TransportBar from './components/TransportBar.vue';
 import InspectorPanel from './components/InspectorPanel.vue';
+import LibraryPanel from './components/LibraryPanel.vue';
+import {
+  deleteLibraryFile,
+  listLibrary,
+  readLibraryFile,
+  saveLibraryFile,
+  type LibraryFile,
+} from './library';
 import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
 import { AXIS_LABELS, Stage, type StageNode, type ViewAxis } from './scene/stage';
@@ -75,6 +83,42 @@ const stats = reactive({
   frames: '-- 帧',
   geometry: '-- 网格',
   size: '--',
+});
+
+// ---- 资源库（项目根目录 data/，由开发服务器读写） ----
+/** data/ 下的文件列表；服务端不可用时保持为空。 */
+const libraryFiles = ref<LibraryFile[]>([]);
+/** 资源库面板是否展开。 */
+const libraryOpen = ref(false);
+/** 资源库接口是否可用（仅 dev / preview）；不可用时隐藏入口。 */
+const libraryAvailable = ref(false);
+/** 上传 / 批量校验进行中。 */
+const libraryBusy = ref(false);
+/** 批量校验结果，key 为文件名。 */
+const libraryStatus = reactive<Record<string, string>>({});
+
+/** 当前预览文件是否来自资源库；用于面板内高亮。 */
+const activeLibraryName = computed(() =>
+  activeSource.value.startsWith('lib:') ? activeSource.value.slice(4) : '',
+);
+
+/**
+ * 顶栏数据源：内置示例 + 外部示例 + 资源库入口。
+ * 资源库入口只在接口可用时插入，位置固定在「导入 JSON」之前。
+ */
+const sources = computed(() => {
+  const list: Array<{ id: string; label: string; accent?: boolean; match?: string }> = [
+    ...SOURCES,
+  ];
+  if (libraryAvailable.value) {
+    const count = libraryFiles.value.length;
+    list.splice(list.length - 1, 0, {
+      id: 'library',
+      label: count > 0 ? `资源库 ${count}` : '资源库',
+      match: 'lib:',
+    });
+  }
+  return list;
 });
 
 // ---- 非响应式的运行时对象 ----
@@ -539,21 +583,155 @@ async function loadDemo(name: string): Promise<void> {
   }
 }
 
-/** 读取用户本地文件（拖拽或文件选择）并解析为 Lottie JSON。 */
-async function loadFile(file: File): Promise<void> {
+/**
+ * 刷新资源库列表；接口不可用（纯静态部署）时关闭资源库入口。
+ * 首次失败后不再反复重试，避免每次启动都打一条 404。
+ */
+async function refreshLibrary(): Promise<void> {
   try {
-    const text = await file.text();
-    const data = JSON.parse(text) as LottieData;
-    await loadDocument(data, `file:${file.name}`);
+    libraryFiles.value = await listLibrary();
+    libraryAvailable.value = true;
+  } catch {
+    libraryAvailable.value = false;
+  }
+}
+
+/**
+ * 批量导入本地文件：逐个解析，成功的自动写入 data/ 资源库，最后载入第一个。
+ * 拖入多个 JSON 即可一次完成“入库 + 预览”，便于大批量测试。
+ */
+async function loadFiles(input: File[]): Promise<void> {
+  if (input.length === 0) {
+    return;
+  }
+  const accepted: Array<{ name: string; data: LottieData }> = [];
+  let rejected = 0;
+  let saved = 0;
+  let saveFailed = 0;
+  libraryBusy.value = libraryAvailable.value;
+  try {
+    for (const [index, file] of input.entries()) {
+      if (input.length > 1) {
+        showToast(`正在处理 ${index + 1}/${input.length}：${file.name}`);
+      }
+      let text: string;
+      let data: LottieData;
+      try {
+        text = await file.text();
+        data = JSON.parse(text) as LottieData;
+      } catch {
+        rejected += 1;
+        continue;
+      }
+      accepted.push({ name: file.name, data });
+      if (!libraryAvailable.value) {
+        continue;
+      }
+      try {
+        await saveLibraryFile(file.name, text);
+        saved += 1;
+      } catch {
+        // 入库失败不影响本地预览，结束后在提示里说明。
+        saveFailed += 1;
+      }
+    }
+  } finally {
+    libraryBusy.value = false;
+    if (saved > 0) {
+      await refreshLibrary();
+    }
+  }
+
+  if (accepted.length === 0) {
+    showToast(rejected > 0 ? `导入失败：${rejected} 个文件不是合法 JSON` : '没有可用的文件');
+    return;
+  }
+
+  await loadDocument(accepted[0].data, `lib:${accepted[0].name}`);
+
+  const parts: string[] = [];
+  if (saved > 0) {
+    parts.push(`已入库 ${saved} 个文件到 data/`);
+  }
+  if (rejected > 0) {
+    parts.push(`${rejected} 个解析失败`);
+  }
+  if (saveFailed > 0) {
+    parts.push(`${saveFailed} 个入库失败`);
+  }
+  if (parts.length > 0) {
+    showToast(parts.join(' · '));
+  }
+}
+
+/** 从资源库载入一份文档；来源 id 用 `lib:` 前缀，供顶栏高亮与面板选中。 */
+async function loadLibraryEntry(name: string): Promise<void> {
+  if (!converter) {
+    return;
+  }
+  try {
+    const data = await readLibraryFile(name);
+    await loadDocument(data, `lib:${name}`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error));
   }
 }
 
-/** 顶部数据源切换：`demo:` 前缀走外部 JSON，否则当作内置示例 id。 */
+/** 从 data/ 删除一份资源；当前正在预览的文件仍留在内存中，不受影响。 */
+async function removeLibraryEntry(name: string): Promise<void> {
+  try {
+    await deleteLibraryFile(name);
+    delete libraryStatus[name];
+    await refreshLibrary();
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
+ * 批量转换校验：按当前参数逐个转换资源库文件，把网格数 / 三角形数 / 耗时
+ * 写进列表。转换是同步的，每处理完一个让出主线程，避免大批量时页面卡死。
+ */
+async function checkLibrary(): Promise<void> {
+  if (!converter || libraryFiles.value.length === 0) {
+    return;
+  }
+  libraryBusy.value = true;
+  for (const key of Object.keys(libraryStatus)) {
+    delete libraryStatus[key];
+  }
+  const options = convertOptions();
+  let failed = 0;
+  for (const file of libraryFiles.value) {
+    try {
+      const data = await readLibraryFile(file.name);
+      const started = performance.now();
+      const converted = converter.convert(data, options);
+      const elapsed = performance.now() - started;
+      libraryStatus[file.name] =
+        `${converted.meshCount} 网格 · ${(converted.totalIndices / 3).toLocaleString()} 三角形 · ${elapsed.toFixed(1)} ms`;
+    } catch (error) {
+      failed += 1;
+      libraryStatus[file.name] = `失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+  }
+  libraryBusy.value = false;
+  const total = libraryFiles.value.length;
+  showToast(
+    failed > 0
+      ? `校验完成：${total - failed}/${total} 通过，${failed} 个失败`
+      : `校验完成：${total} 个文件全部通过`,
+  );
+}
+
+/** 顶部数据源切换：`demo:` 走外部 JSON，`library` 打开资源库，其余为内置示例 id。 */
 function onSelectSource(id: string): void {
   if (id.startsWith('demo:')) {
     void loadDemo(id.slice(5));
+  } else if (id === 'library') {
+    libraryOpen.value = true;
+    void refreshLibrary();
   } else {
     void loadSample(id);
   }
@@ -564,12 +742,12 @@ function pickFile(): void {
   fileInput.value?.click();
 }
 
-/** 文件选择回调；清空 value 以便下次选择同名文件时仍能触发 change。 */
+/** 文件选择回调（支持多选）；清空 value 以便下次选择同名文件时仍能触发 change。 */
 function onFileChange(event: Event): void {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (file) {
-    void loadFile(file);
+  const files = Array.from(input.files ?? []);
+  if (files.length > 0) {
+    void loadFiles(files);
   }
   input.value = '';
 }
@@ -620,14 +798,14 @@ function onDragLeave(): void {
   }
 }
 
-/** 释放文件：取第一个文件交给 loadFile，并重置遮罩状态。 */
+/** 释放文件：批量交给 loadFiles（全部入库，并预览第一个），并重置遮罩状态。 */
 function onDrop(event: DragEvent): void {
   event.preventDefault();
   dragDepth = 0;
   dropVisible.value = false;
-  const file = event.dataTransfer?.files?.[0];
-  if (file) {
-    void loadFile(file);
+  const files = Array.from(event.dataTransfer?.files ?? []);
+  if (files.length > 0) {
+    void loadFiles(files);
   }
 }
 
@@ -666,7 +844,7 @@ function tick(now: number): void {
   rafId = requestAnimationFrame(tick);
 }
 
-/** 启动流程：先加载 wasm 转换器，成功后载入默认示例。 */
+/** 启动流程：先加载 wasm 转换器，成功后探测资源库并载入默认示例。 */
 async function boot(): Promise<void> {
   try {
     converter = await loadConverter();
@@ -674,6 +852,8 @@ async function boot(): Promise<void> {
     showToast(`Rust 转换器加载失败：${error instanceof Error ? error.message : String(error)}`);
     return;
   }
+  // 资源库探测不阻塞首屏：接口存在时顶栏会多出「资源库」入口。
+  void refreshLibrary();
   await loadSample('orbit');
 }
 
@@ -750,7 +930,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="app">
     <TopBar
-      :sources="SOURCES"
+      :sources="sources"
       :active-source="activeSource"
       :conversion="stats.conversion"
       :frames="stats.frames"
@@ -836,9 +1016,22 @@ onBeforeUnmount(() => {
   <div class="drop-overlay" :class="{ 'is-visible': dropVisible }">
     <div class="drop-card">
       <strong>释放以转换 Lottie</strong>
-      <span>支持 Bodymovin 导出的 .json</span>
+      <span>支持 Bodymovin 导出的 .json · 可多选，自动存入 data/</span>
     </div>
   </div>
+
+  <LibraryPanel
+    v-if="libraryOpen"
+    :files="libraryFiles"
+    :active-name="activeLibraryName"
+    :busy="libraryBusy"
+    :statuses="libraryStatus"
+    @close="libraryOpen = false"
+    @load="loadLibraryEntry"
+    @remove="removeLibraryEntry"
+    @upload="pickFile"
+    @check="checkLibrary"
+  />
 
   <div class="toast" :class="{ 'is-visible': toastVisible }" role="status">
     {{ toastText }}
@@ -848,6 +1041,7 @@ onBeforeUnmount(() => {
     ref="fileInput"
     type="file"
     accept=".json,application/json"
+    multiple
     hidden
     @change="onFileChange"
   />

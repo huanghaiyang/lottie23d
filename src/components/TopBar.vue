@@ -5,6 +5,8 @@ interface SourceChip {
   id: string;
   label: string;
   accent?: boolean;
+  /** 可选的选中前缀：资源库文件以 `lib:` 开头，用它保持入口高亮。 */
+  match?: string;
 }
 
 /** 展示数据；统计文案已由 App.vue 预先格式化，组件不再做计算。 */
@@ -48,7 +50,12 @@ function onChip(chip: SourceChip): void {
         v-for="chip in props.sources"
         :key="chip.id"
         class="chip"
-        :class="{ 'is-active': chip.id === props.activeSource, 'chip-accent': chip.accent }"
+        :class="{
+          'is-active':
+            chip.id === props.activeSource ||
+            (chip.match != null && props.activeSource.startsWith(chip.match)),
+          'chip-accent': chip.accent,
+        }"
         type="button"
         @click="onChip(chip)"
       >

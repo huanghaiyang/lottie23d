@@ -38,6 +38,9 @@ npm run dev            # 启动前端（默认 http://localhost:5173）
 
 打开页面即可看到「星轨」示例的左右联播。支持顶部切换内置样例、或把 Lottie JSON 拖入页面导入。
 
+拖入（或顶部「导入 JSON」选择）的文件会自动写入项目根目录的 `data/` 资源库；
+顶栏「资源库」入口可浏览、逐个载入、删除并批量转换校验，适合一次拖入大量文件后逐个回归。
+
 ## 构建
 
 ```bash
@@ -146,7 +149,9 @@ let bytes = lottie2mesh::output::encode(&model);
 │  ├─ src/output.rs           .l2d3 二进制编码
 │  ├─ src/lib.rs              C ABI（alloc/convert/output/release/error）
 │  └─ src/bin/cli.rs          原生命令行
-├─ scripts/build-wasm.mjs     Rust → wasm 构建脚本
+├─ scripts/
+│  ├─ build-wasm.mjs          Rust → wasm 构建脚本
+│  └─ library-plugin.mjs      资源库中间件（上传写入 data/，仅 dev / preview）
 ├─ sdk/
 │  ├─ index.mjs               加载 wasm、转换、解析二进制模型
 │  ├─ index.d.mts             类型声明
@@ -160,5 +165,6 @@ let bytes = lottie2mesh::output::encode(&model);
 ├─ public/
 │  ├─ wasm/lottie2mesh.wasm   构建产物
 │  └─ animations/             样例 Lottie 文件
+├─ data/                      资源库：页面里上传的 Lottie（本地生成，已忽略）
 └─ docs/technical.md          技术文档
 ```

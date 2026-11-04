@@ -11,3 +11,6 @@ rust/lottie2mesh/target/
 .trae-html-share-packages/
 .DS_Store
 Thumbs.db
+
+# 本地资源库（页面里上传的测试动画）
+data/
