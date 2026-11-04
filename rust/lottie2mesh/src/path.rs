@@ -340,9 +340,8 @@ fn bezier_point(
 /// * 两帧顶点数不一致时无法 morph，按进度取较近的一帧。
 /// 返回 `None` 表示路径为空或格式不合法。
 pub fn eval_path_property(ks: &Value, frame: f32) -> Option<PathData> {
-    let animated = ks.get("a").and_then(Value::as_i64).unwrap_or(0) != 0;
     let k = ks.get("k").unwrap_or(ks);
-    if !animated {
+    if !crate::prop::is_keyframed(ks) {
         return parse_path_value(k);
     }
     let list = k.as_array()?;

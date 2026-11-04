@@ -432,10 +432,12 @@ impl<'a> Compiler<'a> {
             } else {
                 0.5
             };
-            // 深度按图层在合成中的顺序均分：越靠前的图层越靠前（z 越大），
-            // 子合成在其 owner 深度附近再压缩到 0.16 的范围。
+            // 深度按图层在合成中的顺序均分：越靠前的图层越靠前（z 越大）。
+            // 子合成整体落在 owner 的深度槽内，并只用很小的范围（±0.01）表达
+            // 内部前后关系——必须远小于相邻顶层图层的间距（约 0.022），否则
+            // 子合成会跨过相邻图层（dalek 的 rayitos 曾因此被压到蓝色背景之后）。
             let depth = match owner {
-                Some(parent) => self.plans[parent].depth + (0.5 - local_t) * 0.16,
+                Some(parent) => self.plans[parent].depth + (0.5 - local_t) * 0.02,
                 None => 0.5 - local_t,
             }
             .clamp(-0.65, 0.65);
@@ -517,8 +519,8 @@ impl<'a> Compiler<'a> {
     /// 参考帧用与烘焙时相同的顶点跟随上下文求值，保证参考拓扑与动画中
     /// 真实出现的拓扑一致；每个 drawable 单独生成一个网格。
     fn build_shape_layer(&mut self, id: usize, layer: &'a Layer) {
-        // 参考几何在图层局部时间采样，与属性求值保持一致。
-        let frame = self.plans[id].ref_frame - layer.st;
+        // 参考几何在图层所在合成的帧上采样；图层自身 `st` 不影响属性求值。
+        let frame = self.plans[id].ref_frame;
         let follows = self.collect_follows(id, &layer.shapes);
         // 带关键帧的遮罩会改变轮廓形状，同样属于几何动画。
         let dynamic_mask = shape::mask_clips_geometry(&layer.masks);
@@ -1787,7 +1789,7 @@ fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
             let remapped = owner_layer.tm.as_ref().and_then(|tm| {
                 // loopOut 以「父合成帧」为时间轴：超出末关键帧后按关键帧区间循环，
                 // 这样子合成会反复播放（例如海星眼睛周期性眨眼）。
-                let comp_frame = owner_frame + owner_layer.st;
+                let comp_frame = owner_frame;
                 let frame = match tm.get("k").and_then(Value::as_array) {
                     Some(keyframes) if tm_loops_cycle(tm) => {
                         let first = keyframes.first().and_then(key_start_time);
@@ -1818,8 +1820,13 @@ fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
 
         None => root_frame,
     };
-    // lottie-web 的属性时间相对图层起始时间 st。
-    parent_frame - plans[id].layer.st
+    // lottie-web 的属性求值使用**父合成当前帧**：`getValueAtCurrentTime` 里
+    // `frameNum = comp.renderedFrame - offsetTime`，而关键帧时间也按同一
+    // `offsetTime`（即图层 `st`）平移，二者相消。因此图层自身的关键帧
+    // 属性不受本层 `st` 影响；`st` 只在进入预合成时平移子合成时间轴。
+    // 之前这里减去了 `st`，导致 `st != 0` 的图层（如 dalek 的 shooter、
+    // cuerpo）属性被错误地求值到时间轴之外。
+    parent_frame
 }
 
 /// 图层在给定合成时间（帧）是否可见；`ip == op` 视为始终可见。
@@ -1908,11 +1915,19 @@ fn plan_world(
     };
     let mut world = mat_mul(&base, &chain);
     // 把图层深度烘焙进矩阵，播放器可直接上传，深度滑块只需再叠加增量。
-    world[14] += plans[id].depth;
+    // 预合成子层的 `base` 已包含 owner 的深度平移，这里只能叠加相对 owner
+    // 的局部深度差；若再叠加绝对深度会被累加两次（dalek 的 rayitos 曾因此
+    // 被推到蓝色背景之后而完全不可见）。
+    let local_depth = match plans[id].owner {
+        Some(owner) => plans[id].depth - plans[owner].depth,
+        None => plans[id].depth,
+    };
+    world[14] += local_depth;
     let frame = frame_cache[id].unwrap_or_else(|| plan_local_frame(plans, id, root_frame));
-    // ip / op 位于父合成时间轴，需要用「局部帧 + st」换回合成时间。
-    let comp_frame = frame + plans[id].layer.st;
-    let own = if visible(plans[id].layer, comp_frame) {
+    // 图层的 ip / op 与属性关键帧一样位于「父合成时间轴」，因此直接用父合成帧
+    // 判断可见性；图层自身 `st` 在两边同时平移、彼此抵消（与 lottie-web 的
+    // `checkLayerLimits` 一致）。
+    let own = if visible(plans[id].layer, frame) {
         layer_opacity(plans[id].layer, frame)
     } else {
         0.0

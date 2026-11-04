@@ -94,13 +94,12 @@ root_frame = ip + (op - ip) * (i / frame_count)
 
 ### 3.3 图层本地时间
 
-- 普通图层：`local = root_frame - layer.st`
-- 预合成子层：先换算父层时间轴，再减去子层 `st`：
+- 普通图层的属性与 `ip` / `op` 都在**父合成时间轴**上求值，图层自身的 `st` 不参与：lottie-web 的 `getValueAtCurrentTime` 里 `frameNum = comp.renderedFrame - offsetTime`（`offsetTime` 即 `st`），而关键帧时间也按同一 `offsetTime` 平移，两边相消。
+- 预合成子层：`st` 只用于进入子合成时换算时间轴，子层自身的 `st` 同样相消：
 
 ```text
 time remap 启用时：child_parent_frame = tm(owner_local) * frame_rate   // tm 以秒计
-否则：             child_parent_frame = owner_local / sr
-local                              = child_parent_frame - child.st
+否则：             child_parent_frame = (root_frame - owner.st) / sr
 ```
 
 `tm` 优先于 `sr`（与 lottie-web 的 `CompElement.prepareFrame` 一致）。`sr` 为 0 时按 1 处理。参考帧的选择同样遵循该规则，并 clamp 到子层 `ip … op - 0.001`。
@@ -121,8 +120,9 @@ comp_frame > last_keyframe.t 时：tm 的求值帧 = first_t + (comp_frame - fir
 
 实现位于 [`prop.rs`](../rust/lottie2mesh/src/prop.rs)，语义对齐 lottie-web 的 `PropertyFactory`。
 
-- 静态属性（`a = 0`）：直接读取 `k`（数字、数组或带 `v`/`s` 的对象）。
-- 动画属性（`a = 1`）：在 `k[]` 中定位 `t ≤ frame` 的区间。
+- 关键帧判定不看 `a`：按 `k` 的**首元素类型**区分——首元素是数字（或 `k` 为空）为静态值，否则为关键帧数组。这与 lottie-web 的 `PropertyFactory.getProp` 一致；旧版 Bodymovin 导出（如 `dalek.json` 的 3.1.6）的 `ks` 属性普遍缺少 `a`，只看 `a` 会把整套动画误判成静态。
+- 静态属性：直接读取 `k`（数字、数组或带 `v`/`s` 的对象）。
+- 动画属性：在 `k[]` 中定位 `t ≤ frame` 的区间。
 - 结束值：`next.s`，缺失时回落到当前关键帧的 `e`（对应 lottie-web 的 `nextKeyData.s || keyData.e`）。
 - 保持帧：`h === 1` 时整段返回起始值。
 - 缓动：`i.x/i.y/o.x/o.y` 支持标量或按维度数组；用二分求解三次贝塞尔的 X 轴，再取 Y 值（18 次迭代）。
@@ -176,11 +176,13 @@ Skew = R(sa) · Shear(tan(-sk)) · R(-sa)
 
 ```text
 顶层：depth = 0.5 - index / (count - 1)
-子层：depth = owner.depth + (0.5 - index / (count - 1)) * 0.16
+子层：depth = owner.depth + (0.5 - index / (count - 1)) * 0.02
 两者都 clamp 到 [-0.65, 0.65]
 ```
 
-深度直接加在最终矩阵的 Z 平移分量（列主序第 14 个元素），所以播放器可以原样上传矩阵；右侧“层深”滑块只是追加一个增量。
+子层的展开范围只有 ±0.01，必须远小于相邻顶层间距（约 0.022），否则子合成会跨过相邻图层（`dalek.json` 的 `rayitos` 曾因此被压到蓝色背景之后）。
+
+深度直接加在最终矩阵的 Z 平移分量（列主序第 14 个元素），所以播放器可以原样上传矩阵；右侧“层深”滑块只是追加一个增量。**子层只累加相对 owner 的深度差**——子层的 `base` 矩阵（owner 世界矩阵）里已经含了 owner 的深度平移，再叠加绝对深度会被算两次（`dalek.json` 的 `rayitos` 因此被推到 `z ≈ -0.97`，整片闪电被不透明的蓝色背景挡住）。
 
 `render_order = ((depth + 1) * 10000) + index`，SDK 解析后按它升序排序网格数组。
 
@@ -196,7 +198,7 @@ k = 图层沿视线方向的深度 / 相机到观察目标的距离
 
 ## 6. 可见性与透明度
 
-- 可见性判定使用**父合成时间**：`comp_frame = local + st`，当 `ip ≤ comp_frame < op` 时可见；`op <= ip` 视为始终可见。
+- 可见性判定使用**父合成帧**（即图层属性求值用的同一个帧）：`ip ≤ frame < op` 时可见，`op <= ip` 视为始终可见；图层自身的 `st` 在 `ip - st` 与 `frame - st` 两边相消，与 lottie-web 的 `checkLayerLimits` 等价。
 - 透明度沿合成树相乘：`opacity = owner_opacity * own_opacity`。
 - 只有当颜色或透明度确实变化时才分配逐帧颜色轨道；常量颜色会把第 0 帧的图层透明度直接折进网格记录。
 - 触发动态颜色的条件包括：样式动画、图层 `o` 动画、父级透明度动画、父级存在时间伸缩/位移，或在采样区间内并非全程可见。
@@ -211,6 +213,7 @@ k = 图层沿视线方向的深度 / 相机到观察目标的距离
 - 支持 `fl` 纯色填充、`st` 描边、`gf` / `gs` 渐变（按首色近似）。
 - 形状变换会烘焙进轮廓坐标，运行时不再做组变换。
 - `eval_styles` 只求颜色，跳过路径展平与组变换，用于“仅样式动画”的场景。
+- 颜色范围按数值判定：旧版 Bodymovin（`v` 低于 4.1.9，如 `dalek.json` 的 3.1.6）的 `fl` / `st` 用 0..255，新版用 0..1。任一通道大于 1 即整组除以 255（与 lottie-web 的 `checkColors` 一致），否则渲染端会把 0..255 的颜色钳成白色剪影。
 - 图元顶点顺序必须与 lottie-web 一致，因为 `tm` 修剪的起点就是路径起点：椭圆从正上方开始（顺时针为上→右→下→左，`d = 3` 时为上→左→下→右），矩形从右上角开始顺时针。顺序不一致会让光弧/扇形整体偏转 90°（`pulse` 的三条环绕光弧曾如此）。
 
 ### 7.0 图层遮罩

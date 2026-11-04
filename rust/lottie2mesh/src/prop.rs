@@ -4,8 +4,9 @@
 //! 供 `shape`（变换、颜色、trim 等）与 `path`（形状路径）复用。
 //!
 //! 关键语义：
-//! * 静态值（`a = 0`）原样返回；
-//! * 关键帧值（`a = 1`）用 cubic-bezier 时间曲线缓动；
+//! * 静态值原样返回；关键帧属性由 `k` 首元素是否为对象判定（见
+//!   [`is_keyframed`]），与 lottie-web 一致，不依赖可能缺失的 `a` 字段；
+//! * 关键帧值用 cubic-bezier 时间曲线缓动；
 //! * 空间关键帧（含 `to` / `ti`）在位置空间走三次贝塞尔，并按**弧长**采样，
 //!   与 lottie-web 的 `bez.buildBezierData` 一致；
 //! * `h === 1` 的关键帧保持起始值不插值。
@@ -17,19 +18,30 @@ use serde_json::Value;
 
 /// 求值一个 Lottie 属性对象 `{ a, k }`。
 ///
-/// `frame` 为帧号；`a != 0` 走关键帧分支，否则按静态值解析。
+/// `frame` 为帧号；关键帧属性见 [`is_keyframed`]，否则按静态值解析。
 /// 返回值分量顺序与 Lottie 定义一致（如位置为 x, y, z）。
 pub fn eval(value: &Value, frame: f32) -> Vec<f32> {
-    let animated = value
-        .get("a")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        != 0;
     let k = value.get("k").unwrap_or(value);
-    if animated {
+    if is_keyframed(value) {
         eval_keyframes(k, frame)
     } else {
         eval_static(k)
+    }
+}
+
+/// 属性是否按关键帧求值。
+///
+/// 对齐 lottie-web 的 `PropertyFactory.getProp`：`k` 是数组且**首元素不是数字**
+/// （即关键帧对象）时才走关键帧分支；`k` 为数组首元素是数字（静态多维值）、
+/// 空数组或直接是值对象时都按静态值解析。不能只看 `a` 字段——部分导出文件
+/// （如 `dalek.json`）省略了 `a`，但 `k` 仍然直接存放关键帧数组。
+pub fn is_keyframed(value: &Value) -> bool {
+    match value.get("k") {
+        Some(Value::Array(items)) => match items.first() {
+            Some(Value::Number(_)) | None => false,
+            Some(_) => true,
+        },
+        _ => false,
     }
 }
 

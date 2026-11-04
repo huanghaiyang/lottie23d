@@ -590,6 +590,19 @@ fn hidden(item: &Value) -> bool {
     item.get("hd").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// 把颜色分量归一化到 0..1。
+///
+/// 旧版 Bodymovin 导出（`v` 低于 4.1.9，如 `dalek.json` 的 3.1.6）的 `fl` / `st`
+/// 颜色用 0..255，新版用 0..1。lottie-web 在加载旧版文件时会把颜色除以 255；
+/// 这里按数值判定（任一通道大于 1 即视为 0..255），否则颜色会被渲染端钳成白色。
+fn normalize_color(color: &mut [f32; 4]) {
+    if color.iter().any(|v| *v > 1.0) {
+        for value in color.iter_mut() {
+            *value /= 255.0;
+        }
+    }
+}
+
 /// 由填充/描边样式节点构造 `Drawable`，并把路径列表克隆进去。
 ///
 /// 颜色分量、样式透明度均归一化为 0..1；描边宽度单位为像素。
@@ -602,15 +615,14 @@ fn build_drawable(kind: DrawKind, style: &Value, frame: f32, paths: &[PathItem])
         let c = prop::eval_in(style, "c", frame, &[0.0, 0.0, 0.0, 1.0]);
         let alpha = c.get(3).copied().unwrap_or(1.0);
         let opacity = prop::eval_scalar(style, "o", frame, 100.0) / 100.0;
-        (
-            [
-                c.first().copied().unwrap_or(0.0),
-                c.get(1).copied().unwrap_or(0.0),
-                c.get(2).copied().unwrap_or(0.0),
-                alpha,
-            ],
-            opacity,
-        )
+        let mut rgba = [
+            c.first().copied().unwrap_or(0.0),
+            c.get(1).copied().unwrap_or(0.0),
+            c.get(2).copied().unwrap_or(0.0),
+            alpha,
+        ];
+        normalize_color(&mut rgba);
+        (rgba, opacity)
     };
 
     let width = if kind == DrawKind::Stroke {
@@ -674,7 +686,9 @@ fn gradient_color(style: &Value, frame: f32) -> ([f32; 4], f32) {
             rgb = [value[0], value[1], value[2]];
         }
     }
-    ([rgb[0], rgb[1], rgb[2], 1.0], opacity)
+    let mut rgba = [rgb[0], rgb[1], rgb[2], 1.0];
+    normalize_color(&mut rgba);
+    (rgba, opacity)
 }
 
 /// 求值 `rc` 矩形节点：位置、尺寸、圆角均以像素为单位，`d` 控制绕向。
@@ -774,9 +788,12 @@ pub fn drawable_slots(drawable: &Drawable) -> Vec<(Cow<'_, Contour>, bool, bool)
     slots
 }
 
-/// 判断属性对象是否为动画（`a != 0`）。
+/// 判断属性对象是否为动画。
+///
+/// 判定规则与 `prop::is_keyframed` 一致：看 `k` 的首元素是否为关键帧对象，
+/// 不依赖可能缺失的 `a` 字段（部分导出文件省掉了 `a`）。
 pub fn is_animated(value: &Value) -> bool {
-    value.get("a").and_then(Value::as_i64).unwrap_or(0) != 0
+    crate::prop::is_keyframed(value)
 }
 
 /// 识别 AE「顶点跟随空对象」路径表达式，并按顶点顺序返回空对象名称。
