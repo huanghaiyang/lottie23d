@@ -508,7 +508,7 @@ fn eval_with_geometry(
 ) -> ShapeResult {
     let mut result = GroupResult::default();
     let mut path = Vec::new();
-    eval_group_items(shapes, frame, &mut result, geometry, ctx, &mut path);
+    eval_group_items(shapes, frame, &mut result, geometry, ctx, &mut path, &[]);
     // 绘制顺序取反：AE 的形状树按「上层在前」存储，lottie-web 的
     // `searchShapes` 也是从末尾向前遍历再逐级 append，因此数组里越靠前的
     // 组/样式画得越晚（越在上）。这里对拍平后的绘制项整体取反即可等价还原；
@@ -534,6 +534,7 @@ struct GroupResult {
 /// 递归求值一组形状节点，结果写入 `out`。
 ///
 /// `path` 是当前节点在形状树中的下标栈，用于匹配顶点跟随表达式；
+/// `inherited_trims` 是祖先层传给本层的 trim 修饰器（按应用顺序）；
 /// `geometry = false` 时只统计路径数量并跳过轮廓构造。
 fn eval_group_items(
     items: &[Value],
@@ -542,6 +543,7 @@ fn eval_group_items(
     geometry: bool,
     ctx: Option<&FollowContext<'_>>,
     path: &mut Vec<usize>,
+    inherited_trims: &[TrimSpec],
 ) {
     // 组变换作用于组内全部内容，与 `tr` 在列表中的位置无关。
     let transform = items
@@ -549,6 +551,24 @@ fn eval_group_items(
         .find(|item| item.get("ty").and_then(Value::as_str) == Some("tr"))
         .map(|tr| transform_matrix(tr, frame))
         .unwrap_or(Affine::IDENTITY);
+
+    // `tm` 按照 lottie-web 的修饰器语义作用：同一层里数组下标更大的
+    // `tm` 修饰下标更小的路径（无论样式在两者之间还是之外），并递归
+    // 作用于这些路径所在子组的全部内容。`shot_01` 的 `Trim Paths 1`
+    // 正位于 `Shape 1` 组之外，旧实现只改本层 `active`，因此整条描边
+    // 从不被修剪。
+    let level_trims: Vec<(usize, TrimSpec)> = if geometry {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.get("ty").and_then(Value::as_str) == Some("tm") && !hidden(item)
+            })
+            .map(|(index, item)| (index, eval_trim(item, frame)))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut active: Vec<PathItem> = Vec::new();
     let mut active_count = 0usize;
@@ -590,7 +610,7 @@ fn eval_group_items(
                         }
                         active.push(PathItem {
                             contour: path::flatten_path(&data),
-                            trim: None,
+                            trim: shape_trim(item_index, inherited_trims, &level_trims),
                         });
                     }
                 }
@@ -603,7 +623,7 @@ fn eval_group_items(
                 if geometry {
                     active.push(PathItem {
                         contour: eval_rect(item, frame),
-                        trim: None,
+                        trim: shape_trim(item_index, inherited_trims, &level_trims),
                     });
                 }
             }
@@ -615,7 +635,7 @@ fn eval_group_items(
                 if geometry {
                     active.push(PathItem {
                         contour: eval_ellipse(item, frame),
-                        trim: None,
+                        trim: shape_trim(item_index, inherited_trims, &level_trims),
                     });
                 }
             }
@@ -627,28 +647,13 @@ fn eval_group_items(
                 if geometry {
                     active.push(PathItem {
                         contour: eval_polystar(item, frame),
-                        trim: None,
+                        trim: shape_trim(item_index, inherited_trims, &level_trims),
                     });
                 }
             }
             "tm" => {
-                // trim path：s / e 为百分比，o 为角度；统一归一化到 0..1。
-                if !geometry {
-                    continue;
-                }
-                let s = prop::eval_scalar(item, "s", frame, 0.0) / 100.0;
-                let e = prop::eval_scalar(item, "e", frame, 100.0) / 100.0;
-                let o = prop::eval_scalar(item, "o", frame, 0.0) / 360.0;
-                let spec = TrimSpec {
-                    start: s,
-                    end: e,
-                    offset: o,
-                    mode: item.get("m").and_then(Value::as_i64).unwrap_or(1) as i32,
-                };
-                // trim 只作用于当前组内已出现、尚未被消费的路径。
-                for path in active.iter_mut() {
-                    path.trim = Some(spec);
-                }
+                // trim path 已在创建路径时按 `level_trims` 一并应用，
+                // 这里只需保留占位，避免重复改写已消费的路径。
             }
             "mm" => {
                 // 合并路径：作用于本组内位于它上方（数组更靠前）的全部路径，
@@ -708,8 +713,17 @@ fn eval_group_items(
                 }
                 if let Some(children) = item.get("it").and_then(Value::as_array) {
                     let mut child = GroupResult::default();
+                    let child_trims = applicable_trims(inherited_trims, &level_trims, item_index);
                     path.push(item_index);
-                    eval_group_items(children, frame, &mut child, geometry, ctx, path);
+                    eval_group_items(
+                        children,
+                        frame,
+                        &mut child,
+                        geometry,
+                        ctx,
+                        path,
+                        &child_trims,
+                    );
                     path.pop();
                     local.drawables.extend(child.drawables);
                     // 子组未被消费的路径冒泡到当前组，路径计数同样累计。
@@ -759,6 +773,47 @@ fn transform_contour(contour: &mut Contour, matrix: Affine) {
 /// 形状节点是否隐藏（`hd = true`）。
 fn hidden(item: &Value) -> bool {
     item.get("hd").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// 求值一个 `tm` 节点：`s` / `e` 为百分比，`o` 为角度，统一归一化到 0..1。
+fn eval_trim(item: &Value, frame: f32) -> TrimSpec {
+    TrimSpec {
+        start: prop::eval_scalar(item, "s", frame, 0.0) / 100.0,
+        end: prop::eval_scalar(item, "e", frame, 100.0) / 100.0,
+        offset: prop::eval_scalar(item, "o", frame, 0.0) / 360.0,
+        mode: item.get("m").and_then(Value::as_i64).unwrap_or(1) as i32,
+    }
+}
+
+/// 汇总某个节点实际生效的 trim 修饰器（按 lottie-web 的应用顺序）。
+///
+/// `level` 是当前层全部 `tm`（按下标升序）。修饰器在下标更大的位置注册，
+/// 因此同层的生效顺序是下标从大到小；祖先层的修饰器注册得更早，排在前面。
+fn applicable_trims(
+    inherited: &[TrimSpec],
+    level: &[(usize, TrimSpec)],
+    index: usize,
+) -> Vec<TrimSpec> {
+    let mut out: Vec<TrimSpec> = inherited.to_vec();
+    for (key, spec) in level.iter().rev() {
+        if *key <= index {
+            break;
+        }
+        out.push(*spec);
+    }
+    out
+}
+
+/// 单个形状路径最终携带的 trim。
+///
+/// 多层 trim 叠加需要把修剪结果再次展平，当前按最后应用的那一层处理
+/// （现有资源里没有同时叠加多个 trim 的形状）。
+fn shape_trim(
+    index: usize,
+    inherited: &[TrimSpec],
+    level: &[(usize, TrimSpec)],
+) -> Option<TrimSpec> {
+    applicable_trims(inherited, level, index).last().copied()
 }
 
 /// 把颜色分量归一化到 0..1。

@@ -6,22 +6,23 @@
 //! * 全部计算在转换期完成，播放端拿到的仍是普通 `Contour`，无需任何新数据。
 //!
 //! 实现思路（「切分 - 分类 - 拼接」）：
-//! 1. 把两组轮廓的所有边在交点处切开，切开后任意两条边只在端点接触；
-//! 2. 用每段的中点判断它是否落在对方轮廓集合内（奇偶规则），据此决定
-//!    保留、丢弃或反向（相减/排除需要反向）；
-//! 3. 按端点把保留的边拼回闭合环路，得到结果轮廓。
+//! 1. 先把自交的轮廓按非零环绕规则拆成若干简单环；
+//! 2. 把两组轮廓的所有边在交点处切开，切开后任意两条边只在端点接触；
+//! 3. 用每段法线两侧的采样点判断它是否落在对方轮廓集合内（奇偶规则），
+//!    据此决定保留、丢弃或反向（相减/排除需要反向）；
+//! 4. 按端点把保留的边拼回闭合环路（节点处取「最顺时针出边」），得到结果轮廓。
 //!
 //! 没有交点时走快速路径：只按包含关系筛选轮廓，避免 O(n·m) 的逐边求交，
 //! 让「互不相交的多条字形路径合并」这类常见情况几乎零开销。
 //!
 //! 已知限制（与 lottie-web 的近似程度一致）：
-//! * 边与边共线重叠时不做特殊拆分，中点分类可能落在对方边界上；
-//! * 路径自交（单个 `sh` 自身打结）不做自相交重排，交点只按「两组之间」处理；
+//! * 边与边共线重叠时不做逐段拆分，靠「两侧采样 + 重复边去重」近似处理；
 //! * 合并模式 1 与 2 都按「并集」处理，4 在只有一条路径时是空操作。
 //!
 //! 单位约定：坐标与 Lottie 像素一致；结果轮廓一律标记为闭合。
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::path::Contour;
 
@@ -108,7 +109,11 @@ struct Edge {
 /// `Subtract` 以第一个轮廓为基底，依次减去其余轮廓；其余模式对所有轮廓
 /// 依次折叠（并集/异或/交均可结合）。返回空列表表示结果没有任何填充区域。
 pub fn combine(contours: &[Contour], op: BoolOp) -> Vec<Contour> {
-    let mut rings: Vec<Ring> = contours.iter().filter_map(prepare).collect();
+    let mut rings: Vec<Ring> = contours
+        .iter()
+        .filter_map(prepare)
+        .flat_map(resolve_self)
+        .collect();
     if rings.is_empty() {
         return Vec::new();
     }
@@ -132,8 +137,16 @@ pub fn combine(contours: &[Contour], op: BoolOp) -> Vec<Contour> {
 /// 嵌套环自然按孔洞处理，适合把图层遮罩（可能由多条轮廓组成）一次性套用。
 /// `mask` 为空时返回主体原样。
 pub fn clip(subject: &[Contour], mask: &[Contour], op: BoolOp) -> Vec<Contour> {
-    let a: Vec<Ring> = subject.iter().filter_map(prepare).collect();
-    let b: Vec<Ring> = mask.iter().filter_map(prepare).collect();
+    let a: Vec<Ring> = subject
+        .iter()
+        .filter_map(prepare)
+        .flat_map(resolve_self)
+        .collect();
+    let b: Vec<Ring> = mask
+        .iter()
+        .filter_map(prepare)
+        .flat_map(resolve_self)
+        .collect();
     if b.is_empty() {
         return subject.to_vec();
     }
@@ -184,6 +197,108 @@ fn to_contour(ring: Ring) -> Contour {
     }
 }
 
+/// 把自交的环按**非零环绕规则**重排成若干条简单环。
+///
+/// Lottie 的遮罩/描边带状区域本质上是同一条路径的轮廓，路径折返时环会
+/// 自己穿过自己；直接送进「切分—分类—拼接」会把交叠区域的边全部留在
+/// 结果里，`stitch` 拼不出闭合环（表现为裁剪结果为空）。这里先把自己的
+/// 边在自交点处切开，只保留「区域边界」分段，再重新拼接。
+///
+/// 非零规则与 Canvas / SVG 的默认填充规则一致：交叠区域仍然保留，
+/// 不会像奇偶规则那样变成孔洞。
+fn resolve_self(ring: Ring) -> Vec<Ring> {
+    let n = ring.pts.len();
+    if n < 4 {
+        return vec![ring];
+    }
+    let edges = collect_edges(std::slice::from_ref(&ring), 0);
+    let mut cuts: Vec<Vec<(f32, [f32; 2])>> = vec![Vec::new(); edges.len()];
+    let mut crossed = false;
+    for i in 0..n {
+        let a0 = ring.pts[i];
+        let a1 = ring.pts[(i + 1) % n];
+        let a_min = [a0[0].min(a1[0]), a0[1].min(a1[1])];
+        let a_max = [a0[0].max(a1[0]), a0[1].max(a1[1])];
+        for j in (i + 1)..n {
+            // 相邻边共享端点，跳过。
+            if j == i + 1 || (i == 0 && j == n - 1) {
+                continue;
+            }
+            let b0 = ring.pts[j];
+            let b1 = ring.pts[(j + 1) % n];
+            if a_min[0] > b0[0].max(b1[0])
+                || b0[0].min(b1[0]) > a_max[0]
+                || a_min[1] > b0[1].max(b1[1])
+                || b0[1].min(b1[1]) > a_max[1]
+            {
+                continue;
+            }
+            if let Some((t, u)) = edge_intersection(a0, a1, b0, b1) {
+                let point = [a0[0] + (a1[0] - a0[0]) * t, a0[1] + (a1[1] - a0[1]) * t];
+                cuts[i].push((t, point));
+                cuts[j].push((u, point));
+                crossed = true;
+            }
+        }
+    }
+    if !crossed {
+        return vec![ring];
+    }
+    let pieces = split_edges(&edges, &mut cuts);
+    // 保留「区域边界」分段：判断中点两侧是否落在非零环绕区域内，只有一侧
+    // 在内、另一侧在外的分段才是边界。只测中点是否在内不够——带状路径折返
+    // 时交叠区分段两侧都在内（环绕数 2），那属于内部边，必须丢弃，否则拼接
+    // 出来的环会自相重叠，后续奇偶填充会把交叠区变成孔洞。
+    let kept: Vec<Edge> = pieces.into_iter().filter(|edge| edge_on_boundary(edge, &ring)).collect();
+    let rings = stitch(kept);
+    if rings.is_empty() {
+        vec![ring]
+    } else {
+        rings
+    }
+}
+
+/// 分段两侧（沿法线各偏移一点）是否一侧在内、一侧在外。
+fn edge_on_boundary(edge: &Edge, ring: &Ring) -> bool {
+    let dx = edge.p1[0] - edge.p0[0];
+    let dy = edge.p1[1] - edge.p0[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 1e-6 {
+        return false;
+    }
+    // 偏移量取分段的 0.2%，上限 0.05 像素：足够越过浮点噪声，又远小于
+    // 描边半宽（`shot_01` 为 19 像素），不会跨到相邻边界。
+    let eps = (length * 0.002).clamp(1e-3, 0.05);
+    let nx = -dy / length;
+    let ny = dx / length;
+    let mid = [
+        (edge.p0[0] + edge.p1[0]) * 0.5,
+        (edge.p0[1] + edge.p1[1]) * 0.5,
+    ];
+    let left = winding_number([mid[0] + nx * eps, mid[1] + ny * eps], &ring.pts) != 0;
+    let right = winding_number([mid[0] - nx * eps, mid[1] - ny * eps], &ring.pts) != 0;
+    left != right
+}
+
+/// 非零环绕规则下的环绕数（逆时针为正）。
+fn winding_number(point: [f32; 2], pts: &[[f32; 2]]) -> i32 {
+    let n = pts.len();
+    let mut winding = 0i32;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let side = (b[0] - a[0]) * (point[1] - a[1]) - (point[0] - a[0]) * (b[1] - a[1]);
+        if a[1] <= point[1] {
+            if b[1] > point[1] && side > 0.0 {
+                winding += 1;
+            }
+        } else if b[1] <= point[1] && side < 0.0 {
+            winding -= 1;
+        }
+    }
+    winding
+}
+
 /// 两组轮廓的二元运算。
 fn binary(a: &[Ring], b: &[Ring], op: BoolOp) -> Vec<Ring> {
     if a.is_empty() {
@@ -210,7 +325,14 @@ fn binary(a: &[Ring], b: &[Ring], op: BoolOp) -> Vec<Ring> {
     if !any_crossing(a, b) {
         return combine_without_crossing(a, b, op);
     }
-    arrange(a, b, op)
+    let out = arrange(a, b, op);
+    // 兜底：切分—分类—拼接在退化数据上仍可能拼不出任何环（例如两条轮廓
+    // 大面积共线重叠）。此时退回按包含关系筛选，至少保证「完全包含」这类
+    // 常见情形不会整块丢失。
+    if out.is_empty() {
+        return combine_without_crossing(a, b, op);
+    }
+    out
 }
 
 /// 两组轮廓之间是否存在真正的边相交（端点接触不算）。
@@ -328,16 +450,18 @@ fn arrange(a: &[Ring], b: &[Ring], op: BoolOp) -> Vec<Ring> {
     pieces.extend(split_edges(&b_edges, &mut b_cuts));
 
     // 逐段分类：中点落在对方内部则视为「内部段」。
+    //
+    // 遮罩与内容常常沿同一条中心线各自的描边带（`shot_01` 的渐变描边与
+    // 动画遮罩就是同源路径），两者边界会**完全共线**。此时中点正好落在
+    // 对方的边界上，水平射线判内外会随浮点尾差跳变，整条链因此断开、
+    // 拼接失败。所以改用法线两侧各偏一点采样：只要任一侧在内就算在内，
+    // 共线分段对交集而言属于边界，应当保留。
     let mut kept: Vec<Edge> = Vec::with_capacity(pieces.len());
     for edge in pieces {
-        let midpoint = [
-            (edge.p0[0] + edge.p1[0]) * 0.5,
-            (edge.p0[1] + edge.p1[1]) * 0.5,
-        ];
         let inside_other = if edge.src == 0 {
-            point_in_rings(midpoint, b)
+            piece_inside(&edge, b)
         } else {
-            point_in_rings(midpoint, a)
+            piece_inside(&edge, a)
         };
         if let Some(reversed) = keep_flag(op, edge.src, inside_other) {
             kept.push(if reversed {
@@ -351,7 +475,38 @@ fn arrange(a: &[Ring], b: &[Ring], op: BoolOp) -> Vec<Ring> {
             });
         }
     }
+    // 共线重叠会让同一条边界同时来自两组轮廓，保留一份即可；重复边会让
+    // 拼接在每个节点上多出候选，环路容易走反。
+    let mut seen: HashSet<((i64, i64), (i64, i64))> = HashSet::new();
+    kept.retain(|edge| {
+        let a = key(edge.p0);
+        let b = key(edge.p1);
+        let pair = if a <= b { (a, b) } else { (b, a) };
+        seen.insert(pair)
+    });
     stitch(kept)
+}
+
+/// 分段是否落在另一组轮廓内：中点与两侧偏移点任一在内即算（共线时按边界处理）。
+fn piece_inside(edge: &Edge, other: &[Ring]) -> bool {
+    let dx = edge.p1[0] - edge.p0[0];
+    let dy = edge.p1[1] - edge.p0[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    let mid = [
+        (edge.p0[0] + edge.p1[0]) * 0.5,
+        (edge.p0[1] + edge.p1[1]) * 0.5,
+    ];
+    if point_in_rings(mid, other) {
+        return true;
+    }
+    if length < 1e-6 {
+        return false;
+    }
+    let eps = (length * 0.002).clamp(1e-3, 0.05);
+    let nx = -dy / length * eps;
+    let ny = dx / length * eps;
+    point_in_rings([mid[0] + nx, mid[1] + ny], other)
+        || point_in_rings([mid[0] - nx, mid[1] - ny], other)
 }
 
 /// 某一段边是否保留；返回 `Some(true)` 表示需要反向。
@@ -407,15 +562,16 @@ fn split_edges(edges: &[Edge], cuts: &mut [Vec<(f32, [f32; 2])>]) -> Vec<Edge> {
         });
         let mut previous = edge.p0;
         for &(_, point) in cuts.iter() {
-            // 与当前起点重合的切点直接跳过；切点贴近终点时不再单独成段。
-            if squared_dist(previous, point) > 1e-8 && squared_dist(point, edge.p1) > 1e-8 {
+            // 只跳过零长度分段；切点贴近端点时也要保留到 `p1` 的余段，
+            // 否则端点处会留下缺口，拼接时整条环闭合不上（表现为整块丢失）。
+            if squared_dist(previous, point) > 1e-8 {
                 out.push(Edge {
                     p0: previous,
                     p1: point,
                     src: edge.src,
                 });
+                previous = point;
             }
-            previous = point;
         }
         if squared_dist(previous, edge.p1) > 1e-8 {
             out.push(Edge {
@@ -429,6 +585,11 @@ fn split_edges(edges: &[Edge], cuts: &mut [Vec<(f32, [f32; 2])>]) -> Vec<Edge> {
 }
 
 /// 按端点把保留的边拼成闭合环；无法闭合的散段直接丢弃。
+///
+/// 一个节点可能有多条出边（自交或两组轮廓交叉处）。此时按平面图的
+/// 「下一半边」规则选边：从入射方向的反方向出发，顺时针方向最先遇到的
+/// 那条出边——这样走出的环路把区域内部保持在左侧，外边界与孔洞都能正确
+/// 闭合。原先任取出边的做法在自交节点会走进死路，导致整条环拼不出来。
 fn stitch(edges: Vec<Edge>) -> Vec<Ring> {
     if edges.is_empty() {
         return Vec::new();
@@ -458,17 +619,28 @@ fn stitch(edges: Vec<Edge>) -> Vec<Ring> {
                 closed = true;
                 break;
             }
-            let Some(candidates) = outgoing.get_mut(&end_key) else {
+            let Some(candidates) = outgoing.get(&end_key) else {
                 break;
             };
-            let mut next = None;
-            while let Some(candidate) = candidates.pop() {
-                if !used[candidate] {
-                    next = Some(candidate);
-                    break;
+            let reverse = [
+                edges[current].p0[0] - edges[current].p1[0],
+                edges[current].p0[1] - edges[current].p1[1],
+            ];
+            let mut next: Option<(f32, usize)> = None;
+            for &candidate in candidates {
+                if used[candidate] {
+                    continue;
+                }
+                let direction = [
+                    edges[candidate].p1[0] - edges[candidate].p0[0],
+                    edges[candidate].p1[1] - edges[candidate].p0[1],
+                ];
+                let turn = clockwise_turn(reverse, direction);
+                if next.map_or(true, |(best, _)| turn < best) {
+                    next = Some((turn, candidate));
                 }
             }
-            let Some(candidate) = next else {
+            let Some((_, candidate)) = next else {
                 break;
             };
             current = candidate;
@@ -501,6 +673,18 @@ fn stitch(edges: Vec<Edge>) -> Vec<Ring> {
         rings.push(ring);
     }
     rings
+}
+
+/// 从 `from` 方向顺时针转到 `to` 方向的角度（0..2π）。
+fn clockwise_turn(from: [f32; 2], to: [f32; 2]) -> f32 {
+    let cross = from[0] * to[1] - from[1] * to[0];
+    let dot = from[0] * to[0] + from[1] * to[1];
+    let clockwise = -cross.atan2(dot);
+    if clockwise < 0.0 {
+        clockwise + std::f32::consts::TAU
+    } else {
+        clockwise
+    }
 }
 
 /// 坐标量化键；0.001 像素的网格足以吸收浮点尾差。

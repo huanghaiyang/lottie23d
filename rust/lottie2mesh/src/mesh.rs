@@ -155,6 +155,42 @@ pub fn plan_slots(slots: &[(Cow<'_, Contour>, bool, bool)], spacing: f32) -> Vec
         .collect()
 }
 
+/// 把一组闭合轮廓直接做成 2D 三角化结果（采样点 + 三角形索引）。
+///
+/// 用于图片图层按轨道遮罩裁剪后的贴图平面：不挤出厚度、不生成侧墙，
+/// 顶点保持 `z = 0`，UV 由调用方按顶点在图片局部坐标中的位置换算。
+/// 轮廓按包含关系自动识别孔洞；无法三角化时返回 `None`。
+pub fn triangulate_contours(
+    contours: &[Contour],
+    spacing: f32,
+) -> Option<(Vec<[f32; 2]>, Vec<u32>)> {
+    let mut points: Vec<[f32; 2]> = Vec::new();
+    let mut plans: Vec<SlotPlan> = Vec::new();
+    for contour in contours {
+        if contour.pts.len() < 3 {
+            continue;
+        }
+        let sampled = path::resample(contour, natural_k(contour, spacing), true);
+        if sampled.len() < 3 {
+            continue;
+        }
+        plans.push(SlotPlan {
+            k: sampled.len(),
+            closed: true,
+            hole: false,
+        });
+        points.extend_from_slice(&sampled);
+    }
+    if plans.is_empty() {
+        return None;
+    }
+    let indices = tessellate_fill(&points, &plans);
+    if indices.is_empty() {
+        return None;
+    }
+    Some((points, indices))
+}
+
 /// 用显式槽位和采样计划构建网格（烘焙时发现新拓扑桶会走这条路径）。
 ///
 /// `plans` 会被就地补全 `hole` 标记。仅填充使用 `edge_radius`；描边固定用
