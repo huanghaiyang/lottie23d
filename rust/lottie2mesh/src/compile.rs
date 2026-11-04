@@ -614,28 +614,14 @@ impl<'a> Compiler<'a> {
     /// `cuadrado` 就靠遮罩从矩形变成梯形）。这类遮罩会改变可见轮廓，必须
     /// 与形状层一样逐帧裁剪，否则整块矩形会以“立方体”形态盖住身体。
     fn build_solid_layer(&mut self, id: usize, layer: &'a Layer) {
+        // 静态遮罩只需在参考帧裁一次；带关键帧的遮罩逐帧重建几何。
+        // 遮罩已经并进可见轮廓，因此不再设置 dynamic_mask（避免重复裁剪）。
         let dynamic_mask = shape::mask_clips_geometry(&layer.masks);
-        {
-            let plan = &mut self.plans[id];
-            plan.dynamic_mask = dynamic_mask;
-            plan.geometry_animated = dynamic_mask;
+        if dynamic_mask {
+            self.plans[id].geometry_animated = true;
         }
-        let drawable = solid_drawable(layer);
-        let drawable = if dynamic_mask {
-            // 参考帧按遮罩裁剪，保证参考拓扑与烘焙时一致。
-            let mut result = shape::ShapeResult {
-                drawables: vec![drawable],
-            };
-            shape::apply_mask(&mut result, &layer.masks, self.plans[id].ref_frame);
-            match result.drawables.pop() {
-                Some(clipped) if !clipped.paths.is_empty() => clipped,
-                // 参考帧恰好被遮罩裁空时重新取未裁矩形，网格仍需存在；
-                // 其余帧由逐帧裁剪决定可见性。
-                _ => solid_drawable(layer),
-            }
-        } else {
-            drawable
-        };
+        // 参考帧的可见轮廓已包含遮罩裁剪（见 solid_contour），直接建网格。
+        let drawable = solid_drawable(layer, self.plans[id].ref_frame);
         let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
             return;
         };
@@ -1032,11 +1018,11 @@ impl<'a> Compiler<'a> {
                 let geometry_animated = plan.geometry_animated;
                 // 只动几何或只动样式时按需求值：纯样式动画跳过路径扁平化。
                 let mut evaluated = if geometry_animated {
-                    // 纯色层没有 shapes，几何动画只可能来自遮罩：用其矩形构造
-                    // 唯一 drawable，后面统一按遮罩裁剪。
+                    // 纯色层没有 shapes，几何动画只可能来自遮罩：当前帧的
+                    // 可见轮廓已经包含遮罩裁剪（见 solid_contour）。
                     if plan.layer.ty == 1 {
                         Some(shape::ShapeResult {
-                            drawables: vec![solid_drawable(plan.layer)],
+                            drawables: vec![solid_drawable(plan.layer, local_frame)],
                         })
                     } else {
                         match &plan.follows {
@@ -1946,18 +1932,38 @@ fn plan_world(
     (world, opacity)
 }
 
-/// 把纯色层描述成一个填充 drawable（矩形，局部坐标原点在左上角）。
+/// 纯色层在指定帧的可见轮廓（局部坐标，原点在左上角）。
 ///
-/// 参考帧构建与逐帧烘焙共用同一份构造，保证两者的轮廓槽位完全一致。
-fn solid_drawable(layer: &Layer) -> Drawable {
+/// 带一条受支持遮罩、且遮罩轮廓完全落在纯色矩形内时，可见区域就是遮罩本身
+/// （矩形与遮罩的交集等于遮罩），直接取遮罩轮廓即可，凹多边形也能由 earcut
+/// 正确三角化——`dalek.json` 的 `tardisLigth` 正是 1920×1080 近黑纯色块被
+/// 一条凹的静态遮罩裁成光束。遮罩超出矩形或不受支持时退回整块矩形。
+fn solid_contour(layer: &Layer, frame: f32) -> Contour {
     let sw = layer.solid_width.max(1.0);
     let sh = layer.solid_height.max(1.0);
-    let rgb = parse_hex(&layer.solid_color);
-    let contour = Contour {
+    if shape::mask_supports_layer(&layer.masks) {
+        if let Some(mask) = shape::mask_contour(&layer.masks, frame) {
+            let inside = mask.pts.iter().all(|p| {
+                p[0] >= -1.0 && p[0] <= sw + 1.0 && p[1] >= -1.0 && p[1] <= sh + 1.0
+            });
+            if inside {
+                return mask;
+            }
+        }
+    }
+    Contour {
         // 纯色层局部坐标原点为左上角，尺寸单位为像素。
         pts: vec![[0.0, 0.0], [sw, 0.0], [sw, sh], [0.0, sh]],
         closed: true,
-    };
+    }
+}
+
+/// 把纯色层描述成一个填充 drawable。
+///
+/// 参考帧构建与逐帧烘焙共用同一份构造，保证两者的轮廓槽位完全一致。
+fn solid_drawable(layer: &Layer, frame: f32) -> Drawable {
+    let rgb = parse_hex(&layer.solid_color);
+    let contour = solid_contour(layer, frame);
     Drawable {
         kind: DrawKind::Fill,
         color: [rgb[0], rgb[1], rgb[2], 1.0],

@@ -966,13 +966,19 @@ pub fn style_animated(shapes: &[Value]) -> bool {
 ///
 /// 目前只支持「单条遮罩 + 加法模式（`mode = "a"`）+ 未反相 + 凸轮廓」，
 /// 且遮罩路径带关键帧的情况（例如海星眼睛的眨眼遮罩：矩形上下滑动）。
-/// 静态遮罩仍按旧行为忽略，避免改变现有示例（如 Dalek）的外观。
+/// 形状层的静态遮罩仍按旧行为忽略；纯色层则连静态遮罩一起裁剪（见
+/// [`mask_supports_layer`]），因为整块纯色矩形不裁会盖住整个画面。
 pub fn mask_clips_geometry(masks: &[Value]) -> bool {
-    if masks.len() != 1 {
-        return false;
-    }
-    mask_supported(&masks[0])
-        && masks[0].get("pt").map(is_animated).unwrap_or(false)
+    mask_supports_layer(masks) && masks[0].get("pt").map(is_animated).unwrap_or(false)
+}
+
+/// 图层是否带一条本模块支持的遮罩（不论静态还是带关键帧）。
+///
+/// 纯色层（如 `dalek.json` 的 `tardisLigth`：1920×1080 近黑纯色块被一条静态
+/// 遮罩裁成光束）必须按遮罩裁剪，否则整块矩形会盖住画面；这里只判断“能否
+/// 处理”，是否逐帧重建几何由 [`mask_clips_geometry`] 决定。
+pub fn mask_supports_layer(masks: &[Value]) -> bool {
+    masks.len() == 1 && mask_supported(&masks[0])
 }
 
 /// 按遮罩裁剪当帧的 drawable 轮廓；不支持或求值失败时原样返回。
@@ -1010,14 +1016,27 @@ fn mask_supported(mask: &Value) -> bool {
     mask.get("mode").and_then(Value::as_str).unwrap_or("a") == "a"
 }
 
-/// 求值遮罩路径并展平为凸多边形；不可用（多条、非凸、退化）时返回 `None`。
-fn mask_outline(masks: &[Value], frame: f32) -> Option<Contour> {
+/// 求值遮罩路径并展平为闭合轮廓；允许多边形凹陷（纯色层直接拿它当轮廓）。
+///
+/// 遮罩按定义是闭合区域，因此显式传 `closed = Some(true)`，避免旧文件缺少
+/// 路径内部的 `c` 标记时被当成开口折线。
+pub fn mask_contour(masks: &[Value], frame: f32) -> Option<Contour> {
     if masks.len() != 1 || !mask_supported(&masks[0]) {
         return None;
     }
-    let data = path::eval_path_property(masks[0].get("pt")?, frame, None)?;
-    let contour = path::flatten_path(&data);
-    if contour.pts.len() < 3 || !is_convex(&contour.pts) {
+    let data = path::eval_path_property(masks[0].get("pt")?, frame, Some(true))?;
+    let mut contour = path::flatten_path(&data);
+    contour.closed = true;
+    if contour.pts.len() < 3 {
+        return None;
+    }
+    Some(contour)
+}
+
+/// 求值遮罩路径并展平为凸多边形；不可用（多条、非凸、退化）时返回 `None`。
+fn mask_outline(masks: &[Value], frame: f32) -> Option<Contour> {
+    let contour = mask_contour(masks, frame)?;
+    if !is_convex(&contour.pts) {
         return None;
     }
     Some(contour)
