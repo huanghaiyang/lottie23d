@@ -103,7 +103,13 @@ interface Entry {
   data: MeshModel;
   mesh: THREE.Mesh;
   geometry: THREE.BufferGeometry;
-  material: THREE.MeshLambertMaterial;
+  material: THREE.MeshLambertMaterial | THREE.MeshBasicMaterial;
+  /** 是否为图片贴图网格（kind = 2）；贴图加载完成前不绘制。 */
+  textured: boolean;
+  /** 贴图是否已加载完成（缺失 / 失败时保持 false）。 */
+  textureReady: boolean;
+  /** 贴图加载失败（404 / 解码失败）；之后保持隐藏。 */
+  textureFailed: boolean;
   /** 静态变换层的固定基矩阵（第 0 帧拷贝，避免每帧从轨道读取）。 */
   base: THREE.Matrix4;
   /** 逐帧变换轨道（frameCount × 16，列主序）；无轨道时为 null。 */
@@ -448,11 +454,44 @@ export class Stage {
       const position = new THREE.BufferAttribute(positions, 3);
       position.setUsage(positionsAnimated ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
       geometry.setAttribute('position', position);
+      // 渐变网格的逐顶点 RGBA（v3）：RGB 按 sRGB 一次性转成线性空间，
+      // alpha 直接沿用（透明度 stop 的采样结果）。itemSize 4 会触发
+      // three.js 的 USE_COLOR_ALPHA，顶点 alpha 与材质 alpha 相乘。
+      let vertexAlpha = false;
+      if (data.vertexColors) {
+        const count = data.vertexCount;
+        const converted = new Float32Array(count * 4);
+        const swatch = new THREE.Color();
+        for (let i = 0; i < count; i += 1) {
+          swatch.setRGB(
+            data.vertexColors[i * 4],
+            data.vertexColors[i * 4 + 1],
+            data.vertexColors[i * 4 + 2],
+            THREE.SRGBColorSpace,
+          );
+          converted[i * 4] = swatch.r;
+          converted[i * 4 + 1] = swatch.g;
+          converted[i * 4 + 2] = swatch.b;
+          converted[i * 4 + 3] = data.vertexColors[i * 4 + 3];
+          if (converted[i * 4 + 3] < 0.999) {
+            vertexAlpha = true;
+          }
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(converted, 4));
+      }
       // 每个拓扑桶一份索引属性；默认绑定桶 0，逐帧按 frameBuckets 切换。
       const indexAttributes = data.buckets.map(
         (bucket) => new THREE.BufferAttribute(bucket.indices, 1),
       );
       geometry.setIndex(indexAttributes[0]);
+      // 图片网格（v4）：携带逐顶点 UV，材质使用不受光照影响的贴图。
+      const textured = data.texture != null && data.uvs != null;
+      if (data.uvs != null) {
+        geometry.setAttribute(
+          'uv',
+          new THREE.BufferAttribute(new Float32Array(data.uvs), 2),
+        );
+      }
 
       // 变换轨道：同层共享；track 为 null 时退化为单位矩阵（base 保持默认）。
       const track = model.transforms[data.transformIndex] ?? null;
@@ -473,16 +512,25 @@ export class Stage {
         data.color[2],
         THREE.SRGBColorSpace,
       );
-      const material = new THREE.MeshLambertMaterial({
-        color: baseColor,
-        // 平面着色：挤出薄板的每个面亮度独立，轮廓更“硬”。
-        flatShading: true,
-        side: THREE.DoubleSide,
-        // 常量且不透明的颜色直接关闭透明混合，省掉排序与 overdraw。
-        transparent: colors != null || alpha < 0.999,
-        opacity: Math.max(0, Math.min(1, alpha)),
-      });
-
+      const material: THREE.MeshLambertMaterial | THREE.MeshBasicMaterial = textured
+        ? // 图片贴图：颜色完全由纹理决定，不参与光照；alpha 仍来自图层透明度。
+          new THREE.MeshBasicMaterial({
+            color: 0xffffff,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: Math.max(0, Math.min(1, alpha)),
+          })
+        : new THREE.MeshLambertMaterial({
+            color: baseColor,
+            // 渐变网格：颜色来自顶点属性，uniform 颜色只保留 alpha。
+            vertexColors: data.vertexColors != null,
+            // 平面着色：挤出薄板的每个面亮度独立，轮廓更“硬”。
+            flatShading: true,
+            side: THREE.DoubleSide,
+            // 常量且不透明的颜色直接关闭透明混合，省掉排序与 overdraw。
+            transparent: colors != null || alpha < 0.999 || vertexAlpha,
+            opacity: Math.max(0, Math.min(1, alpha)),
+          });
       // 关闭全部矩阵自动更新：世界矩阵由 applyFrame 直接写入。
       // 同时关闭视锥剔除，避免整批网格在相机边缘被跳过（模型尺寸已归一化）。
       const mesh = new THREE.Mesh(geometry, material);
@@ -493,7 +541,8 @@ export class Stage {
       mesh.renderOrder = 0;
       // alpha 低于 0.4% 视为完全不可见，直接不绘制。
       const staticVisible = alpha >= 0.004;
-      mesh.visible = staticVisible;
+      // 图片网格要等纹理加载完成才显示，避免闪出一块白板。
+      mesh.visible = textured ? false : staticVisible;
       this.scene.add(mesh);
 
       // 静态基矩阵：取轨道第 0 帧；无常量轨道时保持单位矩阵。
@@ -507,6 +556,9 @@ export class Stage {
         mesh,
         geometry,
         material,
+        textured,
+        textureReady: false,
+        textureFailed: false,
         base,
         track,
         transformStatic,
@@ -521,6 +573,29 @@ export class Stage {
         // 同层共面网格按绘制顺序微移：后画的（stackIndex 更大）更靠前。
         stackOffset: stackIndex * stackStep,
       });
+      // 图片纹理异步加载；加载完成前保持隐藏。404 / 解码失败时永久隐藏，
+      // 而不是显示一块白板（资源缺失时该图层优雅跳过）。
+      if (textured) {
+        const entry = this.entries[this.entries.length - 1];
+        const texture = new THREE.TextureLoader().load(
+          data.texture as string,
+          (loaded) => {
+            loaded.colorSpace = THREE.SRGBColorSpace;
+            entry.textureReady = true;
+            this.applyFrame(this.frameIndex);
+            this.dirty = true;
+          },
+          undefined,
+          () => {
+            entry.textureFailed = true;
+            entry.mesh.visible = false;
+            this.dirty = true;
+          },
+        );
+        texture.colorSpace = THREE.SRGBColorSpace;
+        material.map = texture;
+        material.needsUpdate = true;
+      }
       this.nodes.push({
         id,
         name: data.name || `节点 ${id + 1}`,
@@ -996,6 +1071,12 @@ export class Stage {
         continue;
       }
 
+      // 图片贴图尚未就绪（仍在加载或已失败）时保持隐藏。
+      if (entry.textured && !entry.textureReady) {
+        mesh.visible = false;
+        continue;
+      }
+
       // 逐帧颜色：每帧 4 个 float（RGBA），alpha 过低直接整帧不可见。
       if (colors != null) {
         const colorBase = frame * 4;
@@ -1069,6 +1150,8 @@ export class Stage {
       this.scene.remove(entry.mesh);
       entry.geometry.dispose();
       entry.material.dispose();
+      // 图片网格的纹理由 TextureLoader 创建，需要一并释放。
+      entry.material.map?.dispose();
     }
     this.entries.length = 0;
     this.nodes.length = 0;
@@ -1165,6 +1248,10 @@ export class Stage {
   private syncGlowMeshes(): void {
     const wanted = new Set<number>();
     for (let id = 0; id < this.entries.length; id += 1) {
+      // 图片贴图网格没有可发光的纯色几何，跳过以免出现白色外壳。
+      if (this.entries[id].textured) {
+        continue;
+      }
       if (this.isNodeGlowEnabled(id)) {
         wanted.add(id);
       }

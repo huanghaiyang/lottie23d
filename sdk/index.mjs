@@ -19,8 +19,8 @@
 const MAGIC = 0x4c323344;
 /** 文件头固定 96 字节（字段偏移见 parseModel 的注释表）。 */
 const HEADER_SIZE = 96;
-/** 每条 mesh record 固定 96 字节。 */
-const RECORD_SIZE = 96;
+/** 每条 mesh record 固定 112 字节（v4 新增 UV 与纹理地址）。 */
+const RECORD_SIZE = 112;
 
 /** 运行环境判定：Node 下存在 process.versions.node，浏览器下没有。 */
 const isNode =
@@ -107,7 +107,7 @@ function readString(memory, pointer, length) {
  *
  * 文件头（HEADER_SIZE = 96 字节）字段偏移：
  *   +0  u32 magic          `0x4c323344`（"L23D"）
- *   +4  u32 version        格式版本，当前 v2（新增拓扑分桶）
+ *   +4  u32 version        格式版本，当前 v4（新增纹理图片网格）
  *   +8  f32 width          画布宽（Lottie px）
  *   +12 f32 height         画布高（Lottie px）
  *   +16 f32 frameRate      文档帧率
@@ -177,7 +177,7 @@ export function parseModel(bytes) {
     transforms[index] = new Float32Array(buffer.buffer, buffer.byteOffset + offset, transformFloats);
   }
 
-  // mesh record 区从 HEADER_SIZE 开始，每条 96 字节，字段偏移如下：
+  // mesh record 区从 HEADER_SIZE 开始，每条 112 字节，字段偏移如下：
   //   +0  u32 kind                0 = 填充（fill），1 = 描边（stroke）
   //   +4  u32 flags               bit0 逐帧顶点 / bit1 逐帧颜色 / bit2 frameOffsets / bit3 拓扑分桶
   //   +8  f32 color[4]            参考帧 RGBA（sRGB，0..1）
@@ -197,6 +197,10 @@ export function parseModel(bytes) {
   //   +80 u32 bucketTableOffset   桶表起始（每项 16B）
   //   +84 u32 frameOffsetsOffset  逐帧顶点起点表（frameCount + 1 个 u32，单位为 float）
   //   +88 u32 frameBucketOffset   逐帧桶下标表（frameCount 个 u8）
+  //   +92 u32 vertexColorsOffset  逐顶点 RGBA 起始（v3，vertexCount × 4 个 f32）
+  //   +96 u32 uvOffset            逐顶点 UV 起始（v4，vertexCount × 2 个 f32；0 = 无）
+  //   +100 u32 textureOffset      纹理地址（UTF-8）起始（v4；0 = 无）
+  //   +104 u32 textureLen         纹理地址字节长度
   const meshes = new Array(meta.meshCount);
   for (let index = 0; index < meta.meshCount; index += 1) {
     const record = HEADER_SIZE + index * RECORD_SIZE;
@@ -219,6 +223,24 @@ export function parseModel(bytes) {
     const bucketTableOffset = view.getUint32(record + 80, true);
     const frameOffsetsOffset = view.getUint32(record + 84, true);
     const frameBucketOffset = view.getUint32(record + 88, true);
+    // flags bit4（16）：v3 渐变网格的逐顶点 RGBA。
+    const vertexColorsOffset = view.getUint32(record + 92, true);
+    const vertexColors =
+      flags & 16 && vertexColorsOffset
+        ? new Float32Array(
+            buffer.buffer,
+            buffer.byteOffset + vertexColorsOffset,
+            vertexCount * 4,
+          )
+        : null;
+    // v4 图片网格：逐顶点 UV + 纹理地址（缺失时为 null）。
+    const uvOffset = view.getUint32(record + 96, true);
+    const uvs = uvOffset
+      ? new Float32Array(buffer.buffer, buffer.byteOffset + uvOffset, vertexCount * 2)
+      : null;
+    const textureOffset = view.getUint32(record + 100, true);
+    const textureLen = view.getUint32(record + 104, true);
+    const texture = textureLen ? readString(buffer, textureOffset, textureLen) : null;
 
     // 参考帧顶点：xyz 交错，共 vertexCount × 3 个 float。
     const positions = new Float32Array(
@@ -314,6 +336,9 @@ export function parseModel(bytes) {
       buckets,
       indices,
       colors,
+      vertexColors,
+      uvs,
+      texture,
       transformIndex: view.getUint32(record + 56, true),
       renderOrder: view.getUint32(record + 60, true),
       name,

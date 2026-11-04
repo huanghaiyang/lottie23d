@@ -106,9 +106,15 @@ pub struct Layer {
     /// 是否 3D 图层。
     #[serde(default)]
     pub ddd: i64,
-    /// 文本图层类型（本转换器忽略文本）。
+    /// 轨道遮罩类型：0 无、1 alpha、2 alpha 反转、3 luma、4 luma 反转。
+    /// 非 0 表示该图层被同合成内的遮罩层（`td != 0` 的图层）裁剪。
+    /// 本转换器暂不支持轨道遮罩，按无遮罩处理。
     #[serde(default)]
     pub tt: i64,
+    /// 遮罩目标层标记：非 0 表示该图层只作为轨道遮罩的 alpha 来源，
+    /// AE / lottie-web 从不直接绘制它。
+    #[serde(default)]
+    pub td: i64,
     /// 纯色层颜色（`#rrggbb`）。
     #[serde(default, rename = "sc")]
     pub solid_color: String,
@@ -143,6 +149,15 @@ pub struct Asset {
     /// 资源帧率（当前未使用）。
     #[serde(default)]
     pub fr: f32,
+    /// 图片资源的相对目录（`u`），与 `p` 拼接成纹理地址。
+    #[serde(default)]
+    pub u: String,
+    /// 图片资源的文件名（`p`）；`e = 1` 时是内嵌的 data URI。
+    #[serde(default)]
+    pub p: String,
+    /// 图片是否内嵌为 data URI。
+    #[serde(default, rename = "e")]
+    pub embedded: i64,
 }
 
 impl Lottie {

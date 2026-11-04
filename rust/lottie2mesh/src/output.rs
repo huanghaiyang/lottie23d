@@ -1,13 +1,14 @@
-//! 二进制模型编码器（格式版本 2）。
+//! 二进制模型编码器（格式版本 4）。
 //!
 //! 所有偏移均为从 blob 起始处算起的**字节偏移**，整数与浮点一律小端。
 //!
 //! ```text
 //! header（96 字节）
-//! mesh records（每个 96 字节）
+//! mesh records（每个 112 字节）
 //! transform tracks（每条 frame_count * 16 个 f32）
 //! mesh 数据块：静态顶点、逐帧顶点、各桶 indices、颜色轨迹、
-//!               桶表、逐帧顶点偏移、逐帧桶 id、名称
+//!               桶表、逐帧顶点偏移、逐帧桶 id、逐顶点 RGBA、
+//!               UV、纹理地址、名称
 //! ```
 //!
 //! 播放端直接用这些缓冲创建 TypedArray，运行时无需 JSON 反序列化。
@@ -19,9 +20,9 @@ use crate::compile::Compiled;
 /// header 固定字节数。
 const HEADER_SIZE: usize = 96;
 /// 单个 mesh record 固定字节数（字段偏移见 [`encode`]）。
-const RECORD_SIZE: usize = 96;
+const RECORD_SIZE: usize = 112;
 /// 当前格式版本（`l2d_version` 返回同一值）。
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 
 /// 把编译结果序列化为 `.l2d3` 二进制。
 ///
@@ -86,6 +87,7 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         //   48 基础 indices 偏移、52 颜色轨迹偏移、56 变换轨迹下标
         //   60 渲染顺序、64 采样点数、68 名称偏移、72 名称长度
         //   76 桶数量、80 桶表偏移、84 逐帧偏移表、88 逐帧桶 id
+        //   92 逐顶点 RGBA、96 逐顶点 UV、100 纹理偏移、104 纹理长度
         put_u32(&mut blob, record, mesh.kind as u32);
         // flags 位：bit0 有逐帧顶点、bit1 有颜色轨迹、
         // bit2 有 frame_offsets、bit3 使用多桶（>1 套 indices）。
@@ -99,6 +101,10 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         let bucketized = mesh.buckets.len() > 1;
         if bucketized {
             flags |= 8;
+        }
+        // bit4：存在逐顶点 RGB（渐变网格）。
+        if mesh.vertex_colors.is_some() {
+            flags |= 16;
         }
         put_u32(&mut blob, record + 4, flags);
         put_f32(&mut blob, record + 8, mesh.static_color[0]);
@@ -128,6 +134,50 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
             data.extend_from_slice(&value.to_le_bytes());
         }
         put_u32(&mut blob, record + 40, positions_offset);
+
+        // 逐顶点 RGBA（v3）：长度固定为 vertex_count × 4，按顶点数对齐，
+        // 便于播放端直接作为 BufferAttribute 上传。缺失部分补白（RGBA 1）。
+        let vertex_colors_offset = match &mesh.vertex_colors {
+            Some(colors) => {
+                let offset = (meta_size + data.len()) as u32;
+                for index in 0..vertex_count as usize * 4 {
+                    let value = colors.get(index).copied().unwrap_or(1.0);
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                offset
+            }
+            None => 0,
+        };
+        put_u32(&mut blob, record + 92, vertex_colors_offset);
+
+        // 图片网格（v4）：逐顶点 UV（vertexCount × 2 个 f32），缺失补 0。
+        let uv_offset = match &mesh.uvs {
+            Some(uvs) => {
+                let offset = (meta_size + data.len()) as u32;
+                for index in 0..vertex_count as usize * 2 {
+                    let value = uvs.get(index).copied().unwrap_or(0.0);
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                offset
+            }
+            None => 0,
+        };
+        put_u32(&mut blob, record + 96, uv_offset);
+
+        // 纹理地址（UTF-8，按 4 字节对齐）；长度为 0 表示纯色 / 渐变网格。
+        let (texture_offset, texture_len) = match &mesh.texture {
+            Some(texture) => {
+                let offset = (meta_size + data.len()) as u32;
+                let bytes = texture.as_bytes();
+                data.extend_from_slice(bytes);
+                let padding = (4 - (bytes.len() % 4)) % 4;
+                data.extend(std::iter::repeat(0u8).take(padding));
+                (offset, bytes.len() as u32)
+            }
+            None => (0, 0),
+        };
+        put_u32(&mut blob, record + 100, texture_offset);
+        put_u32(&mut blob, record + 104, texture_len);
 
         // 逐帧顶点连续打包；读取时以 frame_offsets 的 float 下标切片。
         let frame_positions_offset = if let Some(frames) = &mesh.frame_positions {

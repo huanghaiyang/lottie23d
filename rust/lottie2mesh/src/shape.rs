@@ -2,7 +2,7 @@
 //!
 //! 模块职责：
 //! * 解析 `gr`（组）、`sh`（路径）、`rc` / `el` / `sr`（图元）、`tm`（trim）、
-//!   `fl` / `st`（填充/描边）等节点；
+//!   `mm`（合并路径）、`fl` / `st`（填充/描边）等节点；
 //! * 把组变换直接烘焙进轮廓坐标（`Affine`），播放期无需再做 2D 变换；
 //! * 按图层解析 AE「顶点跟随空对象」表达式，把路径顶点替换为空对象位置；
 //! * 检测几何/样式是否随时间变化，供编译器决定是否需要逐帧烘焙。
@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::boolops::{self, BoolOp};
 use crate::path::{self, Contour};
 use crate::prop;
 
@@ -47,6 +48,127 @@ pub struct PathItem {
     pub trim: Option<TrimSpec>,
 }
 
+/// 线性/径向渐变的求值规格。
+///
+/// 端点与 stop 都取自 Lottie 的 `gf` / `gs` 节点；端点坐标已随组变换烘焙，
+/// 因此与三角化后的顶点处于同一坐标系，可直接按顶点位置取色。
+#[derive(Clone, Debug)]
+pub struct GradientSpec {
+    /// 渐变起点（线性渐变的 0% / 径向渐变的圆心）。
+    pub start: [f32; 2],
+    /// 渐变终点（线性渐变的 100% / 径向渐变的半径端点）。
+    pub end: [f32; 2],
+    /// Lottie 的 `t`：1 线性、2 径向。
+    pub kind: u8,
+    /// `(偏移 0..1, RGB 0..1)`，已按偏移升序排列。
+    pub stops: Vec<(f32, [f32; 3])>,
+    /// `(偏移 0..1, alpha 0..1)`；为空表示不透明。
+    /// Lottie 把透明度 stop 成对紧跟在颜色 stop 之后。
+    pub alpha_stops: Vec<(f32, f32)>,
+}
+
+impl GradientSpec {
+    /// 把 2D 位置换算成渐变参数 `t`（0..1）。
+    ///
+    /// 线性渐变把点投影到 start→end 轴；径向渐变用点到圆心的距离
+    /// 除以半径。落在两端之外时自然被 clamp 到 0 / 1。
+    pub fn param(&self, p: [f32; 2]) -> f32 {
+        let dx = self.end[0] - self.start[0];
+        let dy = self.end[1] - self.start[1];
+        let raw = if self.kind == 2 {
+            // 径向：半径为 0 时整体取首色。
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-6 {
+                0.0
+            } else {
+                let px = p[0] - self.start[0];
+                let py = p[1] - self.start[1];
+                (px * px + py * py).sqrt() / len
+            }
+        } else {
+            // 线性：在渐变轴上的投影比例。
+            let len2 = dx * dx + dy * dy;
+            if len2 < 1e-6 {
+                0.0
+            } else {
+                ((p[0] - self.start[0]) * dx + (p[1] - self.start[1]) * dy) / len2
+            }
+        };
+        raw.clamp(0.0, 1.0)
+    }
+
+    /// 按 2D 位置取渐变颜色（RGB，0..1）。
+    pub fn color_at(&self, p: [f32; 2]) -> [f32; 3] {
+        self.rgb_at(self.param(p))
+    }
+
+    /// 按 2D 位置取渐变透明度（0..1）；无透明度 stop 时为 1。
+    pub fn alpha_at(&self, p: [f32; 2]) -> f32 {
+        if self.alpha_stops.is_empty() {
+            return 1.0;
+        }
+        self.alpha_at_t(self.param(p))
+    }
+
+    /// 按渐变参数取颜色，投影落在 stop 范围之外时取首/末 stop，
+    /// 与 lottie-web 一致。
+    fn rgb_at(&self, t: f32) -> [f32; 3] {
+        if self.stops.is_empty() {
+            return [1.0, 1.0, 1.0];
+        }
+        // stop 数量很少，直接线性扫描（无逐帧分配）。
+        let mut previous = self.stops[0];
+        if t <= previous.0 {
+            return previous.1;
+        }
+        for stop in self.stops.iter().skip(1) {
+            if t <= stop.0 {
+                let span = (stop.0 - previous.0).max(1e-6);
+                let k = (t - previous.0) / span;
+                return [
+                    previous.1[0] + (stop.1[0] - previous.1[0]) * k,
+                    previous.1[1] + (stop.1[1] - previous.1[1]) * k,
+                    previous.1[2] + (stop.1[2] - previous.1[2]) * k,
+                ];
+            }
+            previous = *stop;
+        }
+        previous.1
+    }
+
+    /// 按渐变参数取透明度 stop 的插值。
+    fn alpha_at_t(&self, t: f32) -> f32 {
+        let mut previous = self.alpha_stops[0];
+        if t <= previous.0 {
+            return previous.1;
+        }
+        for stop in self.alpha_stops.iter().skip(1) {
+            if t <= stop.0 {
+                let span = (stop.0 - previous.0).max(1e-6);
+                let k = (t - previous.0) / span;
+                return previous.1 + (stop.1 - previous.1) * k;
+            }
+            previous = *stop;
+        }
+        previous.1
+    }
+
+    /// 所有 stop 颜色的平均值，用作无法逐顶点着色时的兜底色。
+    pub fn average_rgb(&self) -> [f32; 3] {
+        if self.stops.is_empty() {
+            return [0.55, 0.62, 0.9];
+        }
+        let mut sum = [0.0f32; 3];
+        for (_, rgb) in &self.stops {
+            sum[0] += rgb[0];
+            sum[1] += rgb[1];
+            sum[2] += rgb[2];
+        }
+        let n = self.stops.len() as f32;
+        [sum[0] / n, sum[1] / n, sum[2] / n]
+    }
+}
+
 /// 一个填充/描边绘制项，持有它作用的所有路径。
 #[derive(Clone, Debug)]
 pub struct Drawable {
@@ -64,6 +186,8 @@ pub struct Drawable {
     /// 斜接限制倍数（Lottie `ml`）。
     pub miter: f32,
     pub name: String,
+    /// 渐变规格；纯色填充/描边为 `None`。
+    pub gradient: Option<GradientSpec>,
     pub paths: Vec<PathItem>,
 }
 
@@ -526,6 +650,38 @@ fn eval_group_items(
                     path.trim = Some(spec);
                 }
             }
+            "mm" => {
+                // 合并路径：作用于本组内位于它上方（数组更靠前）的全部路径，
+                // 包括子组未被消费而冒泡上来的路径。
+                if hidden(item) || !geometry || active.len() < 2 {
+                    continue;
+                }
+                let mode = item.get("mm").and_then(Value::as_i64).unwrap_or(1);
+                let op = match mode {
+                    3 => BoolOp::Subtract,
+                    4 => BoolOp::Intersect,
+                    5 => BoolOp::Exclude,
+                    // 1 Merge / 2 Add 及未知取值统一按并集处理。
+                    _ => BoolOp::Union,
+                };
+                let contours: Vec<Contour> =
+                    active.iter().map(|path| path.contour.clone()).collect();
+                let merged = boolops::combine(&contours, op);
+                // 并集算空只可能来自退化几何，此时保留原路径更稳妥；
+                // 相交/相减算空则代表区域确实被消掉，应如实清空。
+                let empty_fallback = op == BoolOp::Union;
+                if merged.is_empty() && empty_fallback {
+                    continue;
+                }
+                // 合并结果是一条新路径，原有的 trim 信息不再适用。
+                active = merged
+                    .into_iter()
+                    .map(|contour| PathItem {
+                        contour,
+                        trim: None,
+                    })
+                    .collect();
+            }
             "fl" | "gf" => {
                 if hidden(item) {
                     continue;
@@ -573,6 +729,12 @@ fn eval_group_items(
             for path in drawable.paths.iter_mut() {
                 transform_contour(&mut path.contour, transform);
             }
+            // 渐变端点与路径同属本组坐标系，必须一起变换，否则组内缩放/
+            // 旋转后渐变会错位（lottie 的 `s` / `e` 本身不带 tr）。
+            if let Some(gradient) = drawable.gradient.as_mut() {
+                gradient.start = transform.apply(gradient.start);
+                gradient.end = transform.apply(gradient.end);
+            }
         }
         for path in local.unowned.iter_mut() {
             transform_contour(&mut path.contour, transform);
@@ -616,10 +778,14 @@ fn normalize_color(color: &mut [f32; 4]) {
 ///
 /// 颜色分量、样式透明度均归一化为 0..1；描边宽度单位为像素。
 fn build_drawable(kind: DrawKind, style: &Value, frame: f32, paths: &[PathItem]) -> Drawable {
-    let (color, opacity) = if style.get("ty").and_then(Value::as_str) == Some("gf")
-        || style.get("ty").and_then(Value::as_str) == Some("gs")
-    {
-        gradient_color(style, frame)
+    let is_gradient = style.get("ty").and_then(Value::as_str) == Some("gf")
+        || style.get("ty").and_then(Value::as_str) == Some("gs");
+    let spec = if is_gradient { gradient_spec(style, frame) } else { None };
+    let (color, opacity) = if is_gradient {
+        // 颜色只作为兜底（逐顶点渐变不可用时），取 stop 平均值。
+        let opacity = prop::eval_scalar(style, "o", frame, 100.0) / 100.0;
+        let rgb = spec.as_ref().map(GradientSpec::average_rgb).unwrap_or([0.55, 0.62, 0.9]);
+        ([rgb[0], rgb[1], rgb[2], 1.0], opacity)
     } else {
         let c = prop::eval_in(style, "c", frame, &[0.0, 0.0, 0.0, 1.0]);
         let alpha = c.get(3).copied().unwrap_or(1.0);
@@ -653,51 +819,74 @@ fn build_drawable(kind: DrawKind, style: &Value, frame: f32, paths: &[PathItem])
             .and_then(Value::as_str)
             .unwrap_or("shape")
             .to_string(),
+        gradient: spec,
         paths: paths.to_vec(),
     }
 }
 
-/// 用多个颜色 stop 的平均值近似填充渐变。
+/// 解析 `gf` / `gs` 的渐变数据。
 ///
-/// 几何、深度和动画仍来自精确的矢量路径，只有颜色被简化；返回 RGBA 与
-/// 样式透明度（均 0..1）。渐变缺少有效 stop 时退回偏蓝的默认色。
-fn gradient_color(style: &Value, frame: f32) -> ([f32; 4], f32) {
-    let opacity = prop::eval_scalar(style, "o", frame, 100.0) / 100.0;
-    let mut rgb = [0.55f32, 0.62, 0.9];
-    let gradient = style.get("g");
-    if let Some(g) = gradient {
-        let k = g.get("k").unwrap_or(g);
-        let value = if k.get("a").and_then(Value::as_i64).unwrap_or(0) != 0 {
-            crate::prop::eval(k, frame)
-        } else {
-            let stops = k.get("k").unwrap_or(k);
-            let mut sum = [0.0f32; 3];
-            let mut count = 0.0f32;
-            if let Some(list) = stops.as_array() {
-                for stop in list {
-                    if let Some(s) = stop.get("s").and_then(Value::as_array) {
-                        if s.len() >= 3 {
-                            sum[0] += s[0].as_f64().unwrap_or(0.0) as f32;
-                            sum[1] += s[1].as_f64().unwrap_or(0.0) as f32;
-                            sum[2] += s[2].as_f64().unwrap_or(0.0) as f32;
-                            count += 1.0;
-                        }
-                    }
-                }
-            }
-            if count > 0.0 {
-                vec![sum[0] / count, sum[1] / count, sum[2] / count]
-            } else {
-                Vec::new()
-            }
-        };
-        if value.len() >= 3 {
-            rgb = [value[0], value[1], value[2]];
+/// 颜色 stop 在 `g.k.k` 里按 `g.p × 4` 扁平存放（`偏移, r, g, b`），
+/// 其后可能跟 `(偏移, alpha)` 的透明度 stop（本转换器暂不处理）。
+/// 端点 `s` / `e` 与类型 `t` 是样式节点上的兄弟字段，属于形状组坐标系，
+/// 组的 `tr` 会在 [`eval_group_items`] 末尾一并烘焙到端点里。
+fn gradient_spec(style: &Value, frame: f32) -> Option<GradientSpec> {
+    let g = style.get("g")?;
+    let k = g.get("k").unwrap_or(g);
+    // 动画渐变按当前帧求值，得到该帧的扁平 stop 数组。
+    let flat: Vec<f32> = if k.get("a").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        crate::prop::eval(k, frame)
+    } else {
+        k.get("k")
+            .unwrap_or(k)
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_f64)
+                    .map(|value| value as f32)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let declared = g.get("p").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let stop_count = if declared > 0 { declared } else { flat.len() / 4 };
+    let mut stops = Vec::with_capacity(stop_count);
+    for index in 0..stop_count {
+        let base = index * 4;
+        if base + 3 >= flat.len() {
+            break;
         }
+        let offset = flat[base].clamp(0.0, 1.0);
+        stops.push((
+            offset,
+            [
+                flat[base + 1].clamp(0.0, 1.0),
+                flat[base + 2].clamp(0.0, 1.0),
+                flat[base + 3].clamp(0.0, 1.0),
+            ],
+        ));
     }
-    let mut rgba = [rgb[0], rgb[1], rgb[2], 1.0];
-    normalize_color(&mut rgba);
-    (rgba, opacity)
+    if stops.is_empty() {
+        return None;
+    }
+    stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // 颜色 stop 之后的剩余数值是成对的 `(偏移, alpha)` 透明度 stop。
+    let mut alpha_stops = Vec::new();
+    let mut index = stop_count * 4;
+    while index + 1 < flat.len() {
+        alpha_stops.push((flat[index].clamp(0.0, 1.0), flat[index + 1].clamp(0.0, 1.0)));
+        index += 2;
+    }
+    alpha_stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let start = prop::eval_in(style, "s", frame, &[0.0, 0.0]);
+    let end = prop::eval_in(style, "e", frame, &[1.0, 0.0]);
+    Some(GradientSpec {
+        start: [start.first().copied().unwrap_or(0.0), start.get(1).copied().unwrap_or(0.0)],
+        end: [end.first().copied().unwrap_or(1.0), end.get(1).copied().unwrap_or(0.0)],
+        kind: style.get("t").and_then(Value::as_i64).unwrap_or(1) as u8,
+        stops,
+        alpha_stops,
+    })
 }
 
 /// 求值 `rc` 矩形节点：位置、尺寸、圆角均以像素为单位，`d` 控制绕向。

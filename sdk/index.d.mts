@@ -45,7 +45,7 @@ export interface MeshBucket {
 export interface MeshModel {
   /** 在 `meshes` 数组中的下标；排序后同时也是节点 id。 */
   index: number;
-  /** 网格类型：0 = 填充（fill），1 = 描边（stroke）。 */
+  /** 网格类型：0 = 填充（fill），1 = 描边（stroke），2 = 图片贴图。 */
   kind: number;
   /** 是否带逐帧顶点轨道（存在 `framePositions`）。 */
   animated: boolean;
@@ -75,6 +75,15 @@ export interface MeshModel {
   indices: Uint32Array;
   /** 逐帧颜色 RGBA（帧数 × 4，sRGB），颜色恒定时为 null。 */
   colors: Float32Array | null;
+  /**
+   * 逐顶点 RGBA（长度 = vertexCount × 4，RGB 为 sRGB、alpha 为透明度 stop 采样值），
+   * 仅渐变网格存在。有值时 `color` 的 RGB 恒为 1，最终颜色 = 顶点色 × `color`。
+   */
+  vertexColors: Float32Array | null;
+  /** 逐顶点 UV（长度 = vertexCount × 2），仅图片网格存在。 */
+  uvs: Float32Array | null;
+  /** 图片纹理地址（`u + p` 或 data URI），仅图片网格存在。 */
+  texture: string | null;
   /** 引用的变换轨道下标（对应 `Model.transforms`）。 */
   transformIndex: number;
   /** three.js 绘制顺序（= ((depth + 1) * 10000) + 层内下标）。 */
@@ -103,7 +112,7 @@ export interface NodeModel {
 
 /** 解析后的完整模型：header 元信息 + 变换轨道 + 网格 + 节点列表。 */
 export interface Model {
-  /** `.l2d3` 格式版本，当前为 2（拓扑分桶）。 */
+  /** `.l2d3` 格式版本，当前为 4（新增图片贴图）。 */
   version: number;
   /** Lottie 画布宽（px）。 */
   width: number;

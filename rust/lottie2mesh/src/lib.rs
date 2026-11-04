@@ -32,6 +32,7 @@
 //!
 //! 整个转换是确定性的：昂贵的几何计算只在转换期做一次，播放期无需再分配。
 
+pub mod boolops;
 pub mod compile;
 pub mod lottie;
 pub mod mesh;
@@ -239,8 +240,8 @@ pub extern "C" fn l2d_error_len() -> u32 {
     guard.error.len() as u32
 }
 
-/// ABI 版本号，导出接口变化时需要递增；当前 2 与二进制格式版本一致。
+/// ABI 版本号，导出接口变化时需要递增；当前 4 与二进制格式版本一致。
 #[no_mangle]
 pub extern "C" fn l2d_version() -> u32 {
-    2
+    4
 }

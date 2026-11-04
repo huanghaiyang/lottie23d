@@ -63,6 +63,13 @@ function isVisible(id: number): boolean {
   return props.visible[id] !== false;
 }
 
+/** 网格类型标签：0 填充、1 描边、2 图片贴图。 */
+function nodeTypeLabel(kind: number): string {
+  if (kind === 0) return '填充';
+  if (kind === 2) return '图片';
+  return '描边';
+}
+
 // ---- 拖拽重排 ----
 /** 正在拖拽的节点 id；null 表示没有拖拽。 */
 const dragId = ref<number | null>(null);
@@ -251,7 +258,7 @@ function onNodeClick(id: number, event: MouseEvent): void {
               @click.stop="emit('toggle-node-glow', node.id, $event.altKey)"
             ></span>
             <span class="node-name" :title="node.name">{{ node.name }}</span>
-            <span class="node-type">{{ node.kind === 0 ? '填充' : '描边' }}</span>
+            <span class="node-type">{{ nodeTypeLabel(node.kind) }}</span>
             <button
               class="node-vis"
               :class="{ 'is-off': !isVisible(node.id) }"

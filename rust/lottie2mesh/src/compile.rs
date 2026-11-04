@@ -25,10 +25,13 @@ use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
+use std::rc::Rc;
+
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::lottie::{Layer, Lottie};
+use crate::boolops::{self, BoolOp};
+use crate::lottie::{Asset, Layer, Lottie};
 use crate::mesh::{self, MeshSurface, SlotPlan};
 use crate::path::{Contour, PathData, PathLengths};
 use crate::prop;
@@ -92,10 +95,17 @@ pub struct CompiledMesh {
     pub indices: Vec<u32>,
     /// 逐帧颜色 RGBA；为空表示使用 `static_color`。
     pub color_track: Vec<f32>,
+    /// 逐顶点 RGBA（0..1），长度 `positions` 顶点数的 4 倍；仅渐变网格有值。
+    /// 有值时 `static_color` 的 RGB 恒为 1，最终颜色 = 顶点色 × `static_color`。
+    pub vertex_colors: Option<Vec<f32>>,
     pub transform_index: usize,
     pub render_order: u32,
     /// 所有桶中最大的轮廓点数。
     pub point_count: u32,
+    /// 图片网格的纹理地址（`u + p`）；`None` 表示纯色 / 渐变网格。
+    pub texture: Option<String>,
+    /// 逐顶点 UV（每顶点 2 个 f32），仅图片网格有值。
+    pub uvs: Option<Vec<f32>>,
     pub name: String,
 }
 
@@ -110,6 +120,7 @@ impl CompiledMesh {
             self.indices = indices.clone();
         }
         self.point_count = self.point_count.max(point_count);
+        self.pad_vertex_colors(vertex_count as usize);
         let bucket = &mut self.buckets[index];
         bucket.slots = slots;
         bucket.indices = indices;
@@ -123,6 +134,7 @@ impl CompiledMesh {
         let vertex_count = (surface.point_count * surface.stride) as u32;
         let MeshSurface { slots, indices, .. } = surface;
         self.point_count = self.point_count.max(point_count);
+        self.pad_vertex_colors(vertex_count as usize);
         self.buckets.push(MeshBucket {
             slots,
             indices,
@@ -130,6 +142,31 @@ impl CompiledMesh {
             vertex_count,
         });
         self.buckets.len() - 1
+    }
+
+    /// 拓扑桶的顶点数可能超过参考帧表面；补齐逐顶点色，重复末色即可
+    /// （超出部分只被新桶中位置相近的顶点引用）。
+    fn pad_vertex_colors(&mut self, vertex_count: usize) {
+        let Some(colors) = self.vertex_colors.as_mut() else {
+            return;
+        };
+        let needed = vertex_count * 4;
+        if colors.len() >= needed {
+            return;
+        }
+        let rgb = if colors.len() >= 4 {
+            [
+                colors[colors.len() - 4],
+                colors[colors.len() - 3],
+                colors[colors.len() - 2],
+                colors[colors.len() - 1],
+            ]
+        } else {
+            [0.55, 0.62, 0.9, 1.0]
+        };
+        while colors.len() < needed {
+            colors.extend_from_slice(&rgb);
+        }
     }
 
     /// 由参考帧表面创建网格；`animated` 为真时预置空的逐帧顶点轨迹。
@@ -146,9 +183,16 @@ impl CompiledMesh {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
         let frames = if animated { Some(Vec::new()) } else { None };
+        let vertex_colors = surface.ref_colors;
+        // 渐变网格的 RGB 来自顶点色，uniform 颜色只保留 alpha，避免双重染色。
+        let static_color = if vertex_colors.is_some() {
+            [1.0, 1.0, 1.0, color[3]]
+        } else {
+            color
+        };
         CompiledMesh {
             kind,
-            static_color: color,
+            static_color,
             depth,
             half_thickness: half,
             positions: surface.ref_positions,
@@ -163,9 +207,12 @@ impl CompiledMesh {
             }],
             indices: surface.indices,
             color_track: Vec::new(),
+            vertex_colors,
             transform_index,
             render_order: 0,
             point_count,
+            texture: None,
+            uvs: None,
             name,
         }
     }
@@ -229,6 +276,19 @@ struct Plan<'a> {
     frame_rate: f32,
     /// 图层遮罩带关键帧且受支持，需要逐帧裁剪几何（如在眨眼时滑动的眼睑遮罩）。
     dynamic_mask: bool,
+    /// 本图层自身 `tt` 指向的轨道遮罩来源。
+    matte: Option<MatteSource>,
+    /// 实际生效的裁剪来源：自身 `tt`，或从预合成父级继承。
+    clip: Option<MatteSource>,
+    /// 裁剪来源与内容之间存在动画，需要在烘焙期逐帧重算裁剪。
+    clip_animated: bool,
+}
+
+/// 轨道遮罩来源：某个图层（`id`）的 alpha 轮廓，`inverted` 对应反转模式。
+#[derive(Clone, Copy, Debug)]
+struct MatteSource {
+    id: usize,
+    inverted: bool,
 }
 
 /// 位置弹性回弹表达式参数（已按表达式里的换算系数归一）。
@@ -462,6 +522,9 @@ impl<'a> Compiler<'a> {
                 overshoot: None,
                 frame_rate: self.frame_rate,
                 dynamic_mask: false,
+                matte: None,
+                clip: None,
+                clip_animated: false,
             });
             ids.push(id);
         }
@@ -485,9 +548,108 @@ impl<'a> Compiler<'a> {
             self.plans[id].overshoot = self.collect_overshoot(id);
         }
 
+        // 轨道遮罩：`tt` 图层使用同合成内紧邻其上方的图层作为 alpha 遮罩。
+        // 预合成图层被遮罩时，裁剪来源会通过 `owner` 继承到内部所有图层。
+        let mut previous: Option<usize> = None;
+        let mut cursor = 0usize;
+        for layer in layers.iter() {
+            if layer.hd {
+                continue;
+            }
+            let id = ids[cursor];
+            cursor += 1;
+            if layer.tt != 0 {
+                if let Some(source) = previous {
+                    self.plans[id].matte = Some(MatteSource {
+                        id: source,
+                        // 2 / 4 为反转模式（alpha 反转、亮度反转）。
+                        inverted: matches!(layer.tt, 2 | 4),
+                    });
+                }
+            }
+            let inherited = self.plans[id].matte.or_else(|| {
+                self.plans[id]
+                    .owner
+                    .and_then(|owner| self.plans[owner].clip)
+            });
+            // 目前仅形状层 / 纯色层可作为遮罩源；其它类型保持不裁剪。
+            let clip = inherited.filter(|source| matte_supported(&self.plans, source.id));
+            if let Some(source) = clip {
+                let animated = self.clip_animation_needed(id, source);
+                let plan = &mut self.plans[id];
+                plan.clip = Some(source);
+                plan.clip_animated = animated;
+                if animated {
+                    plan.geometry_animated = true;
+                }
+            }
+            previous = Some(id);
+        }
+
         for id in ids {
             self.build_content(doc, id);
         }
+    }
+
+    /// 判断轨道遮罩是否需要逐帧重算。
+    ///
+    /// 遮罩几何本身有动画时必然需要；否则在采样区间内取 5 个时间点比较
+    /// 「遮罩 → 内容」的相对变换，只有确实变化时才逐帧烘焙，避免把静态
+    /// 遮罩误判成动画、让顶点轨迹无谓地膨胀 600 倍。
+    fn clip_animation_needed(&self, content: usize, source: MatteSource) -> bool {
+        let layer = self.plans[source.id].layer;
+        let geometry_animated = match layer.ty {
+            4 => shape::geometry_animated(&layer.shapes)
+                || shape::mask_clips_geometry(&layer.masks),
+            1 => shape::mask_clips_geometry(&layer.masks),
+            _ => true,
+        };
+        if geometry_animated {
+            return true;
+        }
+        // 遮罩自身的可见区间若在采样区间内部切换，也必须逐帧裁剪；否则
+        // 静态参考帧可能取在遮罩不可见的时刻，把内容整层裁掉。
+        if layer.op > layer.ip {
+            let start = plan_local_frame(&self.plans, source.id, self.sample_start);
+            let end =
+                plan_local_frame(&self.plans, source.id, self.sample_start + self.sample_span);
+            let (lo, hi) = (start.min(end), start.max(end));
+            if (layer.ip > lo && layer.ip < hi) || (layer.op > lo && layer.op < hi) {
+                return true;
+            }
+        }
+        let plan_count = self.plans.len();
+        let mut chain_cache = vec![None; plan_count];
+        let mut frame_cache = vec![None; plan_count];
+        let overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
+        let mut previous: Option<Affine> = None;
+        for step in 0..=4 {
+            let root_frame = self.sample_start + self.sample_span * (step as f32 / 4.0);
+            for cache in chain_cache.iter_mut() {
+                *cache = None;
+            }
+            for cache in frame_cache.iter_mut() {
+                *cache = None;
+            }
+            let Some(relative) = matte_relative(
+                &self.plans,
+                content,
+                source.id,
+                root_frame,
+                &mut chain_cache,
+                &mut frame_cache,
+                &overrides,
+            ) else {
+                return true;
+            };
+            if let Some(previous) = previous {
+                if !affine_close(previous, relative) {
+                    return true;
+                }
+            }
+            previous = Some(relative);
+        }
+        false
     }
 
     /// 按图层类型构建内容：4 形状层、1 纯色层、0 预合成层。
@@ -496,9 +658,24 @@ impl<'a> Compiler<'a> {
     /// （`(ref - st) / sr`），时间拉伸 `sr` 不能为 0。
     fn build_content(&mut self, doc: &'a Lottie, id: usize) {
         let layer = self.plans[id].layer;
+        // 轨道遮罩目标层（`td != 0`）只给同合成内的 `tt` 图层提供 alpha，
+        // AE / lottie-web 从不把它本身画出来。若当成普通图层渲染，
+        // 遮罩形状会变成实体黑色三角形盖住画面（shot_01 即如此）。
+        // 遮罩本身尚未实现，因此这里直接跳过几何构建，但保留 plan
+        // 以维持 `parent` 链与 `ind` 引用。
+        if layer.td != 0 {
+            return;
+        }
         match layer.ty {
             4 => self.build_shape_layer(id, layer),
             1 => self.build_solid_layer(id, layer),
+            // 2 = 图片层：资源里的位图铺成一张贴图平面。
+            2 => {
+                let Some(asset) = doc.asset(&layer.ref_id) else {
+                    return;
+                };
+                self.build_image_layer(id, layer, asset);
+            }
             0 => {
                 let Some(asset) = doc.asset(&layer.ref_id) else {
                     return;
@@ -524,10 +701,14 @@ impl<'a> Compiler<'a> {
         let follows = self.collect_follows(id, &layer.shapes);
         // 带关键帧的遮罩会改变轮廓形状，同样属于几何动画。
         let dynamic_mask = shape::mask_clips_geometry(&layer.masks);
+        // 轨道遮罩参与动画时也必须逐帧重建几何。
+        let clip = self.plans[id].clip;
+        let clip_animated = self.plans[id].clip_animated;
         // 顶点跟随也是几何动画的来源之一。
         let geometry_animated = shape::geometry_animated(&layer.shapes)
             || follows.as_ref().map(|specs| !specs.map.is_empty()).unwrap_or(false)
-            || dynamic_mask;
+            || dynamic_mask
+            || clip_animated;
         let style_animated = shape::style_animated(&layer.shapes);
         {
             let plan = &mut self.plans[id];
@@ -576,6 +757,33 @@ impl<'a> Compiler<'a> {
         if dynamic_mask {
             shape::apply_mask(&mut result, &layer.masks, frame);
         }
+        // 轨道遮罩：几何全程静止时在参考帧裁一次即可；若内容本身有动画，
+        // 参考帧必须保留未裁剪几何（否则可能被裁空、拿不到网格），
+        // 逐帧裁剪交给烘焙阶段。
+        if let Some(source) = clip {
+            if !geometry_animated {
+                // 静态遮罩的几何与相对变换在采样区间内不变，取区间起点即可；
+                // 这里必须用根合成时间，`frame` 是图层所在合成的时间轴。
+                let root_frame = self.sample_start;
+                let plan_count = self.plans.len();
+                let mut chain_cache = vec![None; plan_count];
+                let mut frame_cache = vec![None; plan_count];
+                let overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
+                if let Some(relative) = matte_relative(
+                    &self.plans,
+                    id,
+                    source.id,
+                    root_frame,
+                    &mut chain_cache,
+                    &mut frame_cache,
+                    &overrides,
+                ) {
+                    if let Some(mask) = matte_contours(&self.plans, source.id, root_frame) {
+                        clip_with_matte(&mut result, relative, &mask, source.inverted);
+                    }
+                }
+            }
+        }
 
         for drawable in result.drawables {
             let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
@@ -617,11 +825,43 @@ impl<'a> Compiler<'a> {
         // 静态遮罩只需在参考帧裁一次；带关键帧的遮罩逐帧重建几何。
         // 遮罩已经并进可见轮廓，因此不再设置 dynamic_mask（避免重复裁剪）。
         let dynamic_mask = shape::mask_clips_geometry(&layer.masks);
-        if dynamic_mask {
-            self.plans[id].geometry_animated = true;
-        }
+        let clip = self.plans[id].clip;
+        let clip_animated = self.plans[id].clip_animated;
+        let geometry_animated = dynamic_mask || clip_animated;
+        self.plans[id].geometry_animated = geometry_animated;
         // 参考帧的可见轮廓已包含遮罩裁剪（见 solid_contour），直接建网格。
-        let drawable = solid_drawable(layer, self.plans[id].ref_frame);
+        let mut drawable = solid_drawable(layer, self.plans[id].ref_frame);
+        // 几何静止时轨道遮罩在参考帧裁一次；有动画时留给烘焙阶段逐帧裁剪。
+        if let Some(source) = clip {
+            if !geometry_animated {
+                let plan_count = self.plans.len();
+                let mut chain_cache = vec![None; plan_count];
+                let mut frame_cache = vec![None; plan_count];
+                let overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
+                // 静态遮罩取采样区间起点（根合成时间），理由同形状层。
+                let root_frame = self.sample_start;
+                if let Some(relative) = matte_relative(
+                    &self.plans,
+                    id,
+                    source.id,
+                    root_frame,
+                    &mut chain_cache,
+                    &mut frame_cache,
+                    &overrides,
+                ) {
+                    if let Some(mask) = matte_contours(&self.plans, source.id, root_frame) {
+                        let mut clipped = shape::ShapeResult {
+                            drawables: vec![drawable],
+                        };
+                        clip_with_matte(&mut clipped, relative, &mask, source.inverted);
+                        let Some(first) = clipped.drawables.pop() else {
+                            return;
+                        };
+                        drawable = first;
+                    }
+                }
+            }
+        }
         let Some(surface) = mesh::build_surface(&drawable, self.half, self.edge_radius, self.curve_spacing) else {
             return;
         };
@@ -635,12 +875,77 @@ impl<'a> Compiler<'a> {
             self.plans[id].depth,
             self.plans[id].transform_track,
             layer.nm.clone(),
-            dynamic_mask,
+            geometry_animated,
         ));
         self.plans[id].meshes.push(mesh_index);
         self.plans[id].blueprints.push(Some(Blueprint {
             mesh_index,
             color: rgb,
+        }));
+    }
+
+    /// 构建图片图层：把资源里的位图铺成一张贴图平面。
+    ///
+    /// Lottie 图片的局部坐标从左上角 `(0, 0)` 延伸到 `(w, h)`，图层变换的
+    /// 锚点通常位于图片中心。这里不挤出厚度，只生成 4 个顶点 + 2 个三角形，
+    /// 并携带逐顶点 UV；纹理本身由播放端按 `u + p` 异步加载。
+    fn build_image_layer(&mut self, id: usize, layer: &'a Layer, asset: &Asset) {
+        let width = asset.w;
+        let height = asset.h;
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        // 内嵌图片（`e = 1`）的 `p` 本身就是 data URI；否则按 `u + p` 拼地址。
+        let texture = if asset.p.is_empty() {
+            None
+        } else if asset.embedded != 0 || asset.p.starts_with("data:") {
+            Some(asset.p.clone())
+        } else {
+            Some(format!("{}{}", asset.u, asset.p))
+        };
+        let Some(texture) = texture else {
+            return;
+        };
+        let positions = vec![
+            0.0, 0.0, 0.0, // 左上
+            width, 0.0, 0.0, // 右上
+            width, height, 0.0, // 右下
+            0.0, height, 0.0, // 左下
+        ];
+        // 纹理默认 flipY：v = 1 对应图片顶边，与 Lottie 的 y 向下一致。
+        let uvs = vec![0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let indices = vec![0, 1, 2, 0, 2, 3];
+        let mesh_index = self.meshes.len();
+        self.meshes.push(CompiledMesh {
+            kind: 2,
+            // 贴图网格的 RGB 来自纹理，uniform 颜色只保留 alpha。
+            static_color: [1.0, 1.0, 1.0, 1.0],
+            depth: self.plans[id].depth,
+            half_thickness: 0.0,
+            positions,
+            frame_positions: None,
+            frame_offsets: Vec::new(),
+            frame_buckets: Vec::new(),
+            buckets: vec![MeshBucket {
+                slots: Vec::new(),
+                indices: indices.clone(),
+                point_count: 4,
+                vertex_count: 4,
+            }],
+            indices,
+            color_track: Vec::new(),
+            vertex_colors: None,
+            transform_index: self.plans[id].transform_track,
+            render_order: 0,
+            point_count: 4,
+            texture: Some(texture),
+            uvs: Some(uvs),
+            name: layer.nm.clone(),
+        });
+        self.plans[id].meshes.push(mesh_index);
+        self.plans[id].blueprints.push(Some(Blueprint {
+            mesh_index,
+            color: [1.0, 1.0, 1.0, 1.0],
         }));
     }
 
@@ -848,6 +1153,8 @@ impl<'a> Compiler<'a> {
         // 每帧由位置 / 旋转表达式算出的变换覆盖（Trace Path 等），对应 plan 下标。
         let mut overrides: Vec<Option<PoseOverride>> = vec![None; plan_count];
         let mut scratch = mesh::FrameScratch::default();
+        // 静态轨道遮罩已映射到内容局部坐标，可跨帧复用。
+        let mut clip_cache: Vec<Option<Rc<Vec<Contour>>>> = vec![None; plan_count];
 
         // lottie-web 的 `pointOnPath` 在首次调用时缓存分段长度并一直复用；
         // 这里按首帧（采样起点）的目标路径构造参考表，逐帧只按它映射 progress。
@@ -1069,6 +1376,67 @@ impl<'a> Compiler<'a> {
                         shape::apply_mask(result, &plan.layer.masks, local_frame);
                     }
                 }
+                // 轨道遮罩：遮罩或内容有动画时逐帧裁剪；两者都静止时参考几何
+                // 已裁好，这里不再重复计算。静态遮罩映射到内容局部坐标后缓存，
+                // 内容自己带几何动画（如形状形变）时直接复用。
+                if let Some(source) = plan.clip {
+                    if let Some(result) = evaluated.as_mut() {
+                        if result
+                            .drawables
+                            .iter()
+                            .any(|drawable| !drawable.paths.is_empty())
+                        {
+                            if plan.clip_animated {
+                                if let Some(relative) = matte_relative(
+                                    plans,
+                                    id,
+                                    source.id,
+                                    root_frame,
+                                    &mut chain_cache,
+                                    &mut frame_cache,
+                                    &overrides,
+                                ) {
+                                    if let Some(mask) =
+                                        matte_contours(plans, source.id, root_frame)
+                                    {
+                                        clip_with_matte(
+                                            result,
+                                            relative,
+                                            &mask,
+                                            source.inverted,
+                                        );
+                                    }
+                                }
+                            } else {
+                                let cached = match &clip_cache[id] {
+                                    Some(cached) => Rc::clone(cached),
+                                    None => {
+                                        let relative = matte_relative(
+                                            plans,
+                                            id,
+                                            source.id,
+                                            root_frame,
+                                            &mut chain_cache,
+                                            &mut frame_cache,
+                                            &overrides,
+                                        )
+                                        .unwrap_or(Affine::IDENTITY);
+                                        let mask = matte_contours(plans, source.id, root_frame)
+                                            .unwrap_or_default();
+                                        let mapped: Vec<Contour> = mask
+                                            .iter()
+                                            .map(|contour| map_contour(contour, relative))
+                                            .collect();
+                                        let cached = Rc::new(mapped);
+                                        clip_cache[id] = Some(Rc::clone(&cached));
+                                        cached
+                                    }
+                                };
+                                clip_with_local_matte(result, &cached, source.inverted);
+                            }
+                        }
+                    }
+                }
                 let dynamic_color = plan.style_animated || plan.opacity_animated;
 
                 for (drawable_index, blueprint) in plan.blueprints.iter().enumerate() {
@@ -1098,16 +1466,26 @@ impl<'a> Compiler<'a> {
                             ],
                         };
                         let base = frame_index * 4;
-                        mesh.color_track[base..base + 4].copy_from_slice(&color);
+                        // 渐变网格：RGB 由顶点色提供，轨迹只写 alpha。
+                        if mesh.vertex_colors.is_some() {
+                            mesh.color_track[base..base + 4]
+                                .copy_from_slice(&[1.0, 1.0, 1.0, color[3]]);
+                        } else {
+                            mesh.color_track[base..base + 4].copy_from_slice(&color);
+                        }
                     } else if frame_index == 0 {
                         // 静态颜色：把图层常量 alpha 折进 mesh record，
                         // 这样完全不需要颜色轨迹。
-                        mesh.static_color = [
-                            blueprint.color[0],
-                            blueprint.color[1],
-                            blueprint.color[2],
-                            blueprint.color[3] * opacity,
-                        ];
+                        mesh.static_color = if mesh.vertex_colors.is_some() {
+                            [1.0, 1.0, 1.0, blueprint.color[3] * opacity]
+                        } else {
+                            [
+                                blueprint.color[0],
+                                blueprint.color[1],
+                                blueprint.color[2],
+                                blueprint.color[3] * opacity,
+                            ]
+                        };
                     }
 
                     if geometry_animated {
@@ -1932,6 +2310,197 @@ fn plan_world(
     (world, opacity)
 }
 
+/// 从列主序 4×4 矩阵提取 2D 仿射（忽略 Z 平移与齐次行）。
+fn matrix_affine(matrix: &[f32; 16]) -> Affine {
+    Affine {
+        a: matrix[0],
+        b: matrix[1],
+        c: matrix[4],
+        d: matrix[5],
+        tx: matrix[12],
+        ty: matrix[13],
+    }
+}
+
+/// 图层局部 → 最外层合成坐标的 2D 仿射（串联 owner 预合成链）。
+///
+/// 遮罩与内容只要最终落在同一个顶层合成，相对变换就和全局归一化矩阵、
+/// 深度烘焙无关，因此无需 `plan_world` 的完整世界矩阵。
+fn root_affine(
+    plans: &[Plan],
+    id: usize,
+    root_frame: f32,
+    chain_cache: &mut Vec<Option<[f32; 16]>>,
+    frame_cache: &mut Vec<Option<f32>>,
+    overrides: &[Option<PoseOverride>],
+) -> Affine {
+    let mut matrix = plan_chain(plans, id, root_frame, chain_cache, frame_cache, overrides);
+    let mut owner = plans[id].owner;
+    while let Some(owner_id) = owner {
+        let owner_matrix = plan_chain(
+            plans,
+            owner_id,
+            root_frame,
+            chain_cache,
+            frame_cache,
+            overrides,
+        );
+        matrix = mat_mul(&owner_matrix, &matrix);
+        owner = plans[owner_id].owner;
+    }
+    matrix_affine(&matrix)
+}
+
+/// 遮罩轮廓从遮罩图层局部坐标到内容图层局部坐标的相对变换。
+fn matte_relative(
+    plans: &[Plan],
+    content: usize,
+    matte: usize,
+    root_frame: f32,
+    chain_cache: &mut Vec<Option<[f32; 16]>>,
+    frame_cache: &mut Vec<Option<f32>>,
+    overrides: &[Option<PoseOverride>],
+) -> Option<Affine> {
+    let content_affine = root_affine(
+        plans,
+        content,
+        root_frame,
+        chain_cache,
+        frame_cache,
+        overrides,
+    );
+    let matte_affine = root_affine(plans, matte, root_frame, chain_cache, frame_cache, overrides);
+    content_affine
+        .inverse()
+        .map(|inverse| inverse.mul(matte_affine))
+}
+
+/// 两个仿射矩阵是否近似相同（用于判断遮罩裁剪是否静止）。
+fn affine_close(left: Affine, right: Affine) -> bool {
+    (left.a - right.a).abs() < 1e-3
+        && (left.b - right.b).abs() < 1e-3
+        && (left.c - right.c).abs() < 1e-3
+        && (left.d - right.d).abs() < 1e-3
+        && (left.tx - right.tx).abs() < 0.01
+        && (left.ty - right.ty).abs() < 0.01
+}
+
+/// 当前实现支持的遮罩来源类型：形状层与纯色层。
+fn matte_supported(plans: &[Plan], id: usize) -> bool {
+    let layer = plans[id].layer;
+    matches!(layer.ty, 1 | 4) && !layer.hd
+}
+
+/// 遮罩图层在指定根帧下的 alpha 轮廓（遮罩图层局部坐标）。
+///
+/// 返回 `None` 表示该类型暂不支持（如预合成遮罩），调用方应退回不裁剪。
+fn matte_contours(plans: &[Plan], id: usize, root_frame: f32) -> Option<Vec<Contour>> {
+    let layer = plans[id].layer;
+    let frame = plan_local_frame(plans, id, root_frame);
+    // 遮罩图层不在自身时间范围内时 alpha 为空，内容整层被裁掉。
+    if !visible(layer, frame) {
+        return Some(Vec::new());
+    }
+    match layer.ty {
+        4 => {
+            let mut result = shape::eval_shapes(&layer.shapes, frame);
+            if shape::mask_clips_geometry(&layer.masks) {
+                shape::apply_mask(&mut result, &layer.masks, frame);
+            }
+            let mut contours = Vec::new();
+            for drawable in &result.drawables {
+                for path in &drawable.paths {
+                    contours.push(path.contour.clone());
+                }
+            }
+            Some(contours)
+        }
+        1 => Some(vec![solid_contour(layer, frame)]),
+        _ => None,
+    }
+}
+
+/// 把遮罩轮廓按仿射映射到内容图层局部坐标。
+fn map_contour(contour: &Contour, affine: Affine) -> Contour {
+    Contour {
+        pts: contour.pts.iter().map(|point| affine.apply(*point)).collect(),
+        closed: contour.closed,
+    }
+}
+
+/// 退化轮廓：所有采样点重合，三角化后面积为 0，用于表达「整块被裁掉」。
+fn degenerate_contour(contour: &Contour) -> Contour {
+    Contour {
+        pts: vec![contour.pts.first().copied().unwrap_or([0.0, 0.0])],
+        closed: false,
+    }
+}
+
+/// 用遮罩裁剪一组绘制项。
+///
+/// 非反转模式取交集，反转模式取差集；`mask` 为空且非反转时整层被裁掉。
+/// 被裁掉时保留原有路径数量，用退化轮廓占位，保证采样槽位数量不变。
+fn clip_with_matte(
+    result: &mut shape::ShapeResult,
+    relative: Affine,
+    mask: &[Contour],
+    inverted: bool,
+) {
+    let mapped: Vec<Contour> = mask
+        .iter()
+        .map(|contour| map_contour(contour, relative))
+        .collect();
+    clip_with_local_matte(result, &mapped, inverted);
+}
+
+/// 用已经处于内容图层局部坐标的遮罩轮廓裁剪绘制项。
+///
+/// 带 trim 的路径先按 trim 展开成实际可见段再裁剪，避免裁剪后丢掉 trim
+/// 信息而把整条轮廓画出来。
+fn clip_with_local_matte(result: &mut shape::ShapeResult, mask: &[Contour], inverted: bool) {
+    let op = if inverted {
+        BoolOp::Subtract
+    } else {
+        BoolOp::Intersect
+    };
+    for drawable in &mut result.drawables {
+        if drawable.paths.is_empty() {
+            continue;
+        }
+        let subject: Vec<Contour> = if drawable.paths.iter().any(|path| path.trim.is_some()) {
+            shape::drawable_slots(drawable)
+                .into_iter()
+                .map(|(contour, ..)| contour.into_owned())
+                .collect()
+        } else {
+            drawable
+                .paths
+                .iter()
+                .map(|path| path.contour.clone())
+                .collect()
+        };
+        let clipped = if mask.is_empty() && !inverted {
+            Vec::new()
+        } else {
+            boolops::clip(&subject, mask, op)
+        };
+        if clipped.is_empty() {
+            drawable.paths = subject
+                .iter()
+                .map(|contour| PathItem {
+                    contour: degenerate_contour(contour),
+                    trim: None,
+                })
+                .collect();
+        } else {
+            drawable.paths = clipped
+                .into_iter()
+                .map(|contour| PathItem { contour, trim: None })
+                .collect();
+        }
+    }
+}
+
 /// 纯色层在指定帧的可见轮廓（局部坐标，原点在左上角）。
 ///
 /// 带一条受支持遮罩、且遮罩轮廓完全落在纯色矩形内时，可见区域就是遮罩本身
@@ -1973,6 +2542,7 @@ fn solid_drawable(layer: &Layer, frame: f32) -> Drawable {
         join: 2,
         miter: 4.0,
         name: layer.nm.clone(),
+        gradient: None,
         paths: vec![PathItem {
             contour,
             trim: None,
