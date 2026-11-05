@@ -20,6 +20,9 @@ const emit = defineEmits<{
 /** 播放倍速（0.25–2），双向绑定回 App 的播放时钟。 */
 const speed = defineModel<number>('speed', { required: true });
 
+/** 舞台选取开关：开启后可直接在 3D 画布上点击模型选中节点。 */
+const pickMode = defineModel<boolean>('pick-mode', { required: true });
+
 /** 把 range 的字符串值转成数字后上抛；进度到时间的换算由 App 负责。 */
 function onSeek(event: Event): void {
   emit('seek', Number((event.target as HTMLInputElement).value));
@@ -63,6 +66,16 @@ function onSeek(event: Event): void {
     </div>
 
     <div class="view-actions">
+      <button
+        class="ghost pick-toggle"
+        :class="{ 'is-active': pickMode }"
+        type="button"
+        :aria-pressed="pickMode"
+        title="开启后可直接在 3D 画布上点击模型选取节点"
+        @click="pickMode = !pickMode"
+      >
+        舞台选取
+      </button>
       <button class="ghost" type="button" @click="emit('reset-view')">重置视角</button>
       <span class="fps">{{ props.fps > 0 ? `${props.fps} FPS` : '-- FPS' }}</span>
     </div>

@@ -268,6 +268,11 @@ body {
   touch-action: none;
 }
 
+/* 舞台选取开启时给出十字光标提示；只作用于画布，面板内保持普通光标。 */
+.canvas-three.is-picking .three-canvas {
+  cursor: crosshair;
+}
+
 .canvas-hint {
   position: absolute;
   inset: auto 0 16px;
@@ -735,6 +740,13 @@ body {
 .ghost:hover {
   color: var(--text);
   border-color: var(--line-strong);
+}
+
+/* 舞台选取开启态：用与选中线框一致的蓝色强调。 */
+.ghost.is-active {
+  color: #dce8ff;
+  border-color: rgba(61, 139, 255, 0.65);
+  background: rgba(61, 139, 255, 0.16);
 }
 
 .fps {

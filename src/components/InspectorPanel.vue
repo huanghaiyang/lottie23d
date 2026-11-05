@@ -5,14 +5,12 @@
 import { ref } from 'vue';
 import type { StageNode } from '../scene/stage';
 
-// 以下 10 个参数通过 defineModel 与 App.vue 双向绑定（模板中使用 kebab-case 名称）。
-// 厚度/层深/柔光强度/柔光半径是渲染期增量，边缘平滑/曲线采样/采样帧率会触发重转换。
+// 以下 8 个参数通过 defineModel 与 App.vue 双向绑定（模板中使用 kebab-case 名称）。
+// 厚度/层深/柔光强度/柔光半径是渲染期增量，采样帧率会触发重转换。
+// 边缘平滑与曲线采样暂不在面板暴露（实现尚有问题，选项保留在 App 内使用默认值）。
 const thickness = defineModel<number>('thickness', { required: true });
 const depth = defineModel<number>('depth', { required: true });
-const edgeRatio = defineModel<number>('edge-ratio', { required: true });
 const sampleFps = defineModel<number>('sample-fps', { required: true });
-/** 轮廓采样间距（像素/点）：越小曲线越平滑，但顶点与显存随之增加。 */
-const curveSpacing = defineModel<number>('curve-spacing', { required: true });
 const autoRotate = defineModel<boolean>('auto-rotate', { required: true });
 const axisLock = defineModel<boolean>('axis-lock', { required: true });
 const softGlow = defineModel<boolean>('soft-glow', { required: true });
@@ -171,18 +169,6 @@ function onNodeClick(id: number, event: MouseEvent): void {
         <span class="inspector-label">层深</span>
         <input v-model.number="depth" type="range" min="0" max="2.5" step="0.05" />
         <output>{{ depth.toFixed(2) }}</output>
-      </label>
-
-      <label class="inspector-row">
-        <span class="inspector-label">边缘平滑</span>
-        <input v-model.number="edgeRatio" type="range" min="0" max="100" step="1" />
-        <output>{{ edgeRatio.toFixed(0) }}%</output>
-      </label>
-
-      <label class="inspector-row" title="采样间距越小，曲线越平滑，但顶点与显存越多">
-        <span class="inspector-label">曲线采样</span>
-        <input v-model.number="curveSpacing" type="range" min="1" max="8" step="0.5" />
-        <output>{{ curveSpacing.toFixed(1) }} px</output>
       </label>
 
       <label class="inspector-row">

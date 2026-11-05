@@ -51,6 +51,8 @@ const sampleFps = ref(30);
 const curveSpacing = ref(3);
 const autoRotate = ref(false);
 const axisLock = ref(false);
+/** 舞台点选开关：开启后可直接在 3D 画布上点击模型选取节点。 */
+const pickMode = ref(false);
 const activeAxis = ref<ViewAxis | null>(null);
 // ---- 节点列表与多选 ----
 /** 当前模型的节点快照（按渲染顺序，id = meshes 下标）。 */
@@ -275,14 +277,13 @@ function resetView(): void {
 
 /**
  * 点击 gizmo 轴向：相机已由 Stage 补间过去，这里同步 UI 状态——
- * 关闭自动环绕并锁定环绕，避免用户误拖把视角带偏。
+ * 仅关闭自动环绕；不自动锁定视角，切换后仍可用鼠标自由环绕。
  */
 function onAxisPick(axis: ViewAxis): void {
   activeAxis.value = axis;
   autoRotate.value = false;
-  axisLock.value = true;
+  // 只关闭自动环绕，不改变「视角锁定」状态：切换视角后仍可自由拖拽环绕。
   stage?.setAutoRotate(false);
-  stage?.setRotationLock(true);
 }
 
 /** 模型切换后重建节点列表，并清空选择、柔光与显隐等逐节点临时状态。 */
@@ -337,6 +338,49 @@ function onNodeSelect(
     selectionAnchor = id;
   }
   stage?.setSelection(selectedIds.value);
+}
+
+/** 舞台点选的按下位置（页面坐标）；null 表示本次按下不来自 3D 画布。 */
+let stagePickStart: { x: number; y: number } | null = null;
+
+/**
+ * 记录画布上的按下位置。只有“舞台选取”开启且确实按在 canvas 上才记录，
+ * 面板内的滑块 / 开关点击不会触发拾取。
+ */
+function onStagePointerDown(event: PointerEvent): void {
+  stagePickStart = null;
+  if (!pickMode.value || event.button !== 0) {
+    return;
+  }
+  const target = event.target as HTMLElement | null;
+  if (target == null || !target.classList.contains('three-canvas')) {
+    return;
+  }
+  stagePickStart = { x: event.clientX, y: event.clientY };
+}
+
+/**
+ * 抬起时位移小于 6px 视为点击（否则是环绕拖拽），命中节点后复用节点列表的
+ * 选择语义：单击独占、Shift 范围、Alt / Ctrl 切换多选。
+ */
+function onStagePointerUp(event: PointerEvent): void {
+  const start = stagePickStart;
+  stagePickStart = null;
+  if (start == null || stage == null) {
+    return;
+  }
+  if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 6) {
+    return;
+  }
+  const id = stage.pickNodeAt(event.clientX, event.clientY);
+  if (id == null) {
+    return;
+  }
+  onNodeSelect(id, {
+    shift: event.shiftKey,
+    alt: event.altKey,
+    ctrl: event.ctrlKey || event.metaKey,
+  });
 }
 
 /**
@@ -934,6 +978,10 @@ onMounted(() => {
   window.addEventListener('dragover', onDragOver);
   window.addEventListener('dragleave', onDragLeave);
   window.addEventListener('drop', onDrop);
+  // 舞台选取：监听挂在 window 的冒泡阶段，gizmo 的捕获阶段处理会先
+  // stopPropagation，因此点击轴向 gizmo 不会误触发节点拾取。
+  window.addEventListener('pointerdown', onStagePointerDown);
+  window.addEventListener('pointerup', onStagePointerUp);
 
   void boot();
 });
@@ -946,6 +994,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragover', onDragOver);
   window.removeEventListener('dragleave', onDragLeave);
   window.removeEventListener('drop', onDrop);
+  window.removeEventListener('pointerdown', onStagePointerDown);
+  window.removeEventListener('pointerup', onStagePointerUp);
   window.clearTimeout(toastTimer);
   window.clearTimeout(reconvertTimer);
   disposeAnimation();
@@ -991,13 +1041,15 @@ onBeforeUnmount(() => {
           </div>
           <span class="pane-meta">{{ rightMeta }}</span>
         </div>
-        <div ref="threeHost" class="canvas-wrap canvas-three">
+        <div
+          ref="threeHost"
+          class="canvas-wrap canvas-three"
+          :class="{ 'is-picking': pickMode }"
+        >
           <InspectorPanel
             v-model:thickness="thickness"
             v-model:depth="depth"
-            v-model:edge-ratio="edgeRatio"
             v-model:sample-fps="sampleFps"
-            v-model:curve-spacing="curveSpacing"
             v-model:auto-rotate="autoRotate"
             v-model:axis-lock="axisLock"
             v-model:soft-glow="softGlow"
@@ -1014,11 +1066,13 @@ onBeforeUnmount(() => {
           />
           <span class="canvas-hint">
             {{
-              activeAxis
-                ? `轴向 ${AXIS_LABELS[activeAxis]}${axisLock ? ' · 已锁定' : ''} · 滚轮缩放`
-                : axisLock
-                  ? '视角已锁定 · 滚轮缩放 · 点击轴向切换'
-                  : '拖拽环绕 · 滚轮缩放 · 点击轴向切换'
+              pickMode
+                ? '舞台选取 · 点击模型选中节点 · Shift 范围 · Alt 加选'
+                : activeAxis
+                  ? `轴向 ${AXIS_LABELS[activeAxis]}${axisLock ? ' · 已锁定' : ''} · 滚轮缩放`
+                  : axisLock
+                    ? '视角已锁定 · 滚轮缩放 · 点击轴向切换'
+                    : '拖拽环绕 · 滚轮缩放 · 点击轴向切换'
             }}
           </span>
         </div>
@@ -1028,6 +1082,7 @@ onBeforeUnmount(() => {
 
     <TransportBar
       v-model:speed="speed"
+      v-model:pick-mode="pickMode"
       :playing="playing"
       :progress="progress"
       :frame-label="frameLabel"

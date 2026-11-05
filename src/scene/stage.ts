@@ -387,6 +387,8 @@ export class Stage {
   private readonly cameraSpacePoint = new THREE.Vector3();
   /** 复用矩阵：拼装相机空间的补偿变换。 */
   private readonly matrixScratch = new THREE.Matrix4();
+  /** 舞台点选复用的射线；避免每次点击分配新对象。 */
+  private readonly raycaster = new THREE.Raycaster();
 
   /** 通过节点列表隐藏的节点 id；隐藏后跳过逐帧计算与绘制。 */
   private readonly hiddenNodes = new Set<number>();
@@ -762,6 +764,53 @@ export class Stage {
   /** 返回当前层级顺序的节点列表；其 id 与 setSelection 等接口使用的 id 一致。 */
   getNodes(): readonly StageNode[] {
     return this.nodes;
+  }
+
+  /**
+   * 拾取屏幕坐标下的节点（用于“舞台选取”模式）。
+   *
+   * 只对当前实际绘制的网格做射线求交：`mesh.visible` 已综合了逐帧 alpha、
+   * 手动隐藏与贴图就绪状态，因此这里直接以它为准；多个网格重叠时取最近
+   * 命中，保证选中的是视觉上最前面的节点。
+   *
+   * @param clientX 页面坐标（CSS px，与 PointerEvent.clientX 一致）
+   * @param clientY 页面坐标（CSS px）
+   * @returns 命中的节点 id；未命中返回 null
+   */
+  pickNodeAt(clientX: number, clientY: number): number | null {
+    if (this.entries.length === 0) {
+      return null;
+    }
+    const rect = this.host.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+    // 页面坐标 → 容器内 NDC（-1..1，y 轴向上为正）。
+    const ndc = new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -(((clientY - rect.top) / rect.height) * 2 - 1),
+    );
+    // 相机矩阵在渲染循环里更新；点击发生在两帧之间，这里补一次，
+    // 避免刚拖动完视角就点击时用到上一帧的矩阵。
+    this.camera.updateMatrixWorld();
+    this.raycaster.setFromCamera(ndc, this.camera);
+
+    const meshes: THREE.Mesh[] = [];
+    for (const entry of this.entries) {
+      if (entry.mesh.visible) {
+        // 动画网格的顶点逐帧变化，创建时算出的包围球可能已过期，
+        // 过期包围球会让射线在有效像素上提前判定未命中。
+        entry.geometry.computeBoundingSphere();
+        meshes.push(entry.mesh);
+      }
+    }
+    const hits = this.raycaster.intersectObjects(meshes, false);
+    if (hits.length === 0) {
+      return null;
+    }
+    const object = hits[0].object;
+    const index = this.entries.findIndex((entry) => entry.mesh === object);
+    return index >= 0 ? index : null;
   }
 
   /**
