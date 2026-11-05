@@ -836,8 +836,13 @@ pub fn resample_into(contour: &Contour, k: usize, closed: bool, out: &mut Vec<[f
 /// 截取轮廓中从 `start_frac` 开始、长度为 `length_frac` 的一段。
 ///
 /// 两者都是 0..1 的归一化弧长比例；`start_frac` 按 `rem_euclid` 环绕，长度
-/// 会被钳制。返回开放轮廓（调用方在填充时自行闭合）。固定采样 48 段，
-/// 保证截取结果点数稳定；长度接近 1 时直接返回原轮廓的拷贝。
+/// 会被钳制。返回开放轮廓（调用方在填充时自行闭合）。
+///
+/// 裁剪必须保留原折线的全部顶点，只额外插入两个端点：轮廓在求值时已按
+/// 曲线容差展平（约 0.2 像素），若在这里固定重采样成 48 段，长路径会被
+/// 拉成 20~30 像素一段的折线，外轮廓在多边形化后非常明显（shot_01 的
+/// 渐变描边即如此）。保留原顶点后再由 `resample` 按 `curve_spacing`
+/// 重采样，曲线密度就只由采样间距决定。长度接近 1 时直接返回原轮廓。
 pub fn trim_segment(contour: &Contour, start_frac: f32, length_frac: f32) -> Contour {
     let start = start_frac.rem_euclid(1.0);
     let length = length_frac.clamp(0.0, 1.0);
@@ -871,15 +876,11 @@ pub fn trim_segment(contour: &Contour, start_frac: f32, length_frac: f32) -> Con
         cumulative.push(accumulated);
     }
 
-    let start_len = total * start;
-    let end_len = start_len + total * length;
-    // 固定 48 段采样，使 trim 结果的点数与动画时间无关（拓扑稳定）。
-    let steps = 48usize;
-    let mut out = Vec::with_capacity(steps + 1);
-    for i in 0..=steps {
-        let d = start_len + (end_len - start_len) * (i as f32 / steps as f32);
-        // 目标弧长按总长环绕，再用二分定位所在段（partition_point）。
-        let target = d.rem_euclid(total);
+    let start_len = (total * start).min(total);
+    let end_len = (start_len + total * length).min(total);
+    // 取某个弧长位置上的点。`trim_slots` 保证单段不会跨过起点，因此无需环绕。
+    let point_at = |target: f32, out: &mut Vec<[f32; 2]>| {
+        let target = target.clamp(0.0, total);
         let cursor = cumulative
             .partition_point(|value| *value < target)
             .min(segments - 1);
@@ -893,7 +894,18 @@ pub fn trim_segment(contour: &Contour, start_frac: f32, length_frac: f32) -> Con
         let a = pts[cursor];
         let b = pts[(cursor + 1) % pts.len()];
         out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+    };
+
+    let mut out = Vec::with_capacity(pts.len());
+    point_at(start_len, &mut out);
+    // 保留落在裁剪区间内的原始顶点（索引 0 已由上面的起点覆盖）。
+    for index in 1..pts.len() {
+        let position = cumulative[index - 1];
+        if position > start_len + 1e-4 && position < end_len - 1e-4 {
+            out.push(pts[index]);
+        }
     }
+    point_at(end_len, &mut out);
     Contour {
         pts: out,
         closed: false,

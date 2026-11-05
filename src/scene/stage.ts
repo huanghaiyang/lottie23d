@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import type { Model, MeshModel } from '../../sdk/index.mjs';
+import type { Model, MeshModel, GradientModel } from '../../sdk/index.mjs';
 
 /** 六个 Blender 风格观察方向：+X、-X、+Y、-Y、+Z、-Z。 */
 export type ViewAxis = 'x' | '-x' | 'y' | '-y' | 'z' | '-z';
@@ -97,6 +97,157 @@ void main() {
 }
 `;
 
+/** 渐变 LUT 的采样点数；一条渐变轴（往往只有几像素宽）远达不到这个密度。 */
+const GRADIENT_LUT_SIZE = 256;
+
+/** 把数值钳制到 0..1。 */
+function clamp01(value: number): number {
+  return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+
+/**
+ * 把渐变 stop 烘焙成 `GRADIENT_LUT_SIZE × 1` 的 RGBA8 查找纹理。
+ *
+ * RGB 按 sRGB 原值（字节）存放，纹理**不**标记为 sRGB：这样 GPU 的线性
+ * 过滤是在 sRGB 编码空间里插值，与 Lottie / lottie-web 对 stop 的插值
+ * 语义一致；片元着色器采样后再手动解码到线性空间参与光照。
+ * 若直接把纹理标成 `SRGBColorSpace`，GPU 会先逐纹素解码再做线性插值，
+ * 中间色会明显偏亮、偏饱和。
+ *
+ * alpha 是线性值，不参与 sRGB 解码。
+ */
+function buildGradientLut(gradient: GradientModel): {
+  lut: THREE.DataTexture;
+  variesAlpha: boolean;
+} {
+  const pixels = new Uint8Array(GRADIENT_LUT_SIZE * 4);
+  const stops = gradient.stops;
+  const alphaStops = gradient.alphaStops;
+  let variesAlpha = false;
+  for (let i = 0; i < GRADIENT_LUT_SIZE; i += 1) {
+    const t = i / (GRADIENT_LUT_SIZE - 1);
+    // 颜色插值：落在首个 stop 之前取首色，落在末个之后取末色。
+    let rgb: [number, number, number] = [1, 1, 1];
+    if (stops.length > 0) {
+      rgb = stops[0].color;
+      for (let stop = 1; stop < stops.length; stop += 1) {
+        const previous = stops[stop - 1];
+        const next = stops[stop];
+        if (t <= next.offset) {
+          const span = Math.max(1e-6, next.offset - previous.offset);
+          const k = clamp01((t - previous.offset) / span);
+          rgb = [
+            previous.color[0] + (next.color[0] - previous.color[0]) * k,
+            previous.color[1] + (next.color[1] - previous.color[1]) * k,
+            previous.color[2] + (next.color[2] - previous.color[2]) * k,
+          ];
+          break;
+        }
+        rgb = next.color;
+      }
+    }
+    // 透明度插值；无 stop 时整段不透明。
+    let alpha = 1;
+    if (alphaStops.length > 0) {
+      alpha = alphaStops[0].alpha;
+      for (let stop = 1; stop < alphaStops.length; stop += 1) {
+        const previous = alphaStops[stop - 1];
+        const next = alphaStops[stop];
+        if (t <= next.offset) {
+          const span = Math.max(1e-6, next.offset - previous.offset);
+          alpha = previous.alpha + (next.alpha - previous.alpha) * clamp01((t - previous.offset) / span);
+          break;
+        }
+        alpha = next.alpha;
+      }
+    }
+    if (alpha < 0.999) {
+      variesAlpha = true;
+    }
+    pixels[i * 4] = Math.round(clamp01(rgb[0]) * 255);
+    pixels[i * 4 + 1] = Math.round(clamp01(rgb[1]) * 255);
+    pixels[i * 4 + 2] = Math.round(clamp01(rgb[2]) * 255);
+    pixels[i * 4 + 3] = Math.round(clamp01(alpha) * 255);
+  }
+  const lut = new THREE.DataTexture(
+    pixels,
+    GRADIENT_LUT_SIZE,
+    1,
+    THREE.RGBAFormat,
+    THREE.UnsignedByteType,
+  );
+  lut.colorSpace = THREE.NoColorSpace;
+  // 只需沿 t 轴线性过滤；纹理是常量，不需要 mipmap / 重复。
+  // 注意：过滤发生在 sRGB 编码空间（见函数注释），解码在片元里做。
+  lut.minFilter = THREE.LinearFilter;
+  lut.magFilter = THREE.LinearFilter;
+  lut.wrapS = THREE.ClampToEdgeWrapping;
+  lut.wrapT = THREE.ClampToEdgeWrapping;
+  lut.generateMipmaps = false;
+  lut.needsUpdate = true;
+  return { lut, variesAlpha };
+}
+
+/**
+ * 给 MeshLambertMaterial 注入逐片元渐变求值。
+ *
+ * 顶点着色器把网格局部坐标（`transformed.xy`，与渐变端点同一坐标系）传给
+ * 片元；片元按线性 / 径向公式算出 `t`，采样 1D LUT，再乘进 `diffuseColor`：
+ * RGB 参与光照，alpha 与材质透明度（图层不透明度）相乘。
+ */
+function applyGradientShader(
+  material: THREE.Material,
+  gradient: GradientModel,
+  lut: THREE.DataTexture,
+): void {
+  const uniforms = {
+    uGradLut: { value: lut },
+    uGradStart: { value: new THREE.Vector2(gradient.start[0], gradient.start[1]) },
+    uGradEnd: { value: new THREE.Vector2(gradient.end[0], gradient.end[1]) },
+    uGradKind: { value: gradient.kind },
+  };
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec2 vGradPos;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vGradPos = transformed.xy;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform sampler2D uGradLut;
+uniform vec2 uGradStart;
+uniform vec2 uGradEnd;
+uniform float uGradKind;
+varying vec2 vGradPos;`,
+      )
+      // 在颜色阶段注入：此时 diffuseColor 尚参与光照，乘上去与顶点色等价。
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+  float gradT;
+  if (uGradKind < 1.5) {
+    vec2 axis = uGradEnd - uGradStart;
+    gradT = dot(vGradPos - uGradStart, axis) / max(dot(axis, axis), 1e-6);
+  } else {
+    gradT = length(vGradPos - uGradStart) / max(length(uGradEnd - uGradStart), 1e-6);
+  }
+  vec4 gradSample = texture2D(uGradLut, vec2(clamp(gradT, 0.0, 1.0), 0.5));
+  // LUT 里存的是 sRGB 编码值（插值也在该空间完成），这里逐像素解码到
+  // 线性空间再参与光照，等价于 Lottie 的 sRGB 渐变。
+  vec3 gradRgb = mix(
+    gradSample.rgb / 12.92,
+    pow((gradSample.rgb + 0.055) / 1.055, vec3(2.4)),
+    step(vec3(0.04045), gradSample.rgb)
+  );
+  diffuseColor.rgb *= gradRgb;
+  diffuseColor.a *= gradSample.a;`,
+      );
+  };
+  // 所有渐变材质共用同一份注入代码，显式固定缓存键，便于复用已编译程序。
+  material.customProgramCacheKey = () => 'l2d-gradient';
+}
+
 /** 一个网格对应的全部运行时对象；数组下标即节点 id。 */
 interface Entry {
   /** SDK 的网格模型（只读数据源）。 */
@@ -124,8 +275,11 @@ interface Entry {
   positionsAnimated: boolean;
   /** 每个拓扑桶一份索引属性（至少一项；0 与静态 indices 相同）。 */
   indexAttributes: THREE.BufferAttribute[];
-  /** 每个拓扑桶一份顶点色属性（仅渐变网格；下标与 indexAttributes 对应）。 */
-  colorAttributes: THREE.BufferAttribute[];
+  /**
+   * 渐变的一维查找纹理（256×1 RGBA8），非渐变网格为 null。
+   * 颜色在片元着色器里按局部坐标逐像素求值，与顶点密度无关。
+   */
+  gradientLut: THREE.DataTexture | null;
   /** 当前绑定到 geometry 的桶下标，用于跳过重复 setIndex。 */
   currentBucket: number;
   /** 由基础 alpha 推导的可见性（尚未叠加手动隐藏）。 */
@@ -456,34 +610,15 @@ export class Stage {
       const position = new THREE.BufferAttribute(positions, 3);
       position.setUsage(positionsAnimated ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
       geometry.setAttribute('position', position);
-      // 渐变网格的逐顶点 RGBA（v5）：每个拓扑桶一份。RGB 按 sRGB 一次性转成
-      // 线性空间，alpha 直接沿用（透明度 stop 的采样结果）。itemSize 4 会触发
-      // three.js 的 USE_COLOR_ALPHA，顶点 alpha 与材质 alpha 相乘。
-      let vertexAlpha = false;
-      const colorAttributes: THREE.BufferAttribute[] = [];
-      if (data.bucketColors && data.bucketColors.length > 0) {
-        const count = data.vertexCount;
-        const swatch = new THREE.Color();
-        for (const source of data.bucketColors) {
-          const converted = new Float32Array(count * 4);
-          for (let i = 0; i < count; i += 1) {
-            swatch.setRGB(
-              source[i * 4],
-              source[i * 4 + 1],
-              source[i * 4 + 2],
-              THREE.SRGBColorSpace,
-            );
-            converted[i * 4] = swatch.r;
-            converted[i * 4 + 1] = swatch.g;
-            converted[i * 4 + 2] = swatch.b;
-            converted[i * 4 + 3] = source[i * 4 + 3];
-            if (converted[i * 4 + 3] < 0.999) {
-              vertexAlpha = true;
-            }
-          }
-          colorAttributes.push(new THREE.BufferAttribute(converted, 4));
-        }
-        geometry.setAttribute('color', colorAttributes[0]);
+      // 渐变网格（v6）：颜色在片元着色器里按局部坐标逐像素求值，与顶点
+      // 密度无关。这里把 stop 烘焙成 1D LUT；`variesAlpha` 决定是否需要
+      // 透明混合（渐变 alpha 低于 1 时必须开启）。
+      let gradientLut: THREE.DataTexture | null = null;
+      let gradientAlpha = false;
+      if (data.gradient) {
+        const built = buildGradientLut(data.gradient);
+        gradientLut = built.lut;
+        gradientAlpha = built.variesAlpha;
       }
       // 每个拓扑桶一份索引属性；默认绑定桶 0，逐帧按 frameBuckets 切换。
       const indexAttributes = data.buckets.map(
@@ -528,15 +663,20 @@ export class Stage {
           })
         : new THREE.MeshLambertMaterial({
             color: baseColor,
-            // 渐变网格：颜色来自顶点属性，uniform 颜色只保留 alpha。
-            vertexColors: data.vertexColors != null,
+            // 渐变网格的颜色由片元注入，不再使用顶点色属性。
+            vertexColors: false,
             // 平面着色：挤出薄板的每个面亮度独立，轮廓更“硬”。
             flatShading: true,
             side: THREE.DoubleSide,
             // 常量且不透明的颜色直接关闭透明混合，省掉排序与 overdraw。
-            transparent: colors != null || alpha < 0.999 || vertexAlpha,
+            // 渐变 alpha 低于 1 时同样需要透明混合。
+            transparent: colors != null || alpha < 0.999 || gradientAlpha,
             opacity: Math.max(0, Math.min(1, alpha)),
           });
+      // 渐变网格：注入逐片元求值，颜色只与片元位置有关。
+      if (data.gradient && gradientLut) {
+        applyGradientShader(material, data.gradient, gradientLut);
+      }
       // 关闭全部矩阵自动更新：世界矩阵由 applyFrame 直接写入。
       // 同时关闭视锥剔除，避免整批网格在相机边缘被跳过（模型尺寸已归一化）。
       const mesh = new THREE.Mesh(geometry, material);
@@ -572,7 +712,7 @@ export class Stage {
         position,
         positionsAnimated,
         indexAttributes,
-        colorAttributes,
+        gradientLut,
         currentBucket: 0,
         staticVisible,
         // 新载入的模型按烘焙层深排序，尚未发生拖拽重排。
@@ -1138,11 +1278,6 @@ export class Stage {
         if (wanted !== entry.currentBucket) {
           entry.currentBucket = wanted;
           entry.geometry.setIndex(buckets[wanted]);
-          // 顶点色与拓扑绑定：不同桶的顶点顺序不同，必须一起切换。
-          const bucketColor = entry.colorAttributes[wanted];
-          if (bucketColor) {
-            entry.geometry.setAttribute('color', bucketColor);
-          }
         }
       }
     }
@@ -1164,6 +1299,8 @@ export class Stage {
       entry.material.dispose();
       // 图片网格的纹理由 TextureLoader 创建，需要一并释放。
       entry.material.map?.dispose();
+      // 渐变 LUT 由 Stage 自己创建，也需释放。
+      entry.gradientLut?.dispose();
     }
     this.entries.length = 0;
     this.nodes.length = 0;

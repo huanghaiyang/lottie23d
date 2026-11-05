@@ -41,6 +41,39 @@ export interface MeshBucket {
   pointCount: number;
 }
 
+/** 一个渐变颜色 stop：偏移 0..1 与 sRGB 颜色。 */
+export interface GradientColorStop {
+  /** 沿渐变轴的归一化位置（0..1）。 */
+  offset: number;
+  /** sRGB 颜色分量，各 0..1。 */
+  color: [number, number, number];
+}
+
+/** 一个渐变透明度 stop：偏移 0..1 与 alpha。 */
+export interface GradientAlphaStop {
+  /** 沿渐变轴的归一化位置（0..1）。 */
+  offset: number;
+  /** 透明度 0..1。 */
+  alpha: number;
+}
+
+/**
+ * 渐变求值规格（仅渐变网格存在）。颜色由播放端在片元着色器里按局部坐标
+ * 逐像素求值，避免逐顶点采样过疏导致的硬边与三角形接缝。
+ */
+export interface GradientModel {
+  /** 渐变类型：1 = 线性，2 = 径向。 */
+  kind: number;
+  /** 渐变起点（线性 0% / 径向圆心），已随组变换烘焙到网格局部坐标。 */
+  start: [number, number];
+  /** 渐变终点（线性 100% / 径向半径端点）。 */
+  end: [number, number];
+  /** 颜色 stop，按偏移升序。 */
+  stops: GradientColorStop[];
+  /** 透明度 stop，按偏移升序；为空表示不透明。 */
+  alphaStops: GradientAlphaStop[];
+}
+
 /** 单个可绘制网格（一条填充或描边），几何与逐帧数据都由 Rust 预烘焙。 */
 export interface MeshModel {
   /** 在 `meshes` 数组中的下标；排序后同时也是节点 id。 */
@@ -76,15 +109,10 @@ export interface MeshModel {
   /** 逐帧颜色 RGBA（帧数 × 4，sRGB），颜色恒定时为 null。 */
   colors: Float32Array | null;
   /**
-   * 逐顶点 RGBA（长度 = vertexCount × 4，RGB 为 sRGB、alpha 为透明度 stop 采样值），
-   * 仅渐变网格存在。有值时 `color` 的 RGB 恒为 1，最终颜色 = 顶点色 × `color`。
+   * 渐变求值规格，仅渐变网格存在。有值时 `color` 的 RGB 恒为 1（只保留
+   * alpha），最终颜色 = 片元求值得到的渐变色 × `color`（含 alpha）。
    */
-  vertexColors: Float32Array | null;
-  /**
-   * 每个拓扑桶一份逐顶点 RGBA（长度均为 vertexCount × 4），仅渐变网格存在；
-   * 播放端切换拓扑桶时需同时切换这组颜色属性。无渐变时为 null。
-   */
-  bucketColors: Float32Array[] | null;
+  gradient: GradientModel | null;
   /** 逐顶点 UV（长度 = vertexCount × 2），仅图片网格存在。 */
   uvs: Float32Array | null;
   /** 图片纹理地址（`u + p` 或 data URI），仅图片网格存在。 */

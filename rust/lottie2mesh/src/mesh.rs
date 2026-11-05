@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::path::{self, Contour};
-use crate::shape::{DrawKind, Drawable};
+use crate::shape::{DrawKind, Drawable, GradientSpec};
 
 /// 每个 1/4 圆角剖面的折线段数；决定圆角插值点数。
 const ROUND_SEGMENTS: usize = 3;
@@ -67,9 +67,9 @@ pub struct MeshSurface {
     pub indices: Vec<u32>,
     /// 参考帧的展开顶点坐标，布局为 `[x, y, z]`，长度 `point_count * stride * 3`。
     pub ref_positions: Vec<f32>,
-    /// 逐顶点 RGBA（0..1），长度 `point_count * stride * 4`；仅渐变绘制项有值。
-    /// 颜色按参考帧顶点的 2D 位置采样，动画期间保持不变以节省内存。
-    pub ref_colors: Option<Vec<f32>>,
+    /// 渐变规格（仅渐变绘制项有值）；颜色由播放端按片元位置求值，
+    /// 不再逐顶点烘焙，避免采样过疏产生硬边。
+    pub gradient: Option<GradientSpec>,
 }
 
 /// 每个轮廓点生成的顶点数：尖边 2 个，圆角为 `2 * ROUND_SEGMENTS + 2`。
@@ -240,16 +240,6 @@ pub fn build_surface_from_slots(
         fill_normals(&points, &plans, &mut normals);
     }
     let ref_positions = expand_positions(&points, &normals, stride, radius, half_thickness);
-    // 渐变颜色按参考帧顶点位置采样：逐顶点写入 RGBA（alpha 来自透明度 stop）。
-    let ref_colors = drawable.gradient.as_ref().map(|gradient| {
-        let mut colors = Vec::with_capacity(ref_positions.len() * 4 / 3);
-        for vertex in ref_positions.chunks_exact(3) {
-            let point = [vertex[0], vertex[1]];
-            let rgb = gradient.color_at(point);
-            colors.extend_from_slice(&[rgb[0], rgb[1], rgb[2], gradient.alpha_at(point)]);
-        }
-        colors
-    });
 
     Some(MeshSurface {
         slots: plans,
@@ -257,7 +247,7 @@ pub fn build_surface_from_slots(
         stride,
         indices,
         ref_positions,
-        ref_colors,
+        gradient: drawable.gradient.clone(),
     })
 }
 

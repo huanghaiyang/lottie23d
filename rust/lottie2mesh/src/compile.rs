@@ -35,7 +35,9 @@ use crate::lottie::{Asset, Layer, Lottie};
 use crate::mesh::{self, MeshSurface, SlotPlan};
 use crate::path::{Contour, PathData, PathLengths};
 use crate::prop;
-use crate::shape::{self, Affine, DrawKind, Drawable, FollowContext, FollowSpecs, PathItem};
+use crate::shape::{
+    self, Affine, DrawKind, Drawable, FollowContext, FollowSpecs, GradientSpec, PathItem,
+};
 
 /// 前盖折叠判定阈值：`Σ|三角形面积| / |Σ有符号面积|` 超过该值时，
 /// 认为现有三角化已不适合当前姿态，需要按当帧几何重建一套桶。
@@ -69,12 +71,6 @@ pub struct MeshBucket {
     pub indices: Vec<u32>,
     pub point_count: u32,
     pub vertex_count: u32,
-    /// 该桶参考几何的逐顶点 RGBA（0..1），长度 `vertex_count * 4`；仅渐变网格有值。
-    ///
-    /// 颜色是顶点位置的函数（渐变轴 + 色标），而不同桶的顶点顺序不同，
-    /// 因此必须每个桶各存一份，播放端随索引一起切换；共用一份缓冲会让
-    /// 渐变随着拓扑切换整体错位。
-    pub colors: Option<Vec<f32>>,
 }
 
 /// 编译后的单个网格。
@@ -101,9 +97,9 @@ pub struct CompiledMesh {
     pub indices: Vec<u32>,
     /// 逐帧颜色 RGBA；为空表示使用 `static_color`。
     pub color_track: Vec<f32>,
-    /// 是否为渐变网格（颜色来自逐顶点色而非 `static_color`）。
-    /// 有值时 `static_color` 的 RGB 恒为 1，最终颜色 = 顶点色 × `static_color`。
-    pub has_gradient: bool,
+    /// 渐变规格；有值时 `static_color` 的 RGB 恒为 1，最终颜色由播放端
+    /// 按片元位置求值并与 `static_color`（只保留 alpha）相乘。
+    pub gradient: Option<GradientSpec>,
     pub transform_index: usize,
     pub render_order: u32,
     /// 所有桶中最大的轮廓点数。
@@ -120,18 +116,9 @@ impl CompiledMesh {
     fn replace_bucket(&mut self, index: usize, surface: MeshSurface) {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
-        // 顶点色是顶点位置的空间函数，必须与桶的几何一起替换：沿用的旧桶颜色
-        // 是按另一套顶点顺序采样的，会让渐变整体错位（shot_01 首帧的橙色 /
-        // 灰色色块即由此产生）。
         let MeshSurface {
-            slots,
-            indices,
-            ref_colors,
-            ..
+            slots, indices, ..
         } = surface;
-        if ref_colors.is_some() {
-            self.has_gradient = true;
-        }
         if index == 0 {
             // 单桶编码路径仍使用 indices 副本，需要同步。
             self.indices = indices.clone();
@@ -142,7 +129,6 @@ impl CompiledMesh {
         bucket.indices = indices;
         bucket.point_count = point_count;
         bucket.vertex_count = vertex_count;
-        bucket.colors = ref_colors;
     }
 
     /// 追加一套新桶（姿态锚点或段内拓扑变化时），返回其下标。
@@ -150,21 +136,14 @@ impl CompiledMesh {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
         let MeshSurface {
-            slots,
-            indices,
-            ref_colors,
-            ..
+            slots, indices, ..
         } = surface;
-        if ref_colors.is_some() {
-            self.has_gradient = true;
-        }
         self.point_count = self.point_count.max(point_count);
         self.buckets.push(MeshBucket {
             slots,
             indices,
             point_count,
             vertex_count,
-            colors: ref_colors,
         });
         self.buckets.len() - 1
     }
@@ -183,9 +162,16 @@ impl CompiledMesh {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
         let frames = if animated { Some(Vec::new()) } else { None };
-        let has_gradient = surface.ref_colors.is_some();
-        // 渐变网格的 RGB 来自顶点色，uniform 颜色只保留 alpha，避免双重染色。
-        let static_color = if has_gradient {
+        let MeshSurface {
+            slots,
+            indices,
+            ref_positions,
+            gradient,
+            ..
+        } = surface;
+        // 渐变网格的 RGB 由播放端逐片元求值，uniform 颜色只保留 alpha，
+        // 避免双重染色。
+        let static_color = if gradient.is_some() {
             [1.0, 1.0, 1.0, color[3]]
         } else {
             color
@@ -195,20 +181,19 @@ impl CompiledMesh {
             static_color,
             depth,
             half_thickness: half,
-            positions: surface.ref_positions,
+            positions: ref_positions,
             frame_positions: frames,
             frame_offsets: Vec::new(),
             frame_buckets: Vec::new(),
             buckets: vec![MeshBucket {
-                slots: surface.slots,
-                indices: surface.indices.clone(),
+                slots,
+                indices: indices.clone(),
                 point_count,
                 vertex_count,
-                colors: surface.ref_colors,
             }],
-            indices: surface.indices,
+            indices,
             color_track: Vec::new(),
-            has_gradient,
+            gradient,
             transform_index,
             render_order: 0,
             point_count,
@@ -1022,11 +1007,10 @@ impl<'a> Compiler<'a> {
                 indices: indices.clone(),
                 point_count,
                 vertex_count: point_count,
-                colors: None,
             }],
             indices,
             color_track: Vec::new(),
-            has_gradient: false,
+            gradient: None,
             transform_index: self.plans[id].transform_track,
             render_order: 0,
             point_count,
@@ -1571,8 +1555,8 @@ impl<'a> Compiler<'a> {
                             ],
                         };
                         let base = frame_index * 4;
-                        // 渐变网格：RGB 由顶点色提供，轨迹只写 alpha。
-                        if mesh.has_gradient {
+                        // 渐变网格：RGB 由片元渐变提供，轨迹只写 alpha。
+                        if mesh.gradient.is_some() {
                             mesh.color_track[base..base + 4]
                                 .copy_from_slice(&[1.0, 1.0, 1.0, color[3]]);
                         } else {
@@ -1581,7 +1565,7 @@ impl<'a> Compiler<'a> {
                     } else if frame_index == 0 {
                         // 静态颜色：把图层常量 alpha 折进 mesh record，
                         // 这样完全不需要颜色轨迹。
-                        mesh.static_color = if mesh.has_gradient {
+                        mesh.static_color = if mesh.gradient.is_some() {
                             [1.0, 1.0, 1.0, blueprint.color[3] * opacity]
                         } else {
                             [

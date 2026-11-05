@@ -1,4 +1,4 @@
-//! 二进制模型编码器（格式版本 5）。
+//! 二进制模型编码器（格式版本 6）。
 //!
 //! 所有偏移均为从 blob 起始处算起的**字节偏移**，整数与浮点一律小端。
 //!
@@ -7,7 +7,7 @@
 //! mesh records（每个 112 字节）
 //! transform tracks（每条 frame_count * 16 个 f32）
 //! mesh 数据块：静态顶点、逐帧顶点、各桶 indices、颜色轨迹、
-//!               桶表、逐帧顶点偏移、逐帧桶 id、逐顶点 RGBA、
+//!               桶表、逐帧顶点偏移、逐帧桶 id、渐变块、
 //!               UV、纹理地址、名称
 //! ```
 //!
@@ -23,9 +23,11 @@ const HEADER_SIZE: usize = 96;
 const RECORD_SIZE: usize = 112;
 /// 当前格式版本（`l2d_version` 返回同一值）。
 ///
-/// v5：渐变顶点色改为“每个拓扑桶一份”（长度 `桶数 × vertexCount × 4`），
-/// 播放端随索引一起切换颜色属性。
-const VERSION: u32 = 5;
+/// v6：删除 v5 的“每桶一份逐顶点 RGBA”，改为写入一段渐变规格
+/// （起点/终点、颜色 stop、透明度 stop），播放端在片元着色器里按
+/// 局部坐标逐像素求值，因此渐变过渡是连续的，不会因顶点采样过疏
+/// 出现硬边或三角形接缝。
+const VERSION: u32 = 6;
 
 /// 把编译结果序列化为 `.l2d3` 二进制。
 ///
@@ -90,7 +92,8 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         //   48 基础 indices 偏移、52 颜色轨迹偏移、56 变换轨迹下标
         //   60 渲染顺序、64 采样点数、68 名称偏移、72 名称长度
         //   76 桶数量、80 桶表偏移、84 逐帧偏移表、88 逐帧桶 id
-        //   92 逐顶点 RGBA、96 逐顶点 UV、100 纹理偏移、104 纹理长度
+        //   92 保留（v6 起废弃逐顶点 RGBA）、96 逐顶点 UV、100 纹理偏移、
+        //   104 纹理长度、108 渐变块偏移
         put_u32(&mut blob, record, mesh.kind as u32);
         // flags 位：bit0 有逐帧顶点、bit1 有颜色轨迹、
         // bit2 有 frame_offsets、bit3 使用多桶（>1 套 indices）。
@@ -105,9 +108,8 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         if bucketized {
             flags |= 8;
         }
-        // bit4：存在逐顶点 RGB（渐变网格）；数据块按桶顺序存放，
-        //       每桶固定 `vertexCount × 4` 个 f32。
-        if mesh.has_gradient {
+        // bit4：带渐变规格（v6），播放端逐片元求值颜色。
+        if mesh.gradient.is_some() {
             flags |= 16;
         }
         put_u32(&mut blob, record + 4, flags);
@@ -139,27 +141,41 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         }
         put_u32(&mut blob, record + 40, positions_offset);
 
-        // 逐顶点 RGBA（v5）：按拓扑桶顺序连续存放，每桶固定
-        // `vertexCount × 4` 个 f32 —— 播放端切换桶时按同一 stride 取对应切片。
-        // 桶顶点数不足 vertexCount 的部分补白（不影响该桶索引引用到的顶点）。
-        let vertex_colors_offset = if mesh.has_gradient {
-            let offset = (meta_size + data.len()) as u32;
-            for bucket in &mesh.buckets {
-                for index in 0..vertex_count as usize * 4 {
-                    let value = bucket
-                        .colors
-                        .as_ref()
-                        .and_then(|colors| colors.get(index))
-                        .copied()
-                        .unwrap_or(1.0);
+        // 渐变块（v6）：只描述求值规则，不放逐顶点色。布局（小端）：
+        //   u32 kind（1 线性 / 2 径向）
+        //   f32 start.x、start.y、end.x、end.y
+        //   u32 colorCount，随后 colorCount × (f32 offset, f32 r, f32 g, f32 b)
+        //   u32 alphaCount，随后 alphaCount × (f32 offset, f32 a)
+        // 播放端据此构建 1D LUT，在片元里按局部坐标求 t，保证过渡连续。
+        let gradient_offset = match &mesh.gradient {
+            Some(gradient) => {
+                let offset = (meta_size + data.len()) as u32;
+                data.extend_from_slice(&(gradient.kind as u32).to_le_bytes());
+                for value in [
+                    gradient.start[0],
+                    gradient.start[1],
+                    gradient.end[0],
+                    gradient.end[1],
+                ] {
                     data.extend_from_slice(&value.to_le_bytes());
                 }
+                data.extend_from_slice(&(gradient.stops.len() as u32).to_le_bytes());
+                for (position, rgb) in &gradient.stops {
+                    data.extend_from_slice(&position.to_le_bytes());
+                    for channel in rgb {
+                        data.extend_from_slice(&channel.to_le_bytes());
+                    }
+                }
+                data.extend_from_slice(&(gradient.alpha_stops.len() as u32).to_le_bytes());
+                for (position, alpha) in &gradient.alpha_stops {
+                    data.extend_from_slice(&position.to_le_bytes());
+                    data.extend_from_slice(&alpha.to_le_bytes());
+                }
+                offset
             }
-            offset
-        } else {
-            0
+            None => 0,
         };
-        put_u32(&mut blob, record + 92, vertex_colors_offset);
+        put_u32(&mut blob, record + 108, gradient_offset);
 
         // 图片网格（v4）：逐顶点 UV（vertexCount × 2 个 f32），缺失补 0。
         let uv_offset = match &mesh.uvs {

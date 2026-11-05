@@ -19,7 +19,7 @@
 const MAGIC = 0x4c323344;
 /** 文件头固定 96 字节（字段偏移见 parseModel 的注释表）。 */
 const HEADER_SIZE = 96;
-/** 每条 mesh record 固定 112 字节（v4 新增 UV 与纹理地址）。 */
+/** 每条 mesh record 固定 112 字节（v6 在 +108 增加渐变块偏移）。 */
 const RECORD_SIZE = 112;
 
 /** 运行环境判定：Node 下存在 process.versions.node，浏览器下没有。 */
@@ -107,7 +107,7 @@ function readString(memory, pointer, length) {
  *
  * 文件头（HEADER_SIZE = 96 字节）字段偏移：
  *   +0  u32 magic          `0x4c323344`（"L23D"）
- *   +4  u32 version        格式版本，当前 v4（新增纹理图片网格）
+ *   +4  u32 version        格式版本，当前 v6（渐变改为逐片元求值）
  *   +8  f32 width          画布宽（Lottie px）
  *   +12 f32 height         画布高（Lottie px）
  *   +16 f32 frameRate      文档帧率
@@ -197,10 +197,11 @@ export function parseModel(bytes) {
   //   +80 u32 bucketTableOffset   桶表起始（每项 16B）
   //   +84 u32 frameOffsetsOffset  逐帧顶点起点表（frameCount + 1 个 u32，单位为 float）
   //   +88 u32 frameBucketOffset   逐帧桶下标表（frameCount 个 u8）
-  //   +92 u32 vertexColorsOffset  逐顶点 RGBA 起始（v5，桶数 × vertexCount × 4 个 f32）
+  //   +92 u32 reserved            保留（v6 起废弃 v5 的逐顶点 RGBA）
   //   +96 u32 uvOffset            逐顶点 UV 起始（v4，vertexCount × 2 个 f32；0 = 无）
   //   +100 u32 textureOffset      纹理地址（UTF-8）起始（v4；0 = 无）
   //   +104 u32 textureLen         纹理地址字节长度
+  //   +108 u32 gradientOffset     渐变块起始（v6；0 = 非渐变网格）
   const meshes = new Array(meta.meshCount);
   for (let index = 0; index < meta.meshCount; index += 1) {
     const record = HEADER_SIZE + index * RECORD_SIZE;
@@ -223,22 +224,46 @@ export function parseModel(bytes) {
     const bucketTableOffset = view.getUint32(record + 80, true);
     const frameOffsetsOffset = view.getUint32(record + 84, true);
     const frameBucketOffset = view.getUint32(record + 88, true);
-    // flags bit4（16）：v5 渐变网格的逐顶点 RGBA，按桶顺序存放，
-    // 每桶固定 vertexCount × 4 个 f32；播放端随索引一起切换颜色属性。
-    const vertexColorsOffset = view.getUint32(record + 92, true);
-    let vertexColors = null;
-    let bucketColors = null;
-    if (flags & 16 && vertexColorsOffset) {
-      const stride = vertexCount * 4;
-      bucketColors = new Array(Math.max(1, bucketCount));
-      for (let b = 0; b < bucketColors.length; b += 1) {
-        bucketColors[b] = new Float32Array(
-          buffer.buffer,
-          buffer.byteOffset + vertexColorsOffset + b * stride * 4,
-          stride,
-        );
+    // flags bit4（16）：v6 渐变网格，+108 指向一段渐变求值规格：
+    //   u32 kind、f32 start.xy、f32 end.xy、
+    //   u32 colorCount + colorCount × (f32 offset, f32 r, f32 g, f32 b)、
+    //   u32 alphaCount + alphaCount × (f32 offset, f32 a)。
+    // 播放端据此构建 1D LUT，在片元着色器里逐像素求 t，过渡连续无硬边。
+    const gradientOffset = view.getUint32(record + 108, true);
+    let gradient = null;
+    if (flags & 16 && gradientOffset) {
+      let cursor = gradientOffset;
+      const kind = view.getUint32(cursor, true);
+      cursor += 4;
+      const start = [view.getFloat32(cursor, true), view.getFloat32(cursor + 4, true)];
+      cursor += 8;
+      const end = [view.getFloat32(cursor, true), view.getFloat32(cursor + 4, true)];
+      cursor += 8;
+      const colorCount = view.getUint32(cursor, true);
+      cursor += 4;
+      const stops = new Array(colorCount);
+      for (let stop = 0; stop < colorCount; stop += 1) {
+        stops[stop] = {
+          offset: view.getFloat32(cursor, true),
+          color: [
+            view.getFloat32(cursor + 4, true),
+            view.getFloat32(cursor + 8, true),
+            view.getFloat32(cursor + 12, true),
+          ],
+        };
+        cursor += 16;
       }
-      vertexColors = bucketColors[0];
+      const alphaCount = view.getUint32(cursor, true);
+      cursor += 4;
+      const alphaStops = new Array(alphaCount);
+      for (let stop = 0; stop < alphaCount; stop += 1) {
+        alphaStops[stop] = {
+          offset: view.getFloat32(cursor, true),
+          alpha: view.getFloat32(cursor + 4, true),
+        };
+        cursor += 8;
+      }
+      gradient = { kind, start, end, stops, alphaStops };
     }
     // v4 图片网格：逐顶点 UV + 纹理地址（缺失时为 null）。
     const uvOffset = view.getUint32(record + 96, true);
@@ -343,8 +368,7 @@ export function parseModel(bytes) {
       buckets,
       indices,
       colors,
-      vertexColors,
-      bucketColors,
+      gradient,
       uvs,
       texture,
       transformIndex: view.getUint32(record + 56, true),

@@ -67,7 +67,7 @@ l2d_dealloc(jsonPtr, jsonLen)
 { "fps": 30, "max_frames": 600, "thickness": 8, "edge_radius": 3, "curve_spacing": 3 }
 ```
 
-字段均可省略；`edge_radius` / `curve_spacing` 也接受别名 `edgeRadius` / `curveSpacing`。`l2d_version()` 当前返回 `4`，ABI 或二进制格式变化时递增。
+字段均可省略；`edge_radius` / `curve_spacing` 也接受别名 `edgeRadius` / `curveSpacing`。`l2d_version()` 当前返回 `6`，与 `.l2d3` header 的版本字段一致，ABI 或二进制格式变化时递增。
 
 ---
 
@@ -212,7 +212,7 @@ k = 图层沿视线方向的深度 / 相机到观察目标的距离
 [`shape.rs`](../rust/lottie2mesh/src/shape.rs) 把嵌套形状树展平为 `Drawable` 列表：
 
 - 支持 `sh` 路径、`rc` 矩形、`el` 椭圆、`sr` 多角星、`gr` 组、`tr` 组变换、`tm` 修剪。
-- 支持 `fl` 纯色填充、`st` 描边、`gf` / `gs` 渐变（逐顶点采样渐变颜色，端点随组变换烘焙）。
+- 支持 `fl` 纯色填充、`st` 描边、`gf` / `gs` 渐变（导出渐变求值规格：端点随组变换烘焙，颜色与透明度 stop 原样保留，颜色由播放端逐片元求值）。
 - 旧版 Bodymovin 把闭合标记写在 `sh.closed` 上（新版在路径数据内部的 `c`），求值时以该字段作为 `eval_path_property` 的默认值，缺失路径闭合标记的旧文件才不会把闭合轮廓画成开口折线（`dalek.json` 的 3.1.6 即属此类）。
 - 展平后的 drawable 列表整体取反，顺序即绘制顺序：AE 形状树按“上层在前”存储，lottie-web 的 `searchShapes` 从末尾向前遍历，因此数组越靠前的组/样式画得越晚（越在上）。若按原始数组顺序绘制，靠后的样式会盖住靠前的样式（`dalek.json` 的拔塞器因此丢掉蓝色内圈）。
 - 形状变换会烘焙进轮廓坐标，运行时不再做组变换。
@@ -270,7 +270,7 @@ k = clamp(ceil(arc_length / curve_spacing), 3, 8192)   // 退化轮廓用 3
 - 采样密度由转换选项 `curve_spacing`（默认 3 像素/点，范围 1–8）决定：播放器会把画布放大到 3.6 个世界单位，4 像素以上的弦长在放大视图里会出现可见折线。`k` 不再按 480 点截断，长轮廓也会按真实间距采样；下限 3 保证小轮廓（周长十几像素的灯泡）在间距调大时同样能真实降采样；8192 点只是极端路径的显存兜底，外部参数不会因此失真。
 
 - 逐帧用 `resample_into` 按弧长重新采样到同一个 `k`，保证顶点数不变。
-- 修剪路径的环绕区间被拆成固定的两个槽位（`trim_slots`），避免拓扑在环绕时跳变。
+- 修剪路径的环绕区间被拆成固定的两个槽位（`trim_slots`），避免拓扑在环绕时跳变。`trim_segment` 直接复用展平折线的原始顶点，只在两端按弧长插值补点；早期固定 48 段的做法会把长路径（渐变描边、遮罩带）拉成 20–30 像素的折线，是「3D 轮廓比 2D 明显更硬」的直接原因。
 - 若某一帧的轮廓数量少于参考帧，缺失槽位退化为单点轮廓（几何塌陷）；多于参考帧的部分被忽略，即形变需要轮廓数量与闭合性稳定。
 
 ### 7.2 填充
@@ -369,7 +369,7 @@ k = clamp(ceil(arc_length / curve_spacing), 3, 8192)   // 退化轮廓用 3
 | 偏移 | 类型 | 含义 |
 |---|---|---|
 | 0 | u32 | magic `0x4C323344`（"L23D"） |
-| 4 | u32 | 版本，当前 `4` |
+| 4 | u32 | 版本，当前 `6` |
 | 8 / 12 | f32 | 画布宽 / 高 |
 | 16 | f32 | 文档帧率 |
 | 20 / 24 | f32 | `ip` / `op` |
@@ -390,7 +390,7 @@ k = clamp(ceil(arc_length / curve_spacing), 3, 8192)   // 退化轮廓用 3
 | 偏移 | 类型 | 含义 |
 |---|---|---|
 | 0 | u32 | `kind`：`0` 填充 / `1` 描边 / `2` 图片贴图 |
-| 4 | u32 | flags：bit0 有帧顶点轨道，bit1 有颜色轨道，bit2 有帧顶点偏移表，bit3 有多个拓扑桶，bit4 有逐顶点色 |
+| 4 | u32 | flags：bit0 有帧顶点轨道，bit1 有颜色轨道，bit2 有帧顶点偏移表，bit3 有多个拓扑桶，bit4 有渐变规格 |
 | 8 / 12 / 16 / 20 | f32 | 静态颜色 RGBA（sRGB，0–1） |
 | 24 | f32 | Z 深度 |
 | 28 | f32 | 挤出半厚度（Lottie 像素） |
@@ -408,11 +408,11 @@ k = clamp(ceil(arc_length / curve_spacing), 3, 8192)   // 退化轮廓用 3
 | 80 | u32 | 桶表偏移（每桶 16 B：索引偏移 / 索引数 / 顶点数 / 轮廓点数） |
 | 84 | u32 | 帧顶点偏移表偏移（`frame_count + 1` 个 u32，单位为 float） |
 | 88 | u32 | 帧拓扑桶表偏移（`frame_count` 个 u8） |
-| 92 | u32 | 逐顶点 RGBA 偏移（`桶数 × vertex_count × 4 × f32`，无则 0；v5 起按桶存放） |
+| 92 | u32 | 保留（v6 起废弃 v5 的逐顶点 RGBA） |
 | 96 | u32 | 逐顶点 UV 偏移（`vertex_count × 2 × f32`，无则 0；v4 起） |
 | 100 | u32 | 纹理地址偏移（UTF-8，无则 0；v4 起） |
 | 104 | u32 | 纹理地址字节长度（0 表示纯色 / 渐变网格） |
-| 108 | u32 | 保留 |
+| 108 | u32 | 渐变块偏移（无则 0；v6 起） |
 
 ### 9.3 变换轨道
 
@@ -432,7 +432,8 @@ mesh.matrixWorld.fromArray(track, frame * 16);
 - 帧顶点：按帧连续打包，`frame_offsets[f]` 到 `frame_offsets[f + 1]`（单位 float）是本帧的顶点区间；不同拓扑桶的顶点数可以不同。
 - 索引桶：每桶一份 `index_count` u32 索引；桶表记录各桶的偏移、索引数、顶点数与轮廓点数。
 - 颜色轨道：`frame_count × 4` f32（RGBA，sRGB）。
-- 逐顶点 RGBA（v5）：按拓扑桶顺序连续存放，每桶固定 `vertex_count × 4` f32；桶内不足 `vertex_count` 的部分补白。渐变是顶点位置的空间函数，不同桶的顶点顺序不同，因此不能共用一份颜色缓冲，播放端随索引一起切换 `color` 属性。
+- 渐变块（v6）：只在 record +108 指向一段求值规格，不再放逐顶点色。布局为 `u32 kind`（1 线性 / 2 径向）、`f32 start.x/y`、`f32 end.x/y`、`u32 colorCount` + `colorCount × (f32 offset, f32 r, f32 g, f32 b)`、`u32 alphaCount` + `alphaCount × (f32 offset, f32 a)`。播放端据此烘焙 256×1 LUT，在片元着色器里按顶点局部坐标算 `t` 并采样，过渡连续、与顶点密度和裁剪边界无关。
+- 渐变网格的静态颜色 RGB 恒为 1，只保留 alpha；最终颜色 = 片元渐变色 × 静态颜色 alpha × 图层不透明度。
 - UV（v4）：`vertex_count × 2` f32，仅图片网格；与参考顶点一一对应。
 - 纹理地址（v4）：UTF-8 字符串，按 4 字节对齐；播放端据此加载图片。
 - 字符串：UTF-8，尾部补零到 4 字节对齐。
@@ -449,7 +450,7 @@ mesh.matrixWorld.fromArray(track, frame * 16);
 | `converter.convert(json, options?)` | 转换为已解析的模型对象 |
 | `converter.convertBytes(json, options?)` | 只返回 `.l2d3` 原始字节，适合落盘或缓存 |
 | `converter.parseModel(bytes)` | 把二进制解析为 TypedArray（不依赖 wasm） |
-| `converter.version` | ABI 版本 |
+| `converter.version` | 格式版本（当前 6） |
 
 解析结果：
 

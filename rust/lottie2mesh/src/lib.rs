@@ -240,8 +240,9 @@ pub extern "C" fn l2d_error_len() -> u32 {
     guard.error.len() as u32
 }
 
-/// ABI 版本号，导出接口变化时需要递增；当前 4 与二进制格式版本一致。
+/// 格式版本号，与 `.l2d3` header 偏移 4 的版本字段一致；ABI 或二进制
+/// 格式变化时需要递增。当前 v6（渐变改为逐片元求值）。
 #[no_mangle]
 pub extern "C" fn l2d_version() -> u32 {
-    4
+    6
 }
