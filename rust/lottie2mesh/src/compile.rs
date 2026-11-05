@@ -69,6 +69,12 @@ pub struct MeshBucket {
     pub indices: Vec<u32>,
     pub point_count: u32,
     pub vertex_count: u32,
+    /// 该桶参考几何的逐顶点 RGBA（0..1），长度 `vertex_count * 4`；仅渐变网格有值。
+    ///
+    /// 颜色是顶点位置的函数（渐变轴 + 色标），而不同桶的顶点顺序不同，
+    /// 因此必须每个桶各存一份，播放端随索引一起切换；共用一份缓冲会让
+    /// 渐变随着拓扑切换整体错位。
+    pub colors: Option<Vec<f32>>,
 }
 
 /// 编译后的单个网格。
@@ -95,9 +101,9 @@ pub struct CompiledMesh {
     pub indices: Vec<u32>,
     /// 逐帧颜色 RGBA；为空表示使用 `static_color`。
     pub color_track: Vec<f32>,
-    /// 逐顶点 RGBA（0..1），长度 `positions` 顶点数的 4 倍；仅渐变网格有值。
+    /// 是否为渐变网格（颜色来自逐顶点色而非 `static_color`）。
     /// 有值时 `static_color` 的 RGB 恒为 1，最终颜色 = 顶点色 × `static_color`。
-    pub vertex_colors: Option<Vec<f32>>,
+    pub has_gradient: bool,
     pub transform_index: usize,
     pub render_order: u32,
     /// 所有桶中最大的轮廓点数。
@@ -114,59 +120,53 @@ impl CompiledMesh {
     fn replace_bucket(&mut self, index: usize, surface: MeshSurface) {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
-        let MeshSurface { slots, indices, .. } = surface;
+        // 顶点色是顶点位置的空间函数，必须与桶的几何一起替换：沿用的旧桶颜色
+        // 是按另一套顶点顺序采样的，会让渐变整体错位（shot_01 首帧的橙色 /
+        // 灰色色块即由此产生）。
+        let MeshSurface {
+            slots,
+            indices,
+            ref_colors,
+            ..
+        } = surface;
+        if ref_colors.is_some() {
+            self.has_gradient = true;
+        }
         if index == 0 {
             // 单桶编码路径仍使用 indices 副本，需要同步。
             self.indices = indices.clone();
         }
         self.point_count = self.point_count.max(point_count);
-        self.pad_vertex_colors(vertex_count as usize);
         let bucket = &mut self.buckets[index];
         bucket.slots = slots;
         bucket.indices = indices;
         bucket.point_count = point_count;
         bucket.vertex_count = vertex_count;
+        bucket.colors = ref_colors;
     }
 
     /// 追加一套新桶（姿态锚点或段内拓扑变化时），返回其下标。
     fn push_bucket(&mut self, surface: MeshSurface) -> usize {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
-        let MeshSurface { slots, indices, .. } = surface;
+        let MeshSurface {
+            slots,
+            indices,
+            ref_colors,
+            ..
+        } = surface;
+        if ref_colors.is_some() {
+            self.has_gradient = true;
+        }
         self.point_count = self.point_count.max(point_count);
-        self.pad_vertex_colors(vertex_count as usize);
         self.buckets.push(MeshBucket {
             slots,
             indices,
             point_count,
             vertex_count,
+            colors: ref_colors,
         });
         self.buckets.len() - 1
-    }
-
-    /// 拓扑桶的顶点数可能超过参考帧表面；补齐逐顶点色，重复末色即可
-    /// （超出部分只被新桶中位置相近的顶点引用）。
-    fn pad_vertex_colors(&mut self, vertex_count: usize) {
-        let Some(colors) = self.vertex_colors.as_mut() else {
-            return;
-        };
-        let needed = vertex_count * 4;
-        if colors.len() >= needed {
-            return;
-        }
-        let rgb = if colors.len() >= 4 {
-            [
-                colors[colors.len() - 4],
-                colors[colors.len() - 3],
-                colors[colors.len() - 2],
-                colors[colors.len() - 1],
-            ]
-        } else {
-            [0.55, 0.62, 0.9, 1.0]
-        };
-        while colors.len() < needed {
-            colors.extend_from_slice(&rgb);
-        }
     }
 
     /// 由参考帧表面创建网格；`animated` 为真时预置空的逐帧顶点轨迹。
@@ -183,9 +183,9 @@ impl CompiledMesh {
         let point_count = surface.point_count as u32;
         let vertex_count = (surface.point_count * surface.stride) as u32;
         let frames = if animated { Some(Vec::new()) } else { None };
-        let vertex_colors = surface.ref_colors;
+        let has_gradient = surface.ref_colors.is_some();
         // 渐变网格的 RGB 来自顶点色，uniform 颜色只保留 alpha，避免双重染色。
-        let static_color = if vertex_colors.is_some() {
+        let static_color = if has_gradient {
             [1.0, 1.0, 1.0, color[3]]
         } else {
             color
@@ -204,10 +204,11 @@ impl CompiledMesh {
                 indices: surface.indices.clone(),
                 point_count,
                 vertex_count,
+                colors: surface.ref_colors,
             }],
             indices: surface.indices,
             color_track: Vec::new(),
-            vertex_colors,
+            has_gradient,
             transform_index,
             render_order: 0,
             point_count,
@@ -1021,10 +1022,11 @@ impl<'a> Compiler<'a> {
                 indices: indices.clone(),
                 point_count,
                 vertex_count: point_count,
+                colors: None,
             }],
             indices,
             color_track: Vec::new(),
-            vertex_colors: None,
+            has_gradient: false,
             transform_index: self.plans[id].transform_track,
             render_order: 0,
             point_count,
@@ -1570,7 +1572,7 @@ impl<'a> Compiler<'a> {
                         };
                         let base = frame_index * 4;
                         // 渐变网格：RGB 由顶点色提供，轨迹只写 alpha。
-                        if mesh.vertex_colors.is_some() {
+                        if mesh.has_gradient {
                             mesh.color_track[base..base + 4]
                                 .copy_from_slice(&[1.0, 1.0, 1.0, color[3]]);
                         } else {
@@ -1579,7 +1581,7 @@ impl<'a> Compiler<'a> {
                     } else if frame_index == 0 {
                         // 静态颜色：把图层常量 alpha 折进 mesh record，
                         // 这样完全不需要颜色轨迹。
-                        mesh.static_color = if mesh.vertex_colors.is_some() {
+                        mesh.static_color = if mesh.has_gradient {
                             [1.0, 1.0, 1.0, blueprint.color[3] * opacity]
                         } else {
                             [
@@ -1608,7 +1610,13 @@ impl<'a> Compiler<'a> {
                             let slots = shape::drawable_slots(drawable);
 
                             if !slots.is_empty() {
-                                if !pose_ready[mesh_index] {
+                                // 退化裁剪（遮罩尚未出现、trim 为 0 等）会得到
+                                // 只剩 1 个点的轮廓。此时不能重建拓扑桶：否则
+                                // 基础桶被换成只含单点的布局并永久锁定（后续
+                                // 可见帧写不进正确几何）。把这类帧当作无几何。
+                                let renderable =
+                                    slots.iter().any(|(contour, ..)| contour.pts.len() >= 3);
+                                if renderable && !pose_ready[mesh_index] {
                                     // 首个有效帧：用当帧姿态重建基础桶，取代
                                     // 建立在别处（通常是动画中点）的参考三角化。
                                     let natural = mesh::plan_slots(&slots, self.curve_spacing);
@@ -1623,7 +1631,8 @@ impl<'a> Compiler<'a> {
                                         bucket_index = 0;
                                         pose_ready[mesh_index] = true;
                                     }
-                                } else if anchor_slot.is_some()
+                                } else if renderable
+                                    && anchor_slot.is_some()
                                     && mesh.buckets.len() < mesh::MAX_BUCKETS
                                 {
                                     // 姿态锚点：为这一段形变新建一套三角化。
@@ -1637,7 +1646,9 @@ impl<'a> Compiler<'a> {
                                     ) {
                                         bucket_index = mesh.push_bucket(surface);
                                     }
-                                } else if slots.len() != mesh.buckets[bucket_index].slots.len() {
+                                } else if renderable
+                                    && slots.len() != mesh.buckets[bucket_index].slots.len()
+                                {
                                     // 段内轮廓槽位数量发生变化（如 trim）：优先
                                     // 复用槽位数一致的桶，桶还有空位则新建一套。
                                     if let Some(position) = mesh
@@ -1730,7 +1741,11 @@ impl<'a> Compiler<'a> {
                                 // 小于绝对面积和），立即用当前姿态重建一套三角化并重写
                                 // 本帧顶点，避免把裂缝留到下一帧。描边的环形带有符号
                                 // 面积和接近 0，不参与该判定。
-                                if wrote && mesh.kind == 0 && mesh.buckets.len() < mesh::MAX_BUCKETS {
+                                if renderable
+                                    && wrote
+                                    && mesh.kind == 0
+                                    && mesh.buckets.len() < mesh::MAX_BUCKETS
+                                {
                                     let ratio = match mesh.frame_positions.as_ref() {
                                         Some(track) => cap_fold_ratio(
                                             &mesh.buckets[bucket_index].indices,

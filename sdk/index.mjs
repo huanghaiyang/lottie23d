@@ -197,7 +197,7 @@ export function parseModel(bytes) {
   //   +80 u32 bucketTableOffset   桶表起始（每项 16B）
   //   +84 u32 frameOffsetsOffset  逐帧顶点起点表（frameCount + 1 个 u32，单位为 float）
   //   +88 u32 frameBucketOffset   逐帧桶下标表（frameCount 个 u8）
-  //   +92 u32 vertexColorsOffset  逐顶点 RGBA 起始（v3，vertexCount × 4 个 f32）
+  //   +92 u32 vertexColorsOffset  逐顶点 RGBA 起始（v5，桶数 × vertexCount × 4 个 f32）
   //   +96 u32 uvOffset            逐顶点 UV 起始（v4，vertexCount × 2 个 f32；0 = 无）
   //   +100 u32 textureOffset      纹理地址（UTF-8）起始（v4；0 = 无）
   //   +104 u32 textureLen         纹理地址字节长度
@@ -223,16 +223,23 @@ export function parseModel(bytes) {
     const bucketTableOffset = view.getUint32(record + 80, true);
     const frameOffsetsOffset = view.getUint32(record + 84, true);
     const frameBucketOffset = view.getUint32(record + 88, true);
-    // flags bit4（16）：v3 渐变网格的逐顶点 RGBA。
+    // flags bit4（16）：v5 渐变网格的逐顶点 RGBA，按桶顺序存放，
+    // 每桶固定 vertexCount × 4 个 f32；播放端随索引一起切换颜色属性。
     const vertexColorsOffset = view.getUint32(record + 92, true);
-    const vertexColors =
-      flags & 16 && vertexColorsOffset
-        ? new Float32Array(
-            buffer.buffer,
-            buffer.byteOffset + vertexColorsOffset,
-            vertexCount * 4,
-          )
-        : null;
+    let vertexColors = null;
+    let bucketColors = null;
+    if (flags & 16 && vertexColorsOffset) {
+      const stride = vertexCount * 4;
+      bucketColors = new Array(Math.max(1, bucketCount));
+      for (let b = 0; b < bucketColors.length; b += 1) {
+        bucketColors[b] = new Float32Array(
+          buffer.buffer,
+          buffer.byteOffset + vertexColorsOffset + b * stride * 4,
+          stride,
+        );
+      }
+      vertexColors = bucketColors[0];
+    }
     // v4 图片网格：逐顶点 UV + 纹理地址（缺失时为 null）。
     const uvOffset = view.getUint32(record + 96, true);
     const uvs = uvOffset
@@ -337,6 +344,7 @@ export function parseModel(bytes) {
       indices,
       colors,
       vertexColors,
+      bucketColors,
       uvs,
       texture,
       transformIndex: view.getUint32(record + 56, true),

@@ -124,6 +124,8 @@ interface Entry {
   positionsAnimated: boolean;
   /** 每个拓扑桶一份索引属性（至少一项；0 与静态 indices 相同）。 */
   indexAttributes: THREE.BufferAttribute[];
+  /** 每个拓扑桶一份顶点色属性（仅渐变网格；下标与 indexAttributes 对应）。 */
+  colorAttributes: THREE.BufferAttribute[];
   /** 当前绑定到 geometry 的桶下标，用于跳过重复 setIndex。 */
   currentBucket: number;
   /** 由基础 alpha 推导的可见性（尚未叠加手动隐藏）。 */
@@ -454,30 +456,34 @@ export class Stage {
       const position = new THREE.BufferAttribute(positions, 3);
       position.setUsage(positionsAnimated ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
       geometry.setAttribute('position', position);
-      // 渐变网格的逐顶点 RGBA（v3）：RGB 按 sRGB 一次性转成线性空间，
-      // alpha 直接沿用（透明度 stop 的采样结果）。itemSize 4 会触发
+      // 渐变网格的逐顶点 RGBA（v5）：每个拓扑桶一份。RGB 按 sRGB 一次性转成
+      // 线性空间，alpha 直接沿用（透明度 stop 的采样结果）。itemSize 4 会触发
       // three.js 的 USE_COLOR_ALPHA，顶点 alpha 与材质 alpha 相乘。
       let vertexAlpha = false;
-      if (data.vertexColors) {
+      const colorAttributes: THREE.BufferAttribute[] = [];
+      if (data.bucketColors && data.bucketColors.length > 0) {
         const count = data.vertexCount;
-        const converted = new Float32Array(count * 4);
         const swatch = new THREE.Color();
-        for (let i = 0; i < count; i += 1) {
-          swatch.setRGB(
-            data.vertexColors[i * 4],
-            data.vertexColors[i * 4 + 1],
-            data.vertexColors[i * 4 + 2],
-            THREE.SRGBColorSpace,
-          );
-          converted[i * 4] = swatch.r;
-          converted[i * 4 + 1] = swatch.g;
-          converted[i * 4 + 2] = swatch.b;
-          converted[i * 4 + 3] = data.vertexColors[i * 4 + 3];
-          if (converted[i * 4 + 3] < 0.999) {
-            vertexAlpha = true;
+        for (const source of data.bucketColors) {
+          const converted = new Float32Array(count * 4);
+          for (let i = 0; i < count; i += 1) {
+            swatch.setRGB(
+              source[i * 4],
+              source[i * 4 + 1],
+              source[i * 4 + 2],
+              THREE.SRGBColorSpace,
+            );
+            converted[i * 4] = swatch.r;
+            converted[i * 4 + 1] = swatch.g;
+            converted[i * 4 + 2] = swatch.b;
+            converted[i * 4 + 3] = source[i * 4 + 3];
+            if (converted[i * 4 + 3] < 0.999) {
+              vertexAlpha = true;
+            }
           }
+          colorAttributes.push(new THREE.BufferAttribute(converted, 4));
         }
-        geometry.setAttribute('color', new THREE.BufferAttribute(converted, 4));
+        geometry.setAttribute('color', colorAttributes[0]);
       }
       // 每个拓扑桶一份索引属性；默认绑定桶 0，逐帧按 frameBuckets 切换。
       const indexAttributes = data.buckets.map(
@@ -566,6 +572,7 @@ export class Stage {
         position,
         positionsAnimated,
         indexAttributes,
+        colorAttributes,
         currentBucket: 0,
         staticVisible,
         // 新载入的模型按烘焙层深排序，尚未发生拖拽重排。
@@ -1131,6 +1138,11 @@ export class Stage {
         if (wanted !== entry.currentBucket) {
           entry.currentBucket = wanted;
           entry.geometry.setIndex(buckets[wanted]);
+          // 顶点色与拓扑绑定：不同桶的顶点顺序不同，必须一起切换。
+          const bucketColor = entry.colorAttributes[wanted];
+          if (bucketColor) {
+            entry.geometry.setAttribute('color', bucketColor);
+          }
         }
       }
     }

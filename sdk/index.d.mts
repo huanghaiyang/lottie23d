@@ -80,6 +80,11 @@ export interface MeshModel {
    * 仅渐变网格存在。有值时 `color` 的 RGB 恒为 1，最终颜色 = 顶点色 × `color`。
    */
   vertexColors: Float32Array | null;
+  /**
+   * 每个拓扑桶一份逐顶点 RGBA（长度均为 vertexCount × 4），仅渐变网格存在；
+   * 播放端切换拓扑桶时需同时切换这组颜色属性。无渐变时为 null。
+   */
+  bucketColors: Float32Array[] | null;
   /** 逐顶点 UV（长度 = vertexCount × 2），仅图片网格存在。 */
   uvs: Float32Array | null;
   /** 图片纹理地址（`u + p` 或 data URI），仅图片网格存在。 */

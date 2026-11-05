@@ -1,4 +1,4 @@
-//! 二进制模型编码器（格式版本 4）。
+//! 二进制模型编码器（格式版本 5）。
 //!
 //! 所有偏移均为从 blob 起始处算起的**字节偏移**，整数与浮点一律小端。
 //!
@@ -22,7 +22,10 @@ const HEADER_SIZE: usize = 96;
 /// 单个 mesh record 固定字节数（字段偏移见 [`encode`]）。
 const RECORD_SIZE: usize = 112;
 /// 当前格式版本（`l2d_version` 返回同一值）。
-const VERSION: u32 = 4;
+///
+/// v5：渐变顶点色改为“每个拓扑桶一份”（长度 `桶数 × vertexCount × 4`），
+/// 播放端随索引一起切换颜色属性。
+const VERSION: u32 = 5;
 
 /// 把编译结果序列化为 `.l2d3` 二进制。
 ///
@@ -102,8 +105,9 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         if bucketized {
             flags |= 8;
         }
-        // bit4：存在逐顶点 RGB（渐变网格）。
-        if mesh.vertex_colors.is_some() {
+        // bit4：存在逐顶点 RGB（渐变网格）；数据块按桶顺序存放，
+        //       每桶固定 `vertexCount × 4` 个 f32。
+        if mesh.has_gradient {
             flags |= 16;
         }
         put_u32(&mut blob, record + 4, flags);
@@ -135,18 +139,25 @@ pub fn encode(model: &Compiled) -> Vec<u8> {
         }
         put_u32(&mut blob, record + 40, positions_offset);
 
-        // 逐顶点 RGBA（v3）：长度固定为 vertex_count × 4，按顶点数对齐，
-        // 便于播放端直接作为 BufferAttribute 上传。缺失部分补白（RGBA 1）。
-        let vertex_colors_offset = match &mesh.vertex_colors {
-            Some(colors) => {
-                let offset = (meta_size + data.len()) as u32;
+        // 逐顶点 RGBA（v5）：按拓扑桶顺序连续存放，每桶固定
+        // `vertexCount × 4` 个 f32 —— 播放端切换桶时按同一 stride 取对应切片。
+        // 桶顶点数不足 vertexCount 的部分补白（不影响该桶索引引用到的顶点）。
+        let vertex_colors_offset = if mesh.has_gradient {
+            let offset = (meta_size + data.len()) as u32;
+            for bucket in &mesh.buckets {
                 for index in 0..vertex_count as usize * 4 {
-                    let value = colors.get(index).copied().unwrap_or(1.0);
+                    let value = bucket
+                        .colors
+                        .as_ref()
+                        .and_then(|colors| colors.get(index))
+                        .copied()
+                        .unwrap_or(1.0);
                     data.extend_from_slice(&value.to_le_bytes());
                 }
-                offset
             }
-            None => 0,
+            offset
+        } else {
+            0
         };
         put_u32(&mut blob, record + 92, vertex_colors_offset);
 
