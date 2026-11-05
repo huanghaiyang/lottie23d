@@ -60,6 +60,8 @@ const VIEW_TWEEN_MS = 320;
 
 /** 选中线框颜色（蓝色）。 */
 const SELECTION_COLOR = 0x3d8bff;
+/** 悬停高亮线框颜色（暖黄），与蓝色选中线框区分。 */
+const HOVER_COLOR = 0xffc861;
 /**
  * 节点重排时的层深微调步进（世界单位）。
  * 层深相同的填充/描边子节点靠它获得严格的前后次序，避免同级共面闪烁。
@@ -273,6 +275,8 @@ interface Entry {
   position: THREE.BufferAttribute;
   /** 是否需要逐帧拷贝顶点。 */
   positionsAnimated: boolean;
+  /** 包围球对应的帧号（用于拾取时避免每帧重复计算）；-1 表示尚未计算。 */
+  sphereFrame: number;
   /** 每个拓扑桶一份索引属性（至少一项；0 与静态 indices 相同）。 */
   indexAttributes: THREE.BufferAttribute[];
   /**
@@ -377,6 +381,10 @@ export class Stage {
   private readonly selectionBoxes = new Map<number, THREE.Box3Helper>();
   /** 复用的临时包围盒，避免每次更新都分配 Three 对象。 */
   private readonly boxScratch = new THREE.Box3();
+  /** 当前悬停高亮的节点 id；null 表示没有悬停。 */
+  private hoveredId: number | null = null;
+  /** 悬停线框（暖黄色）；场景里常驻一个，通过 visible 控制显隐。 */
+  private readonly hoverBox = new THREE.Box3Helper(new THREE.Box3(), HOVER_COLOR);
 
   // ---- 透视补偿 ----
   /** 上一帧相机的逆矩阵（每帧重算一次，所有图层共用）。 */
@@ -542,6 +550,15 @@ export class Stage {
     const fill = new THREE.DirectionalLight(0x86a8ff, 0.9);
     fill.position.set(-1.5, -2.8, 3.4);
     this.scene.add(ambient, key, rim, fill);
+
+    // 悬停线框：关闭深度测试，被模型挡住时也保持可见；绘制层低于选中线框。
+    const hoverMaterial = this.hoverBox.material as THREE.LineBasicMaterial;
+    hoverMaterial.depthTest = false;
+    hoverMaterial.transparent = true;
+    hoverMaterial.opacity = 0.85;
+    this.hoverBox.renderOrder = 11;
+    this.hoverBox.visible = false;
+    this.scene.add(this.hoverBox);
 
     this.buildGizmo();
     // 全屏四边形始终充满视口，不能被视锥剔除。
@@ -713,6 +730,7 @@ export class Stage {
         colors,
         position,
         positionsAnimated,
+        sphereFrame: -1,
         indexAttributes,
         gradientLut,
         currentBucket: 0,
@@ -798,9 +816,15 @@ export class Stage {
     const meshes: THREE.Mesh[] = [];
     for (const entry of this.entries) {
       if (entry.mesh.visible) {
-        // 动画网格的顶点逐帧变化，创建时算出的包围球可能已过期，
-        // 过期包围球会让射线在有效像素上提前判定未命中。
-        entry.geometry.computeBoundingSphere();
+        // 动画网格的顶点逐帧变化，创建时算出的包围球可能已过期；
+        // 用帧号做缓存，悬停拾取每帧最多重算一次，静止网格只算一次。
+        if (
+          entry.geometry.boundingSphere == null ||
+          (entry.positionsAnimated && entry.sphereFrame !== this.frameIndex)
+        ) {
+          entry.geometry.computeBoundingSphere();
+          entry.sphereFrame = this.frameIndex;
+        }
         meshes.push(entry.mesh);
       }
     }
@@ -899,6 +923,24 @@ export class Stage {
     }
 
     this.updateSelectionBoxes();
+    // 选中中的节点不显示悬停框，选中集合变化时需要同步刷新。
+    this.updateHoverBox();
+    this.dirty = true;
+  }
+
+  /**
+   * 设置鼠标悬停高亮的节点（“舞台选取”模式下使用）。
+   * 与选中状态无关：悬停用暖黄线框，选中用蓝线框；已选中的节点不再叠加悬停框。
+   *
+   * @param id 节点 id；null 表示清除悬停
+   */
+  setHoverNode(id: number | null): void {
+    const next = id == null || id < 0 || id >= this.entries.length ? null : id;
+    if (this.hoveredId === next) {
+      return;
+    }
+    this.hoveredId = next;
+    this.updateHoverBox();
     this.dirty = true;
   }
 
@@ -990,6 +1032,7 @@ export class Stage {
     }
     this.applyFrame(Math.max(0, this.frameIndex));
     this.updateSelectionBoxes();
+    this.updateHoverBox();
     this.dirty = true;
   }
 
@@ -1152,6 +1195,9 @@ export class Stage {
     this.clear();
     this.disposeGlow();
     this.disposeGizmo();
+    // 悬停框是常驻对象，需要单独释放。
+    this.hoverBox.geometry.dispose();
+    (this.hoverBox.material as THREE.Material).dispose();
     this.controls.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();
@@ -1330,6 +1376,11 @@ export class Stage {
         }
       }
     }
+
+    // 悬停框只涉及一个节点，随当前帧顶点与矩阵刷新。
+    if (this.hoveredId != null) {
+      this.updateHoverBox();
+    }
   }
 
   /** 清空所有网格、线框与柔光外壳（切换模型时调用）。 */
@@ -1354,6 +1405,9 @@ export class Stage {
     this.entries.length = 0;
     this.nodes.length = 0;
     this.hiddenNodes.clear();
+    // 悬停框是常驻对象（不随模型销毁），这里只清空引用与显隐。
+    this.hoveredId = null;
+    this.hoverBox.visible = false;
     this.model = null;
   }
 
@@ -1426,6 +1480,37 @@ export class Stage {
       helper.box.copy(this.boxScratch);
       helper.visible = true;
     }
+  }
+
+  /**
+   * 按当前悬停节点刷新暖黄包围盒。
+   * 隐藏节点、越界 id 或已经选中的节点都不显示（选中已有蓝框，避免叠线）。
+   */
+  private updateHoverBox(): void {
+    const id = this.hoveredId;
+    if (id == null || id < 0 || id >= this.entries.length || this.selectionBoxes.has(id)) {
+      this.hoverBox.visible = false;
+      return;
+    }
+    const entry = this.entries[id];
+    if (!entry.mesh.visible) {
+      this.hoverBox.visible = false;
+      return;
+    }
+    // 与 updateSelectionBoxes 一致：只取当前拓扑桶的顶点，避免残留顶点撑大包围盒。
+    const bucket = entry.data.buckets[entry.currentBucket] ?? entry.data.buckets[0];
+    this.setBoxFromPositions(
+      this.boxScratch,
+      entry.position.array,
+      bucket ? bucket.vertexCount : entry.data.vertexCount,
+    );
+    this.boxScratch.applyMatrix4(entry.mesh.matrixWorld);
+    if (this.boxScratch.isEmpty()) {
+      this.hoverBox.visible = false;
+      return;
+    }
+    this.hoverBox.box.copy(this.boxScratch);
+    this.hoverBox.visible = true;
   }
 
   /**

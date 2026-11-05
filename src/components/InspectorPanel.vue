@@ -36,6 +36,8 @@ const emit = defineEmits<{
   ): void;
   (event: 'toggle-node-glow', id: number, solo: boolean): void;
   (event: 'toggle-node-visibility', id: number): void;
+  /** 悬停节点行时高亮舞台中的对应图层；id 为 null 表示清除。 */
+  (event: 'hover-node', id: number | null): void;
   /** 拖拽调整节点层级：把 fromId 插入到 toId 之前或之后。 */
   (event: 'reorder-node', fromId: number, toId: number, place: 'before' | 'after'): void;
 }>();
@@ -232,6 +234,8 @@ function onNodeClick(id: number, event: MouseEvent): void {
             @drop="onDrop(node, $event)"
             @dragend="onDragEnd"
             @click="onNodeClick(node.id, $event)"
+            @mouseenter="emit('hover-node', node.id)"
+            @mouseleave="emit('hover-node', null)"
           >
             <span
               class="node-glow"

@@ -342,6 +342,10 @@ function onNodeSelect(
 
 /** 舞台点选的按下位置（页面坐标）；null 表示本次按下不来自 3D 画布。 */
 let stagePickStart: { x: number; y: number } | null = null;
+/** 待处理的悬停拾取坐标；同一帧内多次移动只拾取一次。 */
+let hoverPoint: { x: number; y: number } | null = null;
+/** 悬停拾取的 rAF 句柄；0 表示未排队。 */
+let hoverRaf = 0;
 
 /**
  * 记录画布上的按下位置。只有“舞台选取”开启且确实按在 canvas 上才记录，
@@ -381,6 +385,54 @@ function onStagePointerUp(event: PointerEvent): void {
     alt: event.altKey,
     ctrl: event.ctrlKey || event.metaKey,
   });
+}
+
+/**
+ * 节点列表行的悬停：复用舞台的暖黄高亮框，鼠标进入行时点亮对应图层，
+ * 离开时清除（id 为 null）。舞台选取的悬停与列表悬停共用同一高亮。
+ */
+function onNodeHover(id: number | null): void {
+  stage?.setHoverNode(id);
+}
+
+/** 清除悬停高亮并取消尚未执行的拾取。 */
+function clearHover(): void {
+  if (hoverRaf !== 0) {
+    cancelAnimationFrame(hoverRaf);
+    hoverRaf = 0;
+  }
+  stage?.setHoverNode(null);
+}
+
+/** rAF 回调：用最新坐标拾取一次，鼠标已移出画布时跳过。 */
+function flushHoverPick(): void {
+  hoverRaf = 0;
+  const point = hoverPoint;
+  hoverPoint = null;
+  if (point == null || stage == null || !pickMode.value) {
+    return;
+  }
+  stage.setHoverNode(stage.pickNodeAt(point.x, point.y));
+}
+
+/**
+ * 舞台选取模式下的悬停高亮：移动事件只记录坐标，实际射线拾取按帧节流，
+ * 避免鼠标快速划过时每个像素都做一次三角形求交。
+ */
+function onStagePointerMove(event: PointerEvent): void {
+  if (!pickMode.value) {
+    return;
+  }
+  const target = event.target as HTMLElement | null;
+  if (target == null || !target.classList.contains('three-canvas')) {
+    hoverPoint = null;
+    clearHover();
+    return;
+  }
+  hoverPoint = { x: event.clientX, y: event.clientY };
+  if (hoverRaf === 0) {
+    hoverRaf = requestAnimationFrame(flushHoverPick);
+  }
 }
 
 /**
@@ -963,6 +1015,13 @@ watch(softGlow, (value) => {
 // 柔光强度 / 半径是渲染期参数，无需重新转换，暂停时也会立即重绘。
 watch(glowIntensity, (value) => stage?.setGlowIntensity(value));
 watch(glowRadius, (value) => stage?.setGlowRadius(value));
+// 关闭舞台选取时立即清除悬停高亮，避免残留暖黄线框。
+watch(pickMode, (enabled) => {
+  if (!enabled) {
+    hoverPoint = null;
+    clearHover();
+  }
+});
 
 // 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
 onMounted(() => {
@@ -982,6 +1041,7 @@ onMounted(() => {
   // stopPropagation，因此点击轴向 gizmo 不会误触发节点拾取。
   window.addEventListener('pointerdown', onStagePointerDown);
   window.addEventListener('pointerup', onStagePointerUp);
+  window.addEventListener('pointermove', onStagePointerMove);
 
   void boot();
 });
@@ -996,6 +1056,12 @@ onBeforeUnmount(() => {
   window.removeEventListener('drop', onDrop);
   window.removeEventListener('pointerdown', onStagePointerDown);
   window.removeEventListener('pointerup', onStagePointerUp);
+  window.removeEventListener('pointermove', onStagePointerMove);
+  // 取消尚未执行的悬停拾取，避免卸载后访问已销毁的 Stage。
+  if (hoverRaf !== 0) {
+    cancelAnimationFrame(hoverRaf);
+    hoverRaf = 0;
+  }
   window.clearTimeout(toastTimer);
   window.clearTimeout(reconvertTimer);
   disposeAnimation();
@@ -1063,6 +1129,7 @@ onBeforeUnmount(() => {
             @toggle-node-glow="toggleNodeGlow"
             @toggle-node-visibility="toggleNodeVisibility"
             @reorder-node="onNodeReorder"
+            @hover-node="onNodeHover"
           />
           <span class="canvas-hint">
             {{
