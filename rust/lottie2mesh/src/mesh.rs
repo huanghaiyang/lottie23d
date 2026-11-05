@@ -448,29 +448,41 @@ fn ribbon_points(
             }
             let nx = -ty;
             let ny = tx;
-            // 斜接因子：相邻两段法线夹角的余弦，钳制到 0.2 防止尖刺无限长。
-            let dot = if i == 0 && !is_closed {
-                1.0
-            } else if i == n - 1 && !is_closed {
-                1.0
+            // 拐角样式（Lottie `lj`）：1 斜接、2 圆角、3 平角。
+            // 只有斜接会沿角平分线外扩，圆角/平角都停在半宽处；斜接还要
+            // 受 `ml` 限制，超过限制时退化为平角（与 Canvas 语义一致），否则
+            // 尖锐转角会拉出几十像素的长刺，裁剪后表现为尖角碎片。
+            let offset = if drawable.join == 1 {
+                let dot = if i == 0 && !is_closed {
+                    1.0
+                } else if i == n - 1 && !is_closed {
+                    1.0
+                } else {
+                    let p0 = points[i];
+                    let d0x = p0[0] - a[0];
+                    let d0y = p0[1] - a[1];
+                    let l0 = (d0x * d0x + d0y * d0y).sqrt().max(1e-6);
+                    let d1x = b[0] - p0[0];
+                    let d1y = b[1] - p0[1];
+                    let l1 = (d1x * d1x + d1y * d1y).sqrt().max(1e-6);
+                    let n0x = -d0y / l0;
+                    let n0y = d0x / l0;
+                    let n1x = -d1y / l1;
+                    let n1y = d1x / l1;
+                    (n0x * n1x + n0y * n1y).clamp(0.2, 1.0)
+                };
+                let extended = half / dot;
+                // 超过斜接限制时退回平角，而不是把长度钳到上限。
+                if extended.abs() <= half.abs() * drawable.miter.max(1.0) {
+                    extended
+                } else {
+                    half
+                }
             } else {
-                let p0 = points[i];
-                let d0x = p0[0] - a[0];
-                let d0y = p0[1] - a[1];
-                let l0 = (d0x * d0x + d0y * d0y).sqrt().max(1e-6);
-                let d1x = b[0] - p0[0];
-                let d1y = b[1] - p0[1];
-                let l1 = (d1x * d1x + d1y * d1y).sqrt().max(1e-6);
-                let n0x = -d0y / l0;
-                let n0y = d0x / l0;
-                let n1x = -d1y / l1;
-                let n1y = d1x / l1;
-                (n0x * n1x + n0y * n1y).clamp(0.2, 1.0)
+                half
             };
-            // 斜接长度受样式 miter 限制，避免锐角处过长。
-            let miter = (half / dot).min(half * drawable.miter.max(1.0));
-            out.push([points[i][0] + nx * miter, points[i][1] + ny * miter]);
-            out.push([points[i][0] - nx * miter, points[i][1] - ny * miter]);
+            out.push([points[i][0] + nx * offset, points[i][1] + ny * offset]);
+            out.push([points[i][0] - nx * offset, points[i][1] - ny * offset]);
         }
     }
     !out.is_empty()

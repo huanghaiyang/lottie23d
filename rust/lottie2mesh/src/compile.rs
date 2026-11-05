@@ -2520,7 +2520,9 @@ fn matte_contours(plans: &[Plan], id: usize, root_frame: f32) -> Option<Vec<Cont
                 if drawable.kind == DrawKind::Stroke {
                     // 描边图层的 alpha 是「中心线两侧的带状区域」，不能直接用
                     // 中心线闭合环（那会把内容裁成一条线）。
-                    contours.extend(stroke_band(drawable));
+                    // 描边带是自相交的单环，先用非零环绕消解交叠，避免奇偶规则
+                    // 把交叠区当成孔洞，导致裁剪后内弧出现缺口。
+                    contours.extend(boolops::simplify(&stroke_band(drawable)));
                 } else {
                     // 填充同理：`tm` 生效后真正绘制的区域是修剪后的轮廓。
                     for (contour, _, _) in shape::drawable_slots(drawable) {
@@ -2556,7 +2558,13 @@ fn stroke_band(drawable: &Drawable) -> Vec<Contour> {
         if contour.pts.len() < 2 {
             continue;
         }
-        contours.extend(stroke_outline(&contour, half, drawable.cap, drawable.miter));
+        contours.extend(stroke_outline(
+            &contour,
+            half,
+            drawable.cap,
+            drawable.join,
+            drawable.miter,
+        ));
     }
     contours
 }
@@ -2566,7 +2574,7 @@ fn stroke_band(drawable: &Drawable) -> Vec<Contour> {
 /// 与「逐段四边形求并」相比，单环做法的面积与 Canvas 描边一致，且只需一次
 /// 布尔运算；逐段求并会因数十个四边形依次折叠而数值退化（`shot_01` 的锯齿
 /// 中心线实测会整片消失），因此保留单环。
-fn stroke_outline(contour: &Contour, half: f32, cap: u8, miter: f32) -> Vec<Contour> {
+fn stroke_outline(contour: &Contour, half: f32, cap: u8, join: u8, miter: f32) -> Vec<Contour> {
     let points = &contour.pts;
     let n = points.len();
     if n < 2 {
@@ -2607,7 +2615,7 @@ fn stroke_outline(contour: &Contour, half: f32, cap: u8, miter: f32) -> Vec<Cont
             ty /= length;
         }
         let (nx, ny) = (-ty, tx);
-        // 斜接长度：用相邻两段法线的夹角余弦放大，并受样式 miter 限制。
+        // 拐角样式：只有斜接（lj=1）沿角平分线外扩，且超过 ml 限制时退回平角。
         let dot = if !closed && (i == 0 || i == n - 1) {
             1.0
         } else {
@@ -2624,7 +2632,12 @@ fn stroke_outline(contour: &Contour, half: f32, cap: u8, miter: f32) -> Vec<Cont
             let n1y = d1x / l1;
             (n0x * n1x + n0y * n1y).clamp(0.2, 1.0)
         };
-        let offset = (half / dot).min(half * miter.max(1.0));
+        let extended = half / dot;
+        let offset = if join == 1 && extended.abs() <= half.abs() * miter.max(1.0) {
+            extended
+        } else {
+            half
+        };
         tangents.push([tx, ty]);
         normals.push([nx, ny]);
         left.push([points[i][0] + nx * offset, points[i][1] + ny * offset]);

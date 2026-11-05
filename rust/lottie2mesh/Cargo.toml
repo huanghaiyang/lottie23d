@@ -16,6 +16,9 @@ path = "src/bin/cli.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 earcutr = "0.5"
+# 多边形布尔运算（合并路径、遮罩裁剪）。自研实现在共线重叠边界上不稳定，
+# 这里换成基于整数网格的成熟实现；仅转换期使用，不进入 wasm 运行时。
+i_overlay = "9"
 
 [profile.release]
 opt-level = 3
