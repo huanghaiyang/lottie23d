@@ -22,11 +22,45 @@ use serde_json::Value;
 /// 返回值分量顺序与 Lottie 定义一致（如位置为 x, y, z）。
 pub fn eval(value: &Value, frame: f32) -> Vec<f32> {
     let k = value.get("k").unwrap_or(value);
+    let mode = loop_mode_of(value);
     if is_keyframed(value) {
-        eval_keyframes(k, frame)
+        eval_keyframes(k, frame, mode)
     } else {
         eval_static(k)
     }
+}
+
+/// `loopOut` 表达式的循环类型，对齐 AE / lottie-web 的 Property loop。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoopMode {
+    /// 首尾区间反复重播（未写类型时 AE 默认）。
+    Cycle,
+    /// 在首尾之间往返弹跳。
+    PingPong,
+    /// 重播并在每个周期叠加首尾差值（值持续漂移）。
+    Offset,
+    /// 超出末关键帧后按末段斜率线性外推。
+    Continue,
+}
+
+/// 从属性 `x` 表达式里识别 `loopOut(...)` 的循环类型；无表达式时返回 `None`。
+///
+/// 只做定点字符串匹配（与现有表达式插件策略一致），不解释任意 JS。
+fn loop_mode_of(prop: &Value) -> Option<LoopMode> {
+    let expr = prop.get("x").and_then(Value::as_str)?;
+    let expr = expr.to_ascii_lowercase();
+    if !expr.contains("loopout") {
+        return None;
+    }
+    Some(if expr.contains("pingpong") {
+        LoopMode::PingPong
+    } else if expr.contains("offset") {
+        LoopMode::Offset
+    } else if expr.contains("continue") {
+        LoopMode::Continue
+    } else {
+        LoopMode::Cycle
+    })
 }
 
 /// 属性是否按关键帧求值。
@@ -102,10 +136,14 @@ fn eval_static(k: &Value) -> Vec<f32> {
 /// 边界行为与 lottie-web 一致：首帧之前返回首帧值；末帧之后返回末帧值
 /// （优先 `s`，为空再用 `e`）；区间内先算线性进度 `progress`，再经
 /// cubic-bezier 缓冲曲线得到缓动进度。
-fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
+fn eval_keyframes(frames: &Value, frame: f32, mode: Option<LoopMode>) -> Vec<f32> {
     let Some(list) = frames.as_array() else {
         return eval_static(frames);
     };
+    eval_keyframe_list(list, frame, mode)
+}
+
+fn eval_keyframe_list(list: &[Value], frame: f32, mode: Option<LoopMode>) -> Vec<f32> {
     if list.is_empty() {
         return Vec::new();
     }
@@ -121,7 +159,7 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
 
     // 找到包含当前帧的区间：取最后一个 `t <= frame` 的关键帧。
     let mut index = 0usize;
-    for i in 0..list.len() - 1 {
+    for i in 0..list.len() {
         if frame >= time_of(&list[i]) {
             index = i;
         } else {
@@ -131,6 +169,15 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
 
     if index >= list.len() - 1 {
         let last = &list[list.len() - 1];
+        // 超出末关键帧：带 loopOut 表达式时按循环类型外推，否则钳到末帧值。
+        if frame > time_of(last) {
+            if let Some(mode) = mode {
+                let looped = eval_loop_tail(list, frame, mode);
+                if !looped.is_empty() {
+                    return looped;
+                }
+            }
+        }
         let value = key_start(last);
         return if value.is_empty() { key_end(last) } else { value };
     }
@@ -181,6 +228,59 @@ fn eval_keyframes(frames: &Value, frame: f32) -> Vec<f32> {
         out[i] = s[i] + (e[i] - s[i]) * p;
     }
     out
+}
+
+/// 超出末关键帧后按循环类型求值。
+///
+/// 首尾区间为 `[t0, t1]`；`cycle` 重播、`pingpong` 往返、`offset` 重播并叠加
+/// 首尾差值、`continue` 按末段斜率外推。`seg <= 0` 或末值缺失时退回末帧值。
+fn eval_loop_tail(list: &[Value], frame: f32, mode: LoopMode) -> Vec<f32> {
+    let first = &list[0];
+    let last = &list[list.len() - 1];
+    let t0 = time_of(first);
+    let t1 = time_of(last);
+    let seg = t1 - t0;
+    let v_first = key_start(first);
+    let v_last = key_start(last);
+    if seg <= 1e-6 || v_last.is_empty() {
+        return v_last;
+    }
+
+    match mode {
+        LoopMode::Continue => {
+            let dims = v_first.len().min(v_last.len());
+            let mut out = v_last.clone();
+            for i in 0..dims {
+                let f0 = v_first.get(i).copied().unwrap_or(v_last[i]);
+                let slope = (v_last[i] - f0) / seg;
+                out[i] = v_last[i] + (frame - t1) * slope;
+            }
+            out
+        }
+        LoopMode::Offset => {
+            let cycles = ((frame - t0) / seg).floor().max(0.0);
+            let local = t0 + (frame - t0).rem_euclid(seg);
+            let base = eval_keyframe_list(list, local, None);
+            let dims = v_first.len().min(v_last.len()).min(base.len());
+            let mut out = base.clone();
+            for i in 0..dims {
+                let f0 = v_first.get(i).copied().unwrap_or(v_last[i]);
+                out[i] = base[i] + cycles * (v_last[i] - f0);
+            }
+            out
+        }
+        LoopMode::Cycle => {
+            let local = t0 + (frame - t0).rem_euclid(seg);
+            eval_keyframe_list(list, local, None)
+        }
+        LoopMode::PingPong => {
+            let phase = (frame - t0) / seg;
+            let fold = phase.rem_euclid(2.0);
+            let tri = if fold <= 1.0 { fold } else { 2.0 - fold };
+            let local = t0 + seg * tri;
+            eval_keyframe_list(list, local, None)
+        }
+    }
 }
 
 /// 读取关键帧的 `t`（帧号），缺失时按 0 处理。
@@ -325,4 +425,61 @@ fn spatial_value(s: &[f32], e: &[f32], to: &[f32], ti: &[f32], progress: f32) ->
         out[axis] = points[i - 1][axis] + (points[i][axis] - points[i - 1][axis]) * local;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 构造 0→10 帧、值 0→100 的单维关键帧属性，带指定循环表达式。
+    fn looped(expr: &str) -> Value {
+        json!({
+            "k": [
+                { "t": 0.0, "s": [0.0] },
+                { "t": 10.0, "s": [100.0] }
+            ],
+            "x": expr
+        })
+    }
+
+    #[test]
+    fn cycle_repeats_segment_beyond_last() {
+        // 帧 15 落在第二个周期的第 5 帧 → 50。
+        let v = eval(&looped("loopOut('cycle')"), 15.0);
+        assert!((v[0] - 50.0).abs() < 1e-3, "got {}", v[0]);
+    }
+
+    #[test]
+    fn pingpong_bounces_back_and_forth() {
+        // 帧 15：phase 1.5 → 三角波 0.5 → 50；帧 20：phase 2 → 0 → 0。
+        let mid = eval(&looped("loopOut('pingpong')"), 15.0);
+        assert!((mid[0] - 50.0).abs() < 1e-3, "got {}", mid[0]);
+        let back = eval(&looped("loopOut('pingpong')"), 20.0);
+        assert!(back[0].abs() < 1e-3, "got {}", back[0]);
+    }
+
+    #[test]
+    fn continue_extrapolates_last_slope() {
+        // 末段斜率 10/帧；帧 15 → 100 + 5*10 = 150。
+        let v = eval(&looped("loopOut('continue')"), 15.0);
+        assert!((v[0] - 150.0).abs() < 1e-3, "got {}", v[0]);
+    }
+
+    #[test]
+    fn offset_drifts_by_endpoint_delta() {
+        // 帧 15：1 个完整周期，局部 50 + 漂移 100 = 150。
+        let v = eval(&looped("loopOut('offset')"), 15.0);
+        assert!((v[0] - 150.0).abs() < 1e-3, "got {}", v[0]);
+    }
+
+    #[test]
+    fn no_loop_clamps_to_last_value() {
+        let plain = json!({ "k": [
+            { "t": 0.0, "s": [0.0] },
+            { "t": 10.0, "s": [100.0] }
+        ]});
+        let v = eval(&plain, 15.0);
+        assert!((v[0] - 100.0).abs() < 1e-3, "got {}", v[0]);
+    }
 }

@@ -2234,27 +2234,6 @@ fn affine_matrix(matrix: Affine) -> [f32; 16] {
     ]
 }
 
-/// 读取关键帧的起始时间 `t`。
-fn key_start_time(keyframe: &Value) -> Option<f32> {
-    keyframe.get("t").and_then(Value::as_f64).map(|t| t as f32)
-}
-
-/// 时间重映射是否带 `loopOut('cycle')` 之类的循环表达式。
-///
-/// lottie-web 自带表达式插件，`loopOut` 会以「父合成当前帧」为时间轴，
-/// 超出末关键帧后把时间按关键帧区间循环。未写类型时 AE 默认是 `cycle`；
-/// `pingpong` / `offset` / `continue` 暂不支持。
-fn tm_loops_cycle(tm: &Value) -> bool {
-    let Some(expr) = tm.get("x").and_then(Value::as_str) else {
-        return false;
-    };
-    let expr = expr.to_ascii_lowercase();
-    if !expr.contains("loopout") {
-        return false;
-    }
-    !expr.contains("pingpong") && !expr.contains("offset") && !expr.contains("continue")
-}
-
 /// 计算图层自身坐标系下的时间（单位：帧）。
 ///
 /// 父合成若启用时间重映射 `tm`，先按 `tm(秒) * 帧率` 换算子合成时间（优先于
@@ -2270,23 +2249,9 @@ fn plan_local_frame(plans: &[Plan], id: usize, root_frame: f32) -> f32 {
             // 时间重映射：值以秒计，帧率是 lottie-web 里 getProp 的乘数；
             // 求值失败（属性缺失）时退回 sr 路径。
             let remapped = owner_layer.tm.as_ref().and_then(|tm| {
-                // loopOut 以「父合成帧」为时间轴：超出末关键帧后按关键帧区间循环，
-                // 这样子合成会反复播放（例如海星眼睛周期性眨眼）。
-                let comp_frame = owner_frame;
-                let frame = match tm.get("k").and_then(Value::as_array) {
-                    Some(keyframes) if tm_loops_cycle(tm) => {
-                        let first = keyframes.first().and_then(key_start_time);
-                        let last = keyframes.last().and_then(key_start_time);
-                        match (first, last) {
-                            (Some(first), Some(last)) if last > first && comp_frame > last => {
-                                first + (comp_frame - first) % (last - first)
-                            }
-                            _ => owner_frame,
-                        }
-                    }
-                    _ => owner_frame,
-                };
-                prop::eval(tm, frame).first().copied()
+                // loopOut 循环（cycle/pingpong/offset/continue）由 prop::eval 内部
+                // 按属性 `x` 表达式识别并外推；这里直接在父合成帧上求值。
+                prop::eval(tm, owner_frame).first().copied()
             });
             match remapped {
                 Some(seconds) => seconds * owner_plan.frame_rate,
