@@ -256,6 +256,14 @@ body {
   border-color: var(--accent);
 }
 
+.backend-select.is-disabled {
+  opacity: 0.45;
+}
+
+.backend-select.is-disabled select {
+  cursor: not-allowed;
+}
+
 .canvas-wrap {
   position: relative;
   flex: 1;

@@ -18,6 +18,10 @@ import {
 import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
 import { AXIS_LABELS, Stage, type RendererBackend, type StageNode, type ViewAxis } from './scene/stage';
+import { PixiStage } from './scene/pixiStage';
+
+/** 渲染引擎：three.js（全特性）/ PixiJS 3D（open beta，部分能力退化）。 */
+type RenderEngine = 'three' | 'pixi';
 
 // 页面级数据流：
 // Lottie JSON → converter.convert() 得到二进制模型 → Stage.setModel() 建立网格；
@@ -67,6 +71,8 @@ const glowIntensity = ref(1);
 const glowRadius = ref(1);
 /** 渲染后端：WebGL（全特性）/ WebGPU（渐变、柔光退化）。 */
 const backend = ref<RendererBackend>('webgl');
+/** 渲染引擎：three.js / PixiJS 3D；仅 three 引擎支持 WebGL/WebGPU 后端切换。 */
+const engine = ref<RenderEngine>('three');
 /** 单节点柔光覆盖：true 强制发光，false 强制排除（与总开关组合）。 */
 const nodeGlow = reactive<Record<number, boolean>>({});
 /** 单节点显隐，缺省（undefined）视为可见。 */
@@ -127,7 +133,7 @@ const sources = computed(() => {
 });
 
 // ---- 非响应式的运行时对象 ----
-let stage: Stage | null = null;
+let stage: Stage | PixiStage | null = null;
 let converter: Converter | null = null;
 let animation: AnimationItem | null = null;
 let model: Model | null = null;
@@ -1030,13 +1036,19 @@ watch(pickMode, (enabled) => {
  * 切换渲染后端时先释放旧舞台，再用新后端构造，并把滑块初值、当前模型、
  * 节点顺序与播放帧重新灌回去；逐节点的选择/发光/显隐临时状态随模型重建清空。
  */
-function createStage(): void {
+async function createStage(): Promise<void> {
   const previousOrder = nodes.value.map((node) => node.id);
   if (stage) {
     stage.dispose();
     stage = null;
   }
-  stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick }, backend.value);
+  const host = threeHost.value as HTMLDivElement;
+  if (engine.value === 'pixi') {
+    // Pixi Application 初始化是异步的，需 await 后再回灌选项与模型。
+    stage = await PixiStage.create(host, { onAxisPick });
+  } else {
+    stage = new Stage(host, { onAxisPick }, backend.value);
+  }
   (window as unknown as { __stage: unknown }).__stage = stage;
   stage.setDepthScale(depth.value);
   stage.setThicknessScale(thickness.value);
@@ -1053,14 +1065,19 @@ function createStage(): void {
   syncScene();
 }
 
-/** 渲染后端下拉切换：重建舞台并沿用当前模型与播放进度。 */
+/** 渲染引擎下拉切换：重建舞台并沿用当前模型与播放进度。 */
+function onEngineChange(): void {
+  void createStage();
+}
+
+/** 渲染后端下拉切换：仅 three 引擎生效，重建舞台并沿用当前模型与播放进度。 */
 function onBackendChange(): void {
-  createStage();
+  void createStage();
 }
 
 // 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
 onMounted(() => {
-  createStage();
+  void createStage();
 
   rafId = requestAnimationFrame(tick);
   window.addEventListener('keydown', onKeyDown);
@@ -1137,9 +1154,20 @@ onBeforeUnmount(() => {
             <h2>Three.js</h2>
           </div>
           <div class="pane-head-right">
-            <label class="backend-select" title="切换渲染后端；WebGPU 下渐变与柔光暂退化">
+            <label class="backend-select" title="切换渲染引擎；PixiJS 3D 为 open beta，拾取/柔光/渐变等暂退化">
+              <span>引擎</span>
+              <select v-model="engine" @change="onEngineChange">
+                <option value="three">Three.js</option>
+                <option value="pixi">PixiJS 3D</option>
+              </select>
+            </label>
+            <label
+              class="backend-select"
+              title="切换渲染后端；WebGPU 下渐变与柔光暂退化（仅 Three.js 引擎）"
+              :class="{ 'is-disabled': engine === 'pixi' }"
+            >
               <span>渲染</span>
-              <select v-model="backend" @change="onBackendChange">
+              <select v-model="backend" :disabled="engine === 'pixi'" @change="onBackendChange">
                 <option value="webgl">WebGL</option>
                 <option value="webgpu">WebGPU</option>
               </select>
