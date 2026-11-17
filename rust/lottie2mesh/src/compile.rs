@@ -1109,11 +1109,11 @@ impl<'a> Compiler<'a> {
             .and_then(Value::as_str)
             .map(|expression| expression.contains("tangentOnPath"))
             .unwrap_or(false);
-        Some(TraceSpec {
-            target,
-            progress,
-            rotate,
-        })
+    Some(TraceSpec {
+        target,
+        progress,
+        rotate,
+    })
     }
 
     /// 解析图层位置上的弹性回弹表达式。

@@ -546,11 +546,18 @@ fn eval_group_items(
     inherited_trims: &[TrimSpec],
 ) {
     // 组变换作用于组内全部内容，与 `tr` 在列表中的位置无关。
-    let transform = items
+    let group_tr = items
         .iter()
-        .find(|item| item.get("ty").and_then(Value::as_str) == Some("tr"))
+        .find(|item| item.get("ty").and_then(Value::as_str) == Some("tr"));
+    let transform = group_tr
         .map(|tr| transform_matrix(tr, frame))
         .unwrap_or(Affine::IDENTITY);
+    // 组内 `tr.o` 是整组不透明度乘数（0..100）；lottie-web 对组内所有
+    // 填充/描边统一相乘，缺失时按不透明处理。
+    let group_opacity = group_tr
+        .map(|tr| prop::eval_scalar(tr, "o", frame, 100.0) / 100.0)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
 
     // `tm` 按照 lottie-web 的修饰器语义作用：同一层里数组下标更大的
     // `tm` 修饰下标更小的路径（无论样式在两者之间还是之外），并递归
@@ -756,6 +763,12 @@ fn eval_group_items(
         for path in active.iter_mut() {
             transform_contour(&mut path.contour, transform);
         }
+    }
+
+    // 组不透明度乘到本组全部绘制项（含子组冒泡上来的项）；嵌套组由各自
+    // 的 `group_opacity` 逐级相乘。
+    for drawable in local.drawables.iter_mut() {
+        drawable.opacity *= group_opacity;
     }
 
     out.drawables.extend(local.drawables);
