@@ -17,7 +17,7 @@ import {
 } from './library';
 import type { LottieData } from './lottie/types';
 import { SAMPLES } from './samples';
-import { AXIS_LABELS, Stage, type StageNode, type ViewAxis } from './scene/stage';
+import { AXIS_LABELS, Stage, type RendererBackend, type StageNode, type ViewAxis } from './scene/stage';
 
 // 页面级数据流：
 // Lottie JSON → converter.convert() 得到二进制模型 → Stage.setModel() 建立网格；
@@ -65,6 +65,8 @@ const softGlow = ref(false);
 const glowIntensity = ref(1);
 /** 柔光半径倍率（0.2..3）：1 为默认，越大越柔和。 */
 const glowRadius = ref(1);
+/** 渲染后端：WebGL（全特性）/ WebGPU（渐变、柔光退化）。 */
+const backend = ref<RendererBackend>('webgl');
 /** 单节点柔光覆盖：true 强制发光，false 强制排除（与总开关组合）。 */
 const nodeGlow = reactive<Record<number, boolean>>({});
 /** 单节点显隐，缺省（undefined）视为可见。 */
@@ -1023,14 +1025,42 @@ watch(pickMode, (enabled) => {
   }
 });
 
-// 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
-onMounted(() => {
-  stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick });
+/**
+ * 创建（或按当前后端重建）three 舞台。
+ * 切换渲染后端时先释放旧舞台，再用新后端构造，并把滑块初值、当前模型、
+ * 节点顺序与播放帧重新灌回去；逐节点的选择/发光/显隐临时状态随模型重建清空。
+ */
+function createStage(): void {
+  const previousOrder = nodes.value.map((node) => node.id);
+  if (stage) {
+    stage.dispose();
+    stage = null;
+  }
+  stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick }, backend.value);
   (window as unknown as { __stage: unknown }).__stage = stage;
   stage.setDepthScale(depth.value);
   stage.setThicknessScale(thickness.value);
   stage.setAutoRotate(autoRotate.value);
   stage.setSoftGlow(softGlow.value);
+  stage.setGlowIntensity(glowIntensity.value);
+  stage.setGlowRadius(glowRadius.value);
+  stage.setRotationLock(axisLock.value);
+  if (model) {
+    stage.setModel(model);
+    syncNodes();
+    restoreNodeOrder(previousOrder);
+  }
+  syncScene();
+}
+
+/** 渲染后端下拉切换：重建舞台并沿用当前模型与播放进度。 */
+function onBackendChange(): void {
+  createStage();
+}
+
+// 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
+onMounted(() => {
+  createStage();
 
   rafId = requestAnimationFrame(tick);
   window.addEventListener('keydown', onKeyDown);
@@ -1106,7 +1136,16 @@ onBeforeUnmount(() => {
             <span class="dot dot-three"></span>
             <h2>Three.js</h2>
           </div>
-          <span class="pane-meta">{{ rightMeta }}</span>
+          <div class="pane-head-right">
+            <label class="backend-select" title="切换渲染后端；WebGPU 下渐变与柔光暂退化">
+              <span>渲染</span>
+              <select v-model="backend" @change="onBackendChange">
+                <option value="webgl">WebGL</option>
+                <option value="webgpu">WebGPU</option>
+              </select>
+            </label>
+            <span class="pane-meta">{{ rightMeta }}</span>
+          </div>
         </div>
         <div
           ref="threeHost"

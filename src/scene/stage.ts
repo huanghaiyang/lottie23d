@@ -1,6 +1,30 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { WebGPURenderer } from 'three/webgpu';
 import type { Model, MeshModel, GradientModel } from '../../sdk/index.mjs';
+
+/** 渲染后端：默认 WebGL；可选 three/webgpu 的 WebGPURenderer（特性退化，见下）。 */
+export type RendererBackend = 'webgl' | 'webgpu';
+
+/**
+ * 两种渲染器共用的最小接口。WebGLRenderer 与 WebGPURenderer 都实现这套
+ * 方法签名；Stage 只依赖该结构，不引用具体后端类型。
+ */
+interface StageRenderer {
+  readonly domElement: HTMLCanvasElement;
+  autoClear: boolean;
+  setPixelRatio(pixelRatio: number): void;
+  setSize(width: number, height: number, updateStyle?: boolean): void;
+  setClearColor(color: number | THREE.Color, alpha: number): void;
+  setRenderTarget(target: unknown): void;
+  setViewport(x: number, y: number, width: number, height: number): void;
+  setScissor(x: number, y: number, width: number, height: number): void;
+  setScissorTest(enabled: boolean): void;
+  clear(depth?: boolean, color?: boolean, stencil?: boolean): void;
+  clearDepth(): void;
+  render(scene: THREE.Scene, camera: THREE.Camera): void;
+  dispose(): void;
+}
 
 /** 六个 Blender 风格观察方向：+X、-X、+Y、-Y、+Z、-Z。 */
 export type ViewAxis = 'x' | '-x' | 'y' | '-y' | 'z' | '-z';
@@ -350,7 +374,11 @@ function measureMinLayerGap(meshes: readonly MeshModel[]): number {
  */
 export class Stage {
   // ---- 渲染基础设施 ----
-  private readonly renderer: THREE.WebGLRenderer;
+  private readonly renderer: StageRenderer;
+  /** 当前渲染后端。 */
+  private readonly backend: RendererBackend;
+  /** WebGPU 后端下，渐变注入（onBeforeCompile）与柔光 ShaderMaterial 后处理退化。 */
+  private readonly isWebGPU: boolean;
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.OrthographicCamera;
   private readonly controls: OrbitControls;
@@ -489,24 +517,41 @@ export class Stage {
   };
 
   /**
-   * @param host 承载 WebGL canvas 的容器（尺寸变化由 ResizeObserver 自动跟随）
+   * @param host 承载渲染 canvas 的容器（尺寸变化由 ResizeObserver 自动跟随）
    * @param callbacks 可选回调（例如 gizmo 轴向点击）
+   * @param backend 渲染后端；默认 WebGL，可选 WebGPU（渐变/柔光退化）
    */
-  constructor(host: HTMLElement, callbacks: StageCallbacks = {}) {
+  constructor(
+    host: HTMLElement,
+    callbacks: StageCallbacks = {},
+    backend: RendererBackend = 'webgl',
+  ) {
     this.host = host;
     this.callbacks = callbacks;
+    this.backend = backend;
+    this.isWebGPU = backend === 'webgpu';
     // alpha + 透明清屏色：让页面背景的渐变透出来。
-    this.renderer = new THREE.WebGLRenderer({
-      antialias: true,
-      alpha: true,
-      powerPreference: 'high-performance',
-      // 对数深度缓冲：同一图层的多个 drawable 挤出面完全共面，只能靠极小的 Z
-      // 偏移还原 Lottie 的绘制顺序；线性深度在 z≈7 处每个 16 位深度单位约合
-      // 0.0037 世界单位，这类百分之一量级的偏移会被量化成 z-fighting 虚线
-      // （dalek 拔塞器蓝色内圈因此被切成斜虚线）。对数深度按相对量均匀分配
-      // 精度，同一偏移可得到成百上千个深度单位。
-      logarithmicDepthBuffer: true,
-    });
+    if (this.isWebGPU) {
+      // WebGPU 后端：不支持 WebGL 专属的对数深度缓冲；渐变注入与柔光后处理
+      // 在 isWebGPU 旁路中关闭（见 setModel / renderGlow）。
+      this.renderer = new WebGPURenderer({
+        antialias: true,
+        alpha: true,
+        powerPreference: 'high-performance',
+      }) as unknown as StageRenderer;
+    } else {
+      this.renderer = new THREE.WebGLRenderer({
+        antialias: true,
+        alpha: true,
+        powerPreference: 'high-performance',
+        // 对数深度缓冲：同一图层的多个 drawable 挤出面完全共面，只能靠极小的 Z
+        // 偏移还原 Lottie 的绘制顺序；线性深度在 z≈7 处每个 16 位深度单位约合
+        // 0.0037 世界单位，这类百分之一量级的偏移会被量化成 z-fighting 虚线
+        // （dalek 拔塞器蓝色内圈因此被切成斜虚线）。对数深度按相对量均匀分配
+        // 精度，同一偏移可得到成百上千个深度单位。
+        logarithmicDepthBuffer: true,
+      });
+    }
     // 限制 DPR，避免高分屏 4K 画布带来 4 倍以上填充率开销。
     this.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
     this.renderer.setPixelRatio(this.pixelRatio);
@@ -545,14 +590,18 @@ export class Stage {
     });
 
     // 固定三点布光 + 环境光：突出挤出薄板的体积感与正面颜色。
-    const ambient = new THREE.AmbientLight(0xffffff, 1.25);
-    const key = new THREE.DirectionalLight(0xdfe9ff, 2.4);
-    key.position.set(2.4, 3.2, 4.2);
-    const rim = new THREE.DirectionalLight(0xffb98a, 1.6);
-    rim.position.set(-3.4, -1.6, -2.2);
-    const fill = new THREE.DirectionalLight(0x86a8ff, 0.9);
-    fill.position.set(-1.5, -2.8, 3.4);
-    this.scene.add(ambient, key, rim, fill);
+    // WebGPU 后端下 legacy 灯光不被节点系统识别（LightsNode 告警），且材质
+    // 改用不受光照的 Basic 材质，因此跳过布光。
+    if (!this.isWebGPU) {
+      const ambient = new THREE.AmbientLight(0xffffff, 1.25);
+      const key = new THREE.DirectionalLight(0xdfe9ff, 2.4);
+      key.position.set(2.4, 3.2, 4.2);
+      const rim = new THREE.DirectionalLight(0xffb98a, 1.6);
+      rim.position.set(-3.4, -1.6, -2.2);
+      const fill = new THREE.DirectionalLight(0x86a8ff, 0.9);
+      fill.position.set(-1.5, -2.8, 3.4);
+      this.scene.add(ambient, key, rim, fill);
+    }
 
     // 悬停线框：关闭深度测试，被模型挡住时也保持可见；绘制层低于选中线框。
     const hoverMaterial = this.hoverBox.material as THREE.LineBasicMaterial;
@@ -683,7 +732,16 @@ export class Stage {
             transparent: true,
             opacity: Math.max(0, Math.min(1, alpha)),
           })
-        : new THREE.MeshLambertMaterial({
+        : this.isWebGPU
+          ? // WebGPU 后端：legacy 灯光不被节点系统识别，Lambert 会因无光照变黑；
+            // 改用不受光照的 Basic 材质保留基础色（渐变/柔光仍按旁路退化）。
+            new THREE.MeshBasicMaterial({
+              color: baseColor,
+              side: THREE.DoubleSide,
+              transparent: colors != null || alpha < 0.999 || gradientAlpha,
+              opacity: Math.max(0, Math.min(1, alpha)),
+            })
+          : new THREE.MeshLambertMaterial({
             color: baseColor,
             // 渐变网格的颜色由片元注入，不再使用顶点色属性。
             vertexColors: false,
@@ -696,7 +754,8 @@ export class Stage {
             opacity: Math.max(0, Math.min(1, alpha)),
           });
       // 渐变网格：注入逐片元求值，颜色只与片元位置有关。
-      if (data.gradient && gradientLut) {
+      // WebGPU 后端不走 onBeforeCompile 字符串替换，渐变退化为基础色材质。
+      if (data.gradient && gradientLut && !this.isWebGPU) {
         applyGradientShader(material, data.gradient, gradientLut);
       }
       // 关闭全部矩阵自动更新：世界矩阵由 applyFrame 直接写入。
@@ -1190,6 +1249,11 @@ export class Stage {
     this.dirty = false;
   }
 
+  /** 当前渲染后端标识（供 UI 展示）。 */
+  getBackend(): RendererBackend {
+    return this.backend;
+  }
+
   /** 释放所有 GPU / DOM 资源；调用后 Stage 不可再用。 */
   dispose(): void {
     this.observer.disconnect();
@@ -1598,6 +1662,10 @@ export class Stage {
    * 只要有一个节点发光就会执行，即使总柔光开关关闭。
    */
   private renderGlow(width: number, height: number): void {
+    // WebGPU 后端下柔光依赖的 ShaderMaterial 后处理退化，直接跳过。
+    if (this.isWebGPU) {
+      return;
+    }
     if (this.glowMeshes.size === 0 || this.glowIntensity <= 0) {
       return;
     }
