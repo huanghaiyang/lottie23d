@@ -55,6 +55,8 @@ const AXIS_COLORS: Record<ViewAxis, number> = {
 
 /** 默认视角：正对 +Z（Blender 的正视图），相机距离原点 7.2。 */
 const AXIS_HOME = new THREE.Vector3(0, 0, 7.2);
+/** 正交相机取景半高（世界单位）：对齐原 40° 透视在 7.2 距离原点平面的可见半高。 */
+const ORTHO_HALF_HEIGHT = 2.62;
 /** 轴向切换的补间时长（毫秒）。 */
 const VIEW_TWEEN_MS = 320;
 
@@ -350,7 +352,7 @@ export class Stage {
   // ---- 渲染基础设施 ----
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
-  private readonly camera: THREE.PerspectiveCamera;
+  private readonly camera: THREE.OrthographicCamera;
   private readonly controls: OrbitControls;
   private readonly host: HTMLElement;
 
@@ -386,15 +388,6 @@ export class Stage {
   /** 悬停线框（暖黄色）；场景里常驻一个，通过 visible 控制显隐。 */
   private readonly hoverBox = new THREE.Box3Helper(new THREE.Box3(), HOVER_COLOR);
 
-  // ---- 透视补偿 ----
-  /** 上一帧相机的逆矩阵（每帧重算一次，所有图层共用）。 */
-  private readonly cameraInverse = new THREE.Matrix4();
-  /** 相机到观察目标的距离，即补偿后的投影参考平面。 */
-  private referenceDistance = 1;
-  /** 复用向量：把图层原点换到相机空间求深度，避免逐层分配。 */
-  private readonly cameraSpacePoint = new THREE.Vector3();
-  /** 复用矩阵：拼装相机空间的补偿变换。 */
-  private readonly matrixScratch = new THREE.Matrix4();
   /** 舞台点选复用的射线；避免每次点击分配新对象。 */
   private readonly raycaster = new THREE.Raycaster();
 
@@ -523,8 +516,18 @@ export class Stage {
     this.renderer.domElement.className = 'three-canvas';
     host.appendChild(this.renderer.domElement);
 
-    // 40° 透视，默认站在 +Z 方向（AXIS_HOME）。
-    this.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 60);
+    // 正交相机：扁平矢量图层按统一尺度投影，环绕视角下不随深度缩放。
+    const hostW = Math.max(1, this.host.clientWidth);
+    const hostH = Math.max(1, this.host.clientHeight);
+    const aspect = hostW / hostH;
+    this.camera = new THREE.OrthographicCamera(
+      -ORTHO_HALF_HEIGHT * aspect,
+      ORTHO_HALF_HEIGHT * aspect,
+      ORTHO_HALF_HEIGHT,
+      -ORTHO_HALF_HEIGHT,
+      -20,
+      40,
+    );
     this.camera.position.copy(AXIS_HOME);
 
     // 环绕控制：阻尼 + 距离限制，关闭自动旋转（由 UI 开关控制）。
@@ -1204,34 +1207,22 @@ export class Stage {
   }
 
   /**
-   * 写入所有图层的世界矩阵：轨道取值 → 层深 / 厚度倍率 → 透视补偿。
+   * 写入所有图层的世界矩阵：轨道取值 → 层深 / 厚度倍率。
    *
-   * 透视补偿的由来：层深被烘焙进矩阵的 Z 平移，而相机是 40° 透视，
-   * 于是越远的图层被压向画面中心、越近的被推离中心（离中心越远偏差越大），
-   * 平移动画里各层相互错位，与 Lottie 原画对不上。这里把每层的原点换到
-   * 相机空间，按沿视线方向的深度 d 做一次 XY 缩放：
-   * `k = d / 相机到观察目标的距离`，投影因此退化为统一尺度的正交投影，
-   * 任意视角下各层位置都与原画重合；层深仍保留在 Z 上负责遮挡与排序，
-   * 绕转视角时也会照常显出前后错位（错位来自旋转而非透视除法）。
+   * 主相机为正交投影，图层不再按相机深度做透视缩放，环绕视角下各层
+   * 保持统一尺度；烘焙进 Z 平移的层深只负责遮挡与绘制次序。
    */
   private writeMatrices(): void {
     if (this.model == null) {
       return;
     }
     this.camera.updateMatrixWorld();
-    this.cameraInverse.copy(this.camera.matrixWorldInverse);
-    // 参考平面：过观察目标、垂直于视线的平面（默认即原画所在的 Z=0 平面）。
-    this.referenceDistance = Math.max(
-      1e-4,
-      this.camera.position.distanceTo(this.controls.target),
-    );
 
     // 每条轨道是帧连续的 16 float 块，这里算好当前帧的起点。
     const trackOffset = Math.min(this.frameIndex, this.model.frameCount - 1) * 16;
     // 层深与厚度都是“倍率”，1 表示保持烘焙值。
     const depthDelta = this.depthAmount - 1;
     const thickness = this.thicknessAmount;
-    const cameraMatrix = this.camera.matrixWorld;
 
     for (let id = 0; id < this.entries.length; id += 1) {
       const entry = this.entries[id];
@@ -1261,30 +1252,6 @@ export class Stage {
         elements[6] *= thickness;
         elements[10] *= thickness;
       }
-
-      // 图层原点在相机空间的深度（相机朝 -Z 看，故取负 z）。
-      this.cameraSpacePoint
-        .set(elements[12], elements[13], elements[14])
-        .applyMatrix4(this.cameraInverse);
-      const depth = -this.cameraSpacePoint.z;
-      if (depth <= 1e-4) {
-        continue;
-      }
-      const scale = depth / this.referenceDistance;
-      // 落在参考平面上的图层无需补偿（绝大多数静态层走这条捷径）。
-      if (scale > 0.999 && scale < 1.001) {
-        continue;
-      }
-      // matrix = cameraMatrix · diag(scale, scale, 1) · cameraInverse · matrix
-      this.matrixScratch.multiplyMatrices(this.cameraInverse, matrix);
-      const scaled = this.matrixScratch.elements;
-      // 左乘 diag(scale, scale, 1, 1) 等价于把前两行按 scale 缩放
-      // （列主序下每列 4 个元素，前两个即第 0、1 行）。
-      for (let col = 0; col < 16; col += 4) {
-        scaled[col] *= scale;
-        scaled[col + 1] *= scale;
-      }
-      matrix.multiplyMatrices(cameraMatrix, this.matrixScratch);
     }
   }
 
@@ -1416,7 +1383,11 @@ export class Stage {
     const width = Math.max(1, this.host.clientWidth);
     const height = Math.max(1, this.host.clientHeight);
     this.renderer.setSize(width, height, false);
-    this.camera.aspect = width / height;
+    const aspect = width / height;
+    this.camera.left = -ORTHO_HALF_HEIGHT * aspect;
+    this.camera.right = ORTHO_HALF_HEIGHT * aspect;
+    this.camera.top = ORTHO_HALF_HEIGHT;
+    this.camera.bottom = -ORTHO_HALF_HEIGHT;
     this.camera.updateProjectionMatrix();
     this.dirty = true;
   }
