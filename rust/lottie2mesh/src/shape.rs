@@ -581,6 +581,20 @@ fn eval_group_items(
     let mut active_count = 0usize;
     let mut local = GroupResult::default();
 
+    // 本组 `rd` 圆角修饰器：下标更大的修饰下标更小的路径（与 tm/mm 同序）。
+    let level_rounds: Vec<(usize, f32)> = if geometry {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.get("ty").and_then(Value::as_str) == Some("rd") && !hidden(item)
+            })
+            .map(|(index, item)| (index, prop::eval_scalar(item, "r", frame, 0.0)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     for (item_index, item) in items.iter().enumerate() {
         let ty = item.get("ty").and_then(Value::as_str).unwrap_or("");
         match ty {
@@ -596,6 +610,9 @@ fn eval_group_items(
                     let closed = item.get("closed").and_then(Value::as_bool);
                     if let Some(shape_path) = path::eval_path_property(ks, frame, closed) {
                         let mut data = shape_path;
+                        if let Some(radius) = rd_radius(&level_rounds, item_index) {
+                            path::round_corners(&mut data, radius);
+                        }
                         if let Some(ctx) = ctx {
                             // 顶点跟随：按形状树下标路径查表，把前面若干
                             // 顶点替换为空对象在合成空间的位置，再经
@@ -815,6 +832,15 @@ fn applicable_trims(
         out.push(*spec);
     }
     out
+}
+
+/// 某个路径节点实际生效的圆角半径：取其下方（下标更大）最近的 `rd` 修饰器。
+fn rd_radius(level: &[(usize, f32)], index: usize) -> Option<f32> {
+    level
+        .iter()
+        .rev()
+        .find(|(key, _)| *key > index)
+        .map(|(_, radius)| *radius)
 }
 
 /// 单个形状路径最终携带的 trim。

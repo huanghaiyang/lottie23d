@@ -551,8 +551,82 @@ pub fn flatten_path(path: &PathData) -> Contour {
     }
 }
 
-/// 递归细分一段三次贝塞尔（de Casteljau 二分）。
+/// 圆角修饰器（Lottie `ty: "rd"`）。
 ///
+/// 与 lottie-web `RoundCornersModifier.processPath` 同口径：只把**零手柄角点**
+/// （入/出控制点都与顶点重合）替换为分居两侧的两个新顶点，中间用三次贝塞尔
+/// （系数 `0.5519`）逼近圆角；带手柄的贝塞尔顶点原样保留。开放路径的首尾
+/// 端点不做圆角。`round` 为圆角半径（像素），超过邻边一半时按邻边一半截断。
+pub fn round_corners(data: &mut PathData, round: f32) {
+    if round <= 0.0 || data.v.len() < 3 {
+        return;
+    }
+    let n = data.v.len();
+    let closed = data.closed;
+    let mut nv: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    let mut ni: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    let mut no: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    const RC: f32 = 0.5519;
+    for i in 0..n {
+        let v = data.v[i];
+        let o = data.o[i];
+        let iv = data.i[i];
+        let corner = o[0].abs() < 1e-6
+            && o[1].abs() < 1e-6
+            && iv[0].abs() < 1e-6
+            && iv[1].abs() < 1e-6;
+        let endpoint = !closed && (i == 0 || i == n - 1);
+        if !corner || endpoint {
+            nv.push(v);
+            ni.push(iv);
+            no.push(o);
+            continue;
+        }
+        // 后邻侧翼：入手柄与顶点重合，出手柄指向原角点。
+        let back = data.v[(i + n - 1) % n];
+        let back_dist = dist(v, back);
+        let back_perc = if back_dist > 1e-6 {
+            (back_dist * 0.5).min(round) / back_dist
+        } else {
+            0.0
+        };
+        let back_v = [
+            v[0] + (back[0] - v[0]) * back_perc,
+            v[1] + (back[1] - v[1]) * back_perc,
+        ];
+        let back_o = [
+            back_v[0] - (back_v[0] - v[0]) * RC,
+            back_v[1] - (back_v[1] - v[1]) * RC,
+        ];
+        // 前邻侧翼：出手柄与顶点重合，入手柄指向原角点。
+        let front = data.v[(i + 1) % n];
+        let front_dist = dist(v, front);
+        let front_perc = if front_dist > 1e-6 {
+            (front_dist * 0.5).min(round) / front_dist
+        } else {
+            0.0
+        };
+        let front_v = [
+            v[0] + (front[0] - v[0]) * front_perc,
+            v[1] + (front[1] - v[1]) * front_perc,
+        ];
+        let front_i = [
+            front_v[0] - (front_v[0] - v[0]) * RC,
+            front_v[1] - (front_v[1] - v[1]) * RC,
+        ];
+        nv.push(back_v);
+        ni.push(back_v);
+        no.push(back_o);
+        nv.push(front_v);
+        ni.push(front_i);
+        no.push(front_v);
+    }
+    data.v = nv;
+    data.i = ni;
+    data.o = no;
+}
+
+/// 递归细分一段三次贝塞尔（de Casteljau 二分）。
 /// 当递归深度达到 8 或两控制点到弦的距离都小于 0.2 像素时停止，
 /// 把终点 `p3` 追加到 `out`（起点由调用方预先写入），从而避免重复点。
 fn flatten_cubic(
@@ -934,4 +1008,44 @@ pub fn trim_slots(s: f32, e: f32, offset: f32) -> [(f32, f32); 2] {
     let first_len = length.min(1.0 - begin);
     let second_len = (length - first_len).max(0.0);
     [(begin, first_len), (0.0, second_len)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_handles(n: usize) -> (Vec<[f32; 2]>, Vec<[f32; 2]>, Vec<[f32; 2]>) {
+        (vec![[0.0; 2]; n], vec![[0.0; 2]; n], vec![[0.0; 2]; n])
+    }
+
+    #[test]
+    fn round_corners_flanks_each_zero_handle_corner() {
+        let (i, o, _) = zero_handles(4);
+        let v = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
+        let mut data = PathData { v, i, o, closed: true };
+        round_corners(&mut data, 10.0);
+        assert_eq!(data.v.len(), 8);
+        assert!((data.v[0][0] - 0.0).abs() < 1e-5 && (data.v[0][1] - 10.0).abs() < 1e-5);
+        assert!((data.v[1][0] - 10.0).abs() < 1e-5 && (data.v[1][1] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn round_corners_keeps_bezier_vertex() {
+        let v = vec![[0.0, 0.0], [100.0, 0.0]];
+        let i = vec![[0.0; 2], [0.0; 2]];
+        let o = vec![[0.0; 2], [5.0, 0.0]];
+        let mut data = PathData { v, i, o, closed: false };
+        round_corners(&mut data, 10.0);
+        assert_eq!(data.v.len(), 2);
+        assert_eq!(data.o[1], [5.0, 0.0]);
+    }
+
+    #[test]
+    fn round_corners_zero_radius_is_noop() {
+        let v = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]];
+        let (i, o, _) = zero_handles(3);
+        let mut data = PathData { v, i, o, closed: true };
+        round_corners(&mut data, 0.0);
+        assert_eq!(data.v.len(), 3);
+    }
 }

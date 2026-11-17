@@ -1026,6 +1026,7 @@ watch(pickMode, (enabled) => {
 // 挂载：创建舞台并把各滑块初值灌进去，然后启动时钟与全局事件监听。
 onMounted(() => {
   stage = new Stage(threeHost.value as HTMLDivElement, { onAxisPick });
+  (window as unknown as { __stage: unknown }).__stage = stage;
   stage.setDepthScale(depth.value);
   stage.setThicknessScale(thickness.value);
   stage.setAutoRotate(autoRotate.value);
