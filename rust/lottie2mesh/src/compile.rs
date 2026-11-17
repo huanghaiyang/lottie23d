@@ -1201,7 +1201,8 @@ impl<'a> Compiler<'a> {
 
     /// 逐帧烘焙：写出所有图层的世界矩阵、动态颜色与几何顶点。
     ///
-    /// 第 i 帧根合成时间为 `sample_start + sample_span * i / frame_count`。
+    /// 第 i 帧根合成时间为 `sample_start + sample_span * i / (frame_count - 1)`
+    /// （首槽=ip、末槽=op，与播放器的槽位映射一致）。
     /// 变换写入 16 float 列主序矩阵；几何变化时按“姿态锚点”选桶，把该帧顶点
     /// 追加到 `frame_positions`，并在 `frame_offsets` 中记录每帧起始的 float
     /// 下标（末尾再补一个总数作为结束哨兵）。最后把初始顶点补齐到所有桶中
@@ -1303,8 +1304,15 @@ impl<'a> Compiler<'a> {
         for frame_index in 0..frame_count {
             // 当前帧是否落在某个姿态锚点上。
             let anchor_slot = anchor_frames.binary_search(&frame_index).ok();
-            // 根合成时间按采样区间线性分摊到 frame_count 帧。
-            let root_frame = sample_start + sample_span * (frame_index as f32 / frame_count as f32);
+            // 根合成时间按采样区间线性分摊到 frame_count 帧。播放器槽位按
+            // `ratio * (frameCount - 1)` 映射（首槽=ip、末槽=op），这里必须用
+            // `n - 1` 分母与之对齐；用 `n` 会让末槽永远到不了端点，尾部窄窗
+            // 内入点的图层采样不到而整层丢失。
+            let root_frame = if frame_count > 1 {
+                sample_start + sample_span * (frame_index as f32 / (frame_count - 1) as f32)
+            } else {
+                sample_start
+            };
             for cache in world_cache.iter_mut() {
                 *cache = None;
             }
