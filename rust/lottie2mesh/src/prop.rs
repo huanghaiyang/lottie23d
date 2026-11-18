@@ -178,8 +178,8 @@ fn eval_keyframe_list(list: &[Value], frame: f32, mode: Option<LoopMode>) -> Vec
                 }
             }
         }
-        let value = key_start(last);
-        return if value.is_empty() { key_end(last) } else { value };
+        let value = effective_last_value(list);
+        return value;
     }
 
     let start = &list[index];
@@ -241,7 +241,7 @@ fn eval_loop_tail(list: &[Value], frame: f32, mode: LoopMode) -> Vec<f32> {
     let t1 = time_of(last);
     let seg = t1 - t0;
     let v_first = key_start(first);
-    let v_last = key_start(last);
+    let v_last = effective_last_value(list);
     if seg <= 1e-6 || v_last.is_empty() {
         return v_last;
     }
@@ -300,6 +300,32 @@ fn key_start(key: &Value) -> Vec<f32> {
 /// 取关键帧结束值 `e`，缺失时返回空数组。
 fn key_end(key: &Value) -> Vec<f32> {
     key.get("e").map(eval_static).unwrap_or_default()
+}
+
+/// 超出末关键帧时应钳到的有效值。
+///
+/// Bodymovin 导出的最后一个关键帧常常只有 `t`、不带 `s`/`e`（结束保持帧）；
+/// 此时它继承前一段的结束值（前一帧 `e`，缺失再退回前一帧 `s`）。若直接取
+/// 末帧 `s` 会得到空数组，上层回退成位置 `[0,0]`，整层被甩到画布左上角。
+fn effective_last_value(list: &[Value]) -> Vec<f32> {
+    let last = &list[list.len() - 1];
+    let mut value = key_start(last);
+    if !value.is_empty() {
+        return value;
+    }
+    value = key_end(last);
+    if !value.is_empty() {
+        return value;
+    }
+    if list.len() >= 2 {
+        let prev = &list[list.len() - 2];
+        value = key_end(prev);
+        if !value.is_empty() {
+            return value;
+        }
+        value = key_start(prev);
+    }
+    value
 }
 
 /// 把 `[x, y, ...]` 形式的 JSON 数组解析为 f32 向量。
@@ -481,5 +507,17 @@ mod tests {
         ]});
         let v = eval(&plain, 15.0);
         assert!((v[0] - 100.0).abs() < 1e-3, "got {}", v[0]);
+    }
+
+    #[test]
+    fn bare_final_keyframe_inherits_previous_end() {
+        // 末帧只有 `t`、无 `s`/`e`：tail 应继承前一帧的 `e`（60），而不是落空成 0。
+        let plain = json!({ "k": [
+            { "t": 0.0, "s": [0.0], "e": [80.0] },
+            { "t": 10.0, "s": [80.0], "e": [60.0] },
+            { "t": 15.0 }
+        ]});
+        let v = eval(&plain, 20.0);
+        assert!((v[0] - 60.0).abs() < 1e-3, "got {}", v[0]);
     }
 }
