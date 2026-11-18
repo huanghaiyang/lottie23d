@@ -549,7 +549,9 @@ impl<'a> Compiler<'a> {
 
         // 轨道遮罩：`tt` 图层使用同合成内紧邻其上方的图层作为 alpha 遮罩。
         // 预合成图层被遮罩时，裁剪来源会通过 `owner` 继承到内部所有图层。
-        let mut previous: Option<usize> = None;
+        // 注意：连续多个 `tt` 图层共用上方同一个遮罩源；被遮罩层自身不能再作为
+        // 下方相邻图层的源，否则第二个标签会被前一个（已被裁空的）标签轮廓裁掉。
+        let mut matte_source: Option<usize> = None;
         let mut cursor = 0usize;
         for layer in layers.iter() {
             if layer.hd {
@@ -558,13 +560,16 @@ impl<'a> Compiler<'a> {
             let id = ids[cursor];
             cursor += 1;
             if layer.tt != 0 {
-                if let Some(source) = previous {
+                if let Some(source) = matte_source {
                     self.plans[id].matte = Some(MatteSource {
                         id: source,
                         // 2 / 4 为反转模式（alpha 反转、亮度反转）。
                         inverted: matches!(layer.tt, 2 | 4),
                     });
                 }
+            } else {
+                // 普通层（含 `td` 遮罩目标层）才可能成为下方相邻被遮罩层的源。
+                matte_source = Some(id);
             }
             let inherited = self.plans[id].matte.or_else(|| {
                 self.plans[id]
@@ -601,7 +606,6 @@ impl<'a> Compiler<'a> {
                     plan.geometry_animated = true;
                 }
             }
-            previous = Some(id);
         }
 
         for id in ids {
