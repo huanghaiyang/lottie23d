@@ -147,6 +147,7 @@ function clamp01(value: number): number {
 function buildGradientLut(gradient: GradientModel): {
   lut: THREE.DataTexture;
   variesAlpha: boolean;
+  pixels: Uint8Array;
 } {
   const pixels = new Uint8Array(GRADIENT_LUT_SIZE * 4);
   const stops = gradient.stops;
@@ -213,7 +214,56 @@ function buildGradientLut(gradient: GradientModel): {
   lut.wrapT = THREE.ClampToEdgeWrapping;
   lut.generateMipmaps = false;
   lut.needsUpdate = true;
-  return { lut, variesAlpha };
+  return { lut, variesAlpha, pixels };
+}
+
+/** sRGB 编码分量解码到线性工作空间，与片元注入路径的手动解码一致。 */
+function srgbToLinear(value: number): number {
+  return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+}
+
+/** 复现片元着色器里的渐变参数 t：线性按轴向投影，径向按到起点距离。 */
+function gradientTAt(gradient: GradientModel, x: number, y: number): number {
+  const [sx, sy] = gradient.start;
+  const [ex, ey] = gradient.end;
+  if (gradient.kind < 1.5) {
+    const axisX = ex - sx;
+    const axisY = ey - sy;
+    const denom = Math.max(axisX * axisX + axisY * axisY, 1e-6);
+    return ((x - sx) * axisX + (y - sy) * axisY) / denom;
+  }
+  const len = Math.max(Math.hypot(ex - sx, ey - sy), 1e-6);
+  return Math.hypot(x - sx, y - sy) / len;
+}
+
+/** 从 1D LUT 采样 sRGB 字节分量（0..1）。 */
+function sampleLut(pixels: Uint8Array, t: number): [number, number, number] {
+  const idx = Math.round(clamp01(t) * (GRADIENT_LUT_SIZE - 1)) * 4;
+  return [pixels[idx] / 255, pixels[idx + 1] / 255, pixels[idx + 2] / 255];
+}
+
+/**
+ * 按局部坐标把渐变烘焙成逐顶点线性 RGB。
+ *
+ * WebGPU 后端不支持 `onBeforeCompile` 字符串注入，无法走片元渐变求值；
+ * 内置材质的顶点色在 WebGL / WebGPU 两端都受支持，作为可移植兜底。
+ * 静态网格只需烘焙一次；动画网格在逐帧顶点写入后按当前位置重算。
+ */
+function bakeGradientVertexColors(
+  gradient: GradientModel,
+  pixels: Uint8Array,
+  positions: Float32Array | ArrayLike<number>,
+): Float32Array {
+  const count = positions.length / 3;
+  const out = new Float32Array(count * 3);
+  for (let i = 0; i < count; i += 1) {
+    const t = gradientTAt(gradient, positions[i * 3], positions[i * 3 + 1]);
+    const [r, g, b] = sampleLut(pixels, t);
+    out[i * 3] = srgbToLinear(r);
+    out[i * 3 + 1] = srgbToLinear(g);
+    out[i * 3 + 2] = srgbToLinear(b);
+  }
+  return out;
 }
 
 /**
@@ -310,6 +360,12 @@ interface Entry {
    * 颜色在片元着色器里按局部坐标逐像素求值，与顶点密度无关。
    */
   gradientLut: THREE.DataTexture | null;
+  /** WebGPU 渐变兜底：渐变定义（片元注入路径为 null）。 */
+  gradient: GradientModel | null;
+  /** WebGPU 渐变兜底：LUT 字节像素。 */
+  gradPixels: Uint8Array | null;
+  /** WebGPU 渐变兜底：逐顶点颜色属性。 */
+  gradColor: THREE.BufferAttribute | null;
   /** 当前绑定到 geometry 的桶下标，用于跳过重复 setIndex。 */
   currentBucket: number;
   /** 由基础 alpha 推导的可见性（尚未叠加手动隐藏）。 */
@@ -686,10 +742,12 @@ export class Stage {
       // 透明混合（渐变 alpha 低于 1 时必须开启）。
       let gradientLut: THREE.DataTexture | null = null;
       let gradientAlpha = false;
+      let gradPixels: Uint8Array | null = null;
       if (data.gradient) {
         const built = buildGradientLut(data.gradient);
         gradientLut = built.lut;
         gradientAlpha = built.variesAlpha;
+        gradPixels = built.pixels;
       }
       // 每个拓扑桶一份索引属性；默认绑定桶 0，逐帧按 frameBuckets 切换。
       const indexAttributes = data.buckets.map(
@@ -724,6 +782,8 @@ export class Stage {
         data.color[2],
         THREE.SRGBColorSpace,
       );
+      // WebGPU 不支持 onBeforeCompile 片元注入；渐变改走逐顶点颜色兜底。
+      const gradFallback = this.isWebGPU && data.gradient != null && gradPixels != null;
       const material: THREE.MeshLambertMaterial | THREE.MeshBasicMaterial = textured
         ? // 图片贴图：颜色完全由纹理决定，不参与光照；alpha 仍来自图层透明度。
           new THREE.MeshBasicMaterial({
@@ -734,9 +794,10 @@ export class Stage {
           })
         : this.isWebGPU
           ? // WebGPU 后端：legacy 灯光不被节点系统识别，Lambert 会因无光照变黑；
-            // 改用不受光照的 Basic 材质保留基础色（渐变/柔光仍按旁路退化）。
+            // 改用不受光照的 Basic 材质保留基础色；渐变网格由顶点色提供颜色。
             new THREE.MeshBasicMaterial({
-              color: baseColor,
+              color: gradFallback ? new THREE.Color(0xffffff) : baseColor,
+              vertexColors: gradFallback,
               side: THREE.DoubleSide,
               transparent: colors != null || alpha < 0.999 || gradientAlpha,
               opacity: Math.max(0, Math.min(1, alpha)),
@@ -757,6 +818,13 @@ export class Stage {
       // WebGPU 后端不走 onBeforeCompile 字符串替换，渐变退化为基础色材质。
       if (data.gradient && gradientLut && !this.isWebGPU) {
         applyGradientShader(material, data.gradient, gradientLut);
+      }
+      // WebGPU 渐变兜底：把渐变烘焙成逐顶点颜色（动画网格在 applyFrame 里重算）。
+      let gradColor: THREE.BufferAttribute | null = null;
+      if (gradFallback && data.gradient && gradPixels) {
+        const rgb = bakeGradientVertexColors(data.gradient, gradPixels, positions);
+        gradColor = new THREE.BufferAttribute(rgb, 3);
+        geometry.setAttribute('color', gradColor);
       }
       // 关闭全部矩阵自动更新：世界矩阵由 applyFrame 直接写入。
       // 同时关闭视锥剔除，避免整批网格在相机边缘被跳过（模型尺寸已归一化）。
@@ -795,6 +863,9 @@ export class Stage {
         sphereFrame: -1,
         indexAttributes,
         gradientLut,
+        gradient: data.gradient ?? null,
+        gradPixels,
+        gradColor,
         currentBucket: 0,
         staticVisible,
         // 新载入的模型按烘焙层深排序，尚未发生拖拽重排。
@@ -1368,7 +1439,12 @@ export class Stage {
           THREE.SRGBColorSpace,
         );
       } else {
-        mesh.visible = entry.staticVisible;
+        // 无逐帧颜色轨道即透明度恒定；静态不可见网格直接跳过后续顶点/索引写入。
+        if (!entry.staticVisible) {
+          mesh.visible = false;
+          continue;
+        }
+        mesh.visible = true;
       }
 
       // 逐帧顶点：v2 用 frameOffsets 定位本帧区间；区间单位是 float，不是顶点。
@@ -1392,6 +1468,18 @@ export class Stage {
             position.needsUpdate = true;
           }
         }
+      }
+
+      // WebGPU 渐变兜底：动画网格顶点移动后按当前局部坐标重算逐顶点颜色。
+      if (entry.positionsAnimated && entry.gradColor && entry.gradient && entry.gradPixels) {
+        const arr = entry.position.array as Float32Array;
+        const rgb = bakeGradientVertexColors(
+          entry.gradient,
+          entry.gradPixels,
+          arr.subarray(0, entry.gradColor.count * 3),
+        );
+        entry.gradColor.array.set(rgb);
+        entry.gradColor.needsUpdate = true;
       }
 
       // 拓扑切换：frameBuckets[frame] 指定本帧使用哪套索引。

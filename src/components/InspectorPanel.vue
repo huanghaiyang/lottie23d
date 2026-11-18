@@ -42,8 +42,8 @@ const emit = defineEmits<{
   (event: 'reorder-node', fromId: number, toId: number, place: 'before' | 'after'): void;
 }>();
 
-/** 面板折叠状态；纯 UI 本地状态，不影响场景。 */
-const open = ref(true);
+/** 面板折叠状态；纯 UI 本地状态，不影响场景。默认收起，避免遮挡画布。 */
+const open = ref(false);
 
 /** 该节点是否在当前选中集合内。 */
 function isSelected(id: number): boolean {

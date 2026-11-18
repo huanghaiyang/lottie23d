@@ -235,6 +235,9 @@ function syncScene(forceHud = false): void {
   }
   const frameIndex = Math.round(ratio * (model.frameCount - 1));
   stage?.setFrame(frameIndex);
+  // 源帧按 ip/op 区间换算，与左侧 lottie-web 定位的帧一致。
+  const sourceFrame = Math.round(ip + ratio * (op - ip));
+  const sourceTotal = Math.max(1, Math.round(op - ip));
 
   // 热路径上避免频繁触发 Vue 更新：HUD 最多约 8 次/秒；
   // 拖动进度条时不要反向写 progress，否则会与用户输入打架。
@@ -244,7 +247,7 @@ function syncScene(forceHud = false): void {
     if (!draggingTimeline) {
       progress.value = Math.round(ratio * 1000);
     }
-    frameLabel.value = `${String(frameIndex + 1).padStart(3, '0')} / ${model.frameCount}`;
+    frameLabel.value = `${String(frameIndex + 1).padStart(3, '0')}/${model.frameCount} · 源 ${String(sourceFrame).padStart(3, '0')}/${sourceTotal}`;
   }
 }
 

@@ -410,7 +410,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
     compiler.mark_opacity_animation();
     compiler.allocate_color_tracks();
 
-    // 性能护栏：动画几何按帧烘焙。用 8M float 的总预算限制顶点数据量，
+    // 性能护栏：动画几何按帧烘焙。用 16M float 的总预算限制顶点数据量，
     // 重场景自动降低采样帧数（最低保留 24 帧），而不是膨胀到数百 MB。
     let animated_floats: usize = compiler
         .meshes
@@ -419,7 +419,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
         .map(|mesh| mesh.positions.len())
         .sum();
     if animated_floats > 0 {
-        const BUDGET_FLOATS: usize = 8_000_000;
+        const BUDGET_FLOATS: usize = 16_000_000;
         let allowed = (BUDGET_FLOATS / animated_floats).max(24);
         if allowed < compiler.frame_count {
             compiler.resize_frames(allowed);
@@ -1048,6 +1048,51 @@ impl<'a> Compiler<'a> {
             }
             if !mesh.color_track.is_empty() {
                 mesh.color_track.resize(new_count * 4, 0.0);
+            }
+        }
+    }
+
+    /// 回收「被保守标记为动画、但逐帧几何完全不变」的网格。
+    ///
+    /// 轨道遮罩 / 顶点跟随等判定会把一批实际静止的轮廓也标成几何动画，
+    /// 它们的逐帧顶点缓冲与参考帧逐点相同；这类网格保留静态几何即可，
+    /// 透明度/位置动画仍由颜色轨道与变换轨道驱动，不受影响。回收后既减小
+    /// 产物体积，也省去播放端逐帧上传顶点的开销。
+    fn staticize_redundant(&mut self) {
+        const EPS: f32 = 1e-3;
+        for mesh in self.meshes.iter_mut() {
+            let Some(track) = mesh.frame_positions.as_ref() else {
+                continue;
+            };
+            let offsets = &mesh.frame_offsets;
+            if offsets.len() < 2 {
+                continue;
+            }
+            let first = offsets[0] as usize;
+            let second = offsets[1] as usize;
+            let reference = &track[first..second.min(track.len())];
+            let mut unchanged = true;
+            for slot in offsets.windows(2) {
+                let start = slot[0] as usize;
+                let end = slot[1] as usize;
+                let slice = &track[start..end.min(track.len())];
+                if slice.len() != reference.len() {
+                    unchanged = false;
+                    break;
+                }
+                if slice
+                    .iter()
+                    .zip(reference.iter())
+                    .any(|(a, b)| (a - b).abs() > EPS)
+                {
+                    unchanged = false;
+                    break;
+                }
+            }
+            if unchanged {
+                mesh.frame_positions = None;
+                mesh.frame_offsets.clear();
+                mesh.frame_buckets.clear();
             }
         }
     }
@@ -1832,6 +1877,8 @@ impl<'a> Compiler<'a> {
             let total = mesh.frame_positions.as_ref().map_or(0, |track| track.len());
             mesh.frame_offsets.push(total as u32);
         }
+        // 回收逐帧几何不变的冗余动画网格，避免静态轮廓白占顶点轨迹。
+        self.staticize_redundant();
     }
 }
 
