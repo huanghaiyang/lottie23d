@@ -115,6 +115,9 @@ pub struct Layer {
     /// AE / lottie-web 从不直接绘制它。
     #[serde(default)]
     pub td: i64,
+    /// 轨道遮罩显式指定的遮罩源图层 `ind`；缺省时取数组紧邻上方图层。
+    #[serde(default)]
+    pub tp: Option<i64>,
     /// 纯色层颜色（`#rrggbb`）。
     #[serde(default, rename = "sc")]
     pub solid_color: String,

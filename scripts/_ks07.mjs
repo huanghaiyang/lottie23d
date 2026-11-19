@@ -1,0 +1,14 @@
+import { readFileSync } from 'node:fs';
+const d = JSON.parse(readFileSync('data/shot_07.json', 'utf8'));
+const a11 = d.assets.find((x) => x.id.startsWith('11_'));
+const a10 = d.assets.find((x) => x.id.startsWith('10_'));
+const show = (l, tag) => console.log(tag, l.nm, 'ks=', JSON.stringify(l.ks));
+show(a11.layers[9], '[A11 body6]');
+show(a11.layers[14], '[A11 body]');
+show(a10.layers[40], '[A10 layer4]');
+const a1 = d.assets.find((x) => x.id.startsWith('1_'));
+show(a1.layers[3], '[A1 print9 normal]');
+const bg = d.layers.find((l) => l.nm === 'BG');
+show(bg, '[TOP BG]');
+const mb = d.layers.find((l) => l.nm === 'Machine body');
+show(mb, '[TOP Machine body]');

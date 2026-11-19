@@ -430,6 +430,7 @@ pub fn compile(json: &str, raw_options: RawOptions) -> Result<Compiled, String> 
     let sample_fps = compiler.frame_count as f32 / ((op - ip) / frame_rate).max(1e-4);
     let frame_count = compiler.frame_count;
     compiler.bake();
+    compiler.debug_dump_clips();
 
     #[cfg(not(target_arch = "wasm32"))]
     let conversion_us = started.elapsed().as_micros() as u32;
@@ -539,6 +540,9 @@ impl<'a> Compiler<'a> {
                     self.plans[id].parent = Some(parent);
                 }
             }
+            if std::env::var("L2D3_DEBUG_PARENT").is_ok() {
+                eprintln!("PARENT nm={} ind={} parent={:?} resolved={:?}", self.plans[id].layer.nm, self.plans[id].layer.ind, parent_ind, self.plans[id].parent);
+            }
         }
 
         // 位置表达式按图层名引用同合成内的路径图层，此时所有 plan 已建立。
@@ -560,7 +564,13 @@ impl<'a> Compiler<'a> {
             let id = ids[cursor];
             cursor += 1;
             if layer.tt != 0 {
-                if let Some(source) = matte_source {
+                // lottie-web 规则：`tp` 显式指定遮罩源图层 `ind`；未指定时取
+                // 数组紧邻上方的图层（pos - 1）。
+                let source = layer
+                    .tp
+                    .and_then(|tp| by_ind.get(&tp).copied())
+                    .or(matte_source);
+                if let Some(source) = source {
                     self.plans[id].matte = Some(MatteSource {
                         id: source,
                         // 2 / 4 为反转模式（alpha 反转、亮度反转）。
@@ -672,6 +682,43 @@ impl<'a> Compiler<'a> {
             previous = Some(relative);
         }
         false
+    }
+
+    /// 临时调试：输出轨道遮罩层的相对仿射与轮廓数（环境变量 L2D3_DEBUG_CLIP 开启）。
+    fn debug_dump_clips(&self) {
+        if std::env::var("L2D3_DEBUG_CLIP").is_err() {
+            return;
+        }
+        let plan_count = self.plans.len();
+        for id in 0..plan_count {
+            let Some(src) = self.plans[id].clip else { continue };
+            let p = &self.plans[id];
+            let owner = p.owner.map(|o| self.plans[o].layer.nm.as_str()).unwrap_or("-");
+            let src_nm = self.plans[src.id].layer.nm.as_str();
+            eprintln!(
+                "CLIP id={} layer={} owner={} src={} animated={} ref={:.1}",
+                id, p.layer.nm, owner, src_nm, p.clip_animated, p.clip_ref_frame
+            );
+            for step in [0.0f32, 0.5, 1.0] {
+                let rf = self.sample_start + self.sample_span * step;
+                let mut cc = vec![None; plan_count];
+                let mut fc = vec![None; plan_count];
+                let ov: Vec<Option<PoseOverride>> = vec![None; plan_count];
+                let rel = matte_relative(&self.plans, id, src.id, rf, &mut cc, &mut fc, &ov);
+                let mc = matte_contours(&self.plans, src.id, rf).map(|c| c.len());
+                if let Some(r) = rel {
+                    eprintln!(
+                        "   f={:.0} rel tx={:.1} ty={:.1} sx={:.3} sy={:.3} mask={:?}",
+                        rf,
+                        r.tx,
+                        r.ty,
+                        r.a.hypot(r.b),
+                        r.c.hypot(r.d),
+                        mc
+                    );
+                }
+            }
+        }
     }
 
     /// 按图层类型构建内容：4 形状层、1 纯色层、0 预合成层。
@@ -1058,6 +1105,56 @@ impl<'a> Compiler<'a> {
     /// 它们的逐帧顶点缓冲与参考帧逐点相同；这类网格保留静态几何即可，
     /// 透明度/位置动画仍由颜色轨道与变换轨道驱动，不受影响。回收后既减小
     /// 产物体积，也省去播放端逐帧上传顶点的开销。
+    /// 收窄全程颜色/透明度不变的网格：把逐帧 RGBA 轨迹折叠进静态色，
+    /// 播放端无需每帧读取颜色轨道与 `setRGB`。
+    fn collapse_static_colors(&mut self) {
+        const EPS: f32 = 1e-3;
+        for mesh in self.meshes.iter_mut() {
+            let track = &mesh.color_track;
+            if track.len() < 4 {
+                continue;
+            }
+            let frames = track.len() / 4;
+            let base = [track[0], track[1], track[2], track[3]];
+            let mut unchanged = true;
+            for f in 0..frames {
+                let b = f * 4;
+                for k in 0..4 {
+                    if (track[b + k] - base[k]).abs() > EPS {
+                        unchanged = false;
+                        break;
+                    }
+                }
+                if !unchanged {
+                    break;
+                }
+            }
+            if unchanged {
+                mesh.static_color = base;
+                mesh.color_track.clear();
+            }
+        }
+    }
+
+    /// 剔除在整个采样区间内都不可见的网格：静态色与逐帧颜色轨道的 alpha
+    /// 全部低于阈值。这类网格只是占位退化几何，留在场景图里只增加遍历与
+    /// 绘制对象，不会贡献任何可见像素。
+    fn drop_invisible(&mut self) {
+        const VISIBLE: f32 = 0.004;
+        self.meshes.retain(|mesh| {
+            if mesh.static_color[3] >= VISIBLE {
+                return true;
+            }
+            let frames = mesh.color_track.len() / 4;
+            for f in 0..frames {
+                if mesh.color_track[f * 4 + 3] >= VISIBLE {
+                    return true;
+                }
+            }
+            false
+        });
+    }
+
     fn staticize_redundant(&mut self) {
         const EPS: f32 = 1e-3;
         for mesh in self.meshes.iter_mut() {
@@ -1543,12 +1640,64 @@ impl<'a> Compiler<'a> {
                                     if let Some(mask) =
                                         matte_contours(plans, source.id, root_frame)
                                     {
+                                        let dbg = std::env::var("L2D3_DEBUG_CLIP").is_ok()
+                                            && plan.layer.nm.starts_with("print")
+                                            && plan.owner.is_some();
+                                        if dbg {
+                                            let ca = root_affine(plans, id, root_frame, &mut chain_cache, &mut frame_cache, &overrides);
+                                            let ma = root_affine(plans, source.id, root_frame, &mut chain_cache, &mut frame_cache, &overrides);
+                                            let pnm = plans[id].parent.map(|p| plans[p].layer.nm.as_str()).unwrap_or("-");
+                                            let pa = plans[id].parent.map(|p| root_affine(plans, p, root_frame, &mut chain_cache, &mut frame_cache, &overrides));
+                                            eprintln!("    rel tx={:.1} ty={:.1} sx={:.3} content tx={:.1} ty={:.1} matte tx={:.1} ty={:.1} ind={} rawParent={:?} parent={} parentTx={:.1},{:.1}", relative.tx, relative.ty, relative.a, ca.tx, ca.ty, ma.tx, ma.ty, plan.layer.ind, plan.layer.parent, pnm, pa.map(|a| a.tx).unwrap_or(0.0), pa.map(|a| a.ty).unwrap_or(0.0));
+                                            let subj: usize = result
+                                                .drawables
+                                                .iter()
+                                                .map(|d| d.paths.len())
+                                                .sum();
+                                            let owner_nm = plan
+                                                .owner
+                                                .map(|o| plans[o].layer.nm.as_str())
+                                                .unwrap_or("-");
+                                            let owner_ind = plan.owner.map(|o| plans[o].layer.ind).unwrap_or(-1);
+                                            let src_nm = plans[source.id].layer.nm.as_str();
+                                            let src_ind = plans[source.id].layer.ind;
+                                            let src_owner = plans[source.id].owner.map(|o| plans[o].layer.nm.as_str()).unwrap_or("-");
+                                            let lf = plan_local_frame(plans, source.id, root_frame);
+                                            let vis = visible(plans[source.id].layer, lf);
+                                            let op = opacity_cache[id].unwrap_or(0.0);
+                                            let bbox = |paths: &[crate::shape::PathItem]| -> String {
+                                                let mut x0=1e9f32; let mut y0=1e9f32; let mut x1=-1e9f32; let mut y1=-1e9f32;
+                                                for p in paths { for q in &p.contour.pts { x0=x0.min(q[0]); y0=y0.min(q[1]); x1=x1.max(q[0]); y1=y1.max(q[1]); } }
+                                                if x0>x1 { return "empty".to_string(); }
+                                                format!("[{:.0},{:.0}..{:.0},{:.0}]",x0,y0,x1,y1)
+                                            };
+                                            let subj_bbox: String = result.drawables.iter().map(|d| bbox(&d.paths)).collect::<Vec<_>>().join(";");
+                                            let mapped: Vec<Contour> = mask.iter().map(|c| map_contour(c, relative)).collect();
+                                            let mut mx0=1e9f32;let mut my0=1e9f32;let mut mx1=-1e9f32;let mut my1=-1e9f32;
+                                            for c in &mapped { for q in &c.pts { mx0=mx0.min(q[0]); my0=my0.min(q[1]); mx1=mx1.max(q[0]); my1=my1.max(q[1]); } }
+                                            let mask_bbox = if mx0>mx1 {"empty".to_string()} else {format!("[{:.0},{:.0}..{:.0},{:.0}]",mx0,my0,mx1,my1)};
+                                            let mut lx0=1e9f32;let mut ly0=1e9f32;let mut lx1=-1e9f32;let mut ly1=-1e9f32;
+                                            for c in &mask { for q in &c.pts { lx0=lx0.min(q[0]); ly0=ly0.min(q[1]); lx1=lx1.max(q[0]); ly1=ly1.max(q[1]); } }
+                                            let mask_local = if lx0>lx1 {"empty".to_string()} else {format!("[{:.0},{:.0}..{:.0},{:.0}]",lx0,ly0,lx1,ly1)};
+                                            eprintln!(
+                                                "  f={:.0} owner={}#{} {}#{} src={}#{} srcOwner={} lf={:.0} vis={} op={:.2} subj={} mask={} subjB={} maskB={} maskLocal={}",
+                                                root_frame, owner_nm, owner_ind, plan.layer.nm, plan.layer.ind, src_nm, src_ind, src_owner, lf, vis, op, subj, mask.len(), subj_bbox, mask_bbox, mask_local
+                                            );
+                                        }
                                         clip_with_matte(
                                             result,
                                             relative,
                                             &mask,
                                             source.inverted,
                                         );
+                                        if dbg {
+                                            let after: usize = result
+                                                .drawables
+                                                .iter()
+                                                .map(|d| d.paths.iter().filter(|p| p.contour.pts.len() >= 3).count())
+                                                .sum();
+                                            eprintln!("    after={}", after);
+                                        }
                                     }
                                 }
                             } else {
@@ -1879,6 +2028,10 @@ impl<'a> Compiler<'a> {
         }
         // 回收逐帧几何不变的冗余动画网格，避免静态轮廓白占顶点轨迹。
         self.staticize_redundant();
+        // 收窄全程颜色不变的网格，去掉冗余逐帧颜色轨道。
+        self.collapse_static_colors();
+        // 剔除全程不可见的占位退化网格。
+        self.drop_invisible();
     }
 }
 
