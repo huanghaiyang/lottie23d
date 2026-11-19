@@ -829,8 +829,12 @@ impl<'a> Compiler<'a> {
         // 轨道遮罩：几何全程静止时在参考帧裁一次即可；若内容本身有动画，
         // 参考帧必须保留未裁剪几何（否则可能被裁空、拿不到网格），
         // 逐帧裁剪交给烘焙阶段。
+        // 轨道遮罩：蓝图网格必须在参考帧按遮罩裁剪，与图层是否几何动画无关。
+        // 逐帧重建的几何在烘焙阶段独立 `eval_shapes` 重新求值并再次裁剪，不复用
+        // 蓝图轮廓；若这里因几何动画而保留未裁剪蓝图，静态（顶点不随帧变化）的
+        // 蓝图网格会把遮罩外的笔画直接渲染出来，成为游离碎片。
         if let Some(source) = clip {
-            if !geometry_animated {
+            {
                 // 静态遮罩的几何与相对变换在采样区间内不变，取预先挑选的
                 // 参考时刻即可；这里必须用根合成时间，`frame` 是图层所在
                 // 合成的时间轴。
@@ -903,7 +907,7 @@ impl<'a> Compiler<'a> {
         let mut drawable = solid_drawable(layer, self.plans[id].ref_frame);
         // 几何静止时轨道遮罩在参考帧裁一次；有动画时留给烘焙阶段逐帧裁剪。
         if let Some(source) = clip {
-            if !geometry_animated {
+            {
                 let plan_count = self.plans.len();
                 let mut chain_cache = vec![None; plan_count];
                 let mut frame_cache = vec![None; plan_count];
@@ -1544,6 +1548,32 @@ impl<'a> Compiler<'a> {
                 let slot = &mut self.transforms[track]
                     [frame_index * 16..(frame_index + 1) * 16];
                 slot.copy_from_slice(&matrix);
+
+                if std::env::var("L2D3_DEBUG_PARENT").is_ok() {
+                    let plans = &self.plans;
+                    if let Some(par) = plans[id].parent {
+                        if plans[id].owner.is_some() {
+                            let ca = root_affine(
+                                plans, id, root_frame,
+                                &mut chain_cache, &mut frame_cache, &overrides,
+                            );
+                            let pa = root_affine(
+                                plans, par, root_frame,
+                                &mut chain_cache, &mut frame_cache, &overrides,
+                            );
+                            let owner_ind = plans[id].owner.map(|o| plans[o].layer.ind).unwrap_or(-1);
+                            let owner_nm = plans[id].owner.map(|o| plans[o].layer.nm.as_str()).unwrap_or("-");
+                            let lf = frame_cache[id].unwrap_or(root_frame);
+                            eprintln!(
+                                "PARENT f={:.0} track={} owner#{}({}) {}#{} par={}#{} childW(tx={:.1},ty={:.1},a={:.3},d={:.3}) parW(tx={:.1},ty={:.1}) rel(tx={:.1},ty={:.1}) lf={:.0}",
+                                root_frame, plans[id].transform_track, owner_ind, owner_nm, plans[id].layer.nm, plans[id].layer.ind,
+                                plans[par].layer.nm, plans[par].layer.ind,
+                                ca.tx, ca.ty, ca.a, ca.d, pa.tx, pa.ty,
+                                ca.tx - pa.tx, ca.ty - pa.ty, lf
+                            );
+                        }
+                    }
+                }
             }
 
             let plans = &self.plans;
@@ -1679,6 +1709,11 @@ impl<'a> Compiler<'a> {
                                             let mut lx0=1e9f32;let mut ly0=1e9f32;let mut lx1=-1e9f32;let mut ly1=-1e9f32;
                                             for c in &mask { for q in &c.pts { lx0=lx0.min(q[0]); ly0=ly0.min(q[1]); lx1=lx1.max(q[0]); ly1=ly1.max(q[1]); } }
                                             let mask_local = if lx0>lx1 {"empty".to_string()} else {format!("[{:.0},{:.0}..{:.0},{:.0}]",lx0,ly0,lx1,ly1)};
+                                            let pts_dump: Vec<String> = mask.iter().map(|c| {
+                                                let head: Vec<String> = c.pts.iter().take(3).map(|p| format!("{:.1},{:.1}", p[0], p[1])).collect();
+                                                format!("n={},head={}", c.pts.len(), if c.pts.is_empty() { "-".to_string() } else { head.join(" ") })
+                                            }).collect();
+                                            eprintln!("    maskPts={}", pts_dump.join(" ; "));
                                             eprintln!(
                                                 "  f={:.0} owner={}#{} {}#{} src={}#{} srcOwner={} lf={:.0} vis={} op={:.2} subj={} mask={} subjB={} maskB={} maskLocal={}",
                                                 root_frame, owner_nm, owner_ind, plan.layer.nm, plan.layer.ind, src_nm, src_ind, src_owner, lf, vis, op, subj, mask.len(), subj_bbox, mask_bbox, mask_local

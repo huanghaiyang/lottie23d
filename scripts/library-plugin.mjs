@@ -59,8 +59,32 @@ function readBody(req) {
   });
 }
 
+/** 读取请求体为原始 Buffer（用于 `.lottie` 二进制归档）。 */
+function readBodyBuffer(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new LibraryError('文件超过 64 MB 上限', 413));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/** 归档文件扩展名判定。 */
+function isArchiveName(name) {
+  return /\.(lottie|zip)$/i.test(name);
+}
+
 /**
- * 校验并规范化上传文件名：只接受 data/ 下的单个 .json 文件名，
+ * 校验并规范化上传文件名：只接受 data/ 下的单个 `.json` / `.lottie` 文件名，
  * 避免通过 `../` 或绝对路径写到资源库之外。
  */
 function sanitizeName(raw) {
@@ -71,8 +95,8 @@ function sanitizeName(raw) {
   if (name.includes('/') || name.includes('\\')) {
     throw new LibraryError('文件名不能包含路径');
   }
-  if (!/\.json$/i.test(name) || name.length <= 5) {
-    throw new LibraryError('只支持 .json 文件');
+  if (!/\.(json|lottie|zip)$/i.test(name) || name.length <= 5) {
+    throw new LibraryError('只支持 .json / .lottie 文件');
   }
   if (name.length > 200 || /[\u0000-\u001f<>:"|?*]/.test(name)) {
     throw new LibraryError('文件名包含非法字符');
@@ -109,7 +133,7 @@ async function listFiles() {
   const entries = await readdir(dataDir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.json')) {
+    if (!entry.isFile() || !/\.(json|lottie|zip)$/i.test(entry.name)) {
       continue;
     }
     const info = await stat(join(dataDir, entry.name));
@@ -131,12 +155,18 @@ export function createLibraryMiddleware() {
       }
       if (url.pathname === '/' && req.method === 'POST') {
         const name = sanitizeName(url.searchParams.get('name'));
-        const text = await readBody(req);
-        validateLottie(text);
         await mkdir(dataDir, { recursive: true });
         const target = join(dataDir, name);
         const replaced = existsSync(target);
-        await writeFile(target, text, 'utf8');
+        if (isArchiveName(name)) {
+          // `.lottie` 是 ZIP 二进制，按原始字节落盘，不做 JSON 校验。
+          const buffer = await readBodyBuffer(req);
+          await writeFile(target, buffer);
+        } else {
+          const text = await readBody(req);
+          validateLottie(text);
+          await writeFile(target, text, 'utf8');
+        }
         const info = await stat(target);
         sendJson(res, 200, {
           ok: true,
@@ -222,9 +252,14 @@ export function createLibraryMiddleware() {
           throw new LibraryError('文件不存在', 404);
         }
         res.statusCode = 200;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', 'no-store');
-        res.end(await readFile(target, 'utf8'));
+        if (isArchiveName(name)) {
+          res.setHeader('Content-Type', 'application/octet-stream');
+          res.end(await readFile(target));
+        } else {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(await readFile(target, 'utf8'));
+        }
         return;
       }
       next();

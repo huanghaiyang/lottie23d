@@ -13,9 +13,11 @@ import {
   readLibraryFile,
   renameLibraryFiles,
   saveLibraryFile,
+  saveLibraryFileBinary,
   type LibraryFile,
 } from './library';
 import type { LottieData } from './lottie/types';
+import { isLottieArchive, parseLottieArchive } from './lottie/lottieZip';
 import { SAMPLES } from './samples';
 import { AXIS_LABELS, Stage, type RendererBackend, type StageNode, type ViewAxis } from './scene/stage';
 import { PixiStage } from './scene/pixiStage';
@@ -35,7 +37,7 @@ const SOURCES = [
   { id: 'demo:starfish', label: '海星' },
   { id: 'demo:lights', label: '彩灯' },
   { id: 'demo:dalek', label: 'Dalek' },
-  { id: 'pick', label: '导入 JSON', accent: true },
+  { id: 'pick', label: '导入 JSON / .lottie', accent: true },
 ];
 
 // ---- 挂载点 ----
@@ -160,6 +162,16 @@ let dragDepth = 0;
 /** 重转换防抖定时器与上次转换的参数键。 */
 let reconvertTimer = 0;
 let convertKey = '';
+/** 当前文档由 `.lottie` 归档解出的 blob URL，切换文档时释放。 */
+let activeObjectUrls: string[] = [];
+
+/** 释放上一份文档的归档 blob URL。 */
+function releaseObjectUrls(): void {
+  for (const url of activeObjectUrls) {
+    URL.revokeObjectURL(url);
+  }
+  activeObjectUrls = [];
+}
 
 /** 把字节数格式化成 KB / MB，用于顶栏统计。 */
 function formatBytes(bytes: number): string {
@@ -653,6 +665,7 @@ async function loadDocument(data: LottieData, id: string): Promise<void> {
 
   model = converted;
   animation = createAnimation(data);
+  (window as unknown as { __anim: unknown }).__anim = animation;
   stage?.setModel(converted);
   syncNodes();
 
@@ -708,11 +721,19 @@ async function refreshLibrary(): Promise<void> {
  * 批量导入本地文件：逐个解析，成功的自动写入 data/ 资源库，最后载入第一个。
  * 拖入多个 JSON 即可一次完成“入库 + 预览”，便于大批量测试。
  */
+interface AcceptedFile {
+  name: string;
+  data: LottieData;
+  text?: string;
+  raw?: File;
+  objectUrls: string[];
+}
+
 async function loadFiles(input: File[]): Promise<void> {
   if (input.length === 0) {
     return;
   }
-  const accepted: Array<{ name: string; data: LottieData }> = [];
+  const accepted: AcceptedFile[] = [];
   let rejected = 0;
   let saved = 0;
   let saveFailed = 0;
@@ -722,21 +743,34 @@ async function loadFiles(input: File[]): Promise<void> {
       if (input.length > 1) {
         showToast(`正在处理 ${index + 1}/${input.length}：${file.name}`);
       }
-      let text: string;
+      let text: string | undefined;
       let data: LottieData;
+      let raw: File | undefined;
+      let objectUrls: string[] = [];
       try {
-        text = await file.text();
-        data = JSON.parse(text) as LottieData;
+        if (isLottieArchive(file.name)) {
+          const parsed = await parseLottieArchive(file);
+          data = parsed.data;
+          objectUrls = parsed.objectUrls;
+          raw = file;
+        } else {
+          text = await file.text();
+          data = JSON.parse(text) as LottieData;
+        }
       } catch {
         rejected += 1;
         continue;
       }
-      accepted.push({ name: file.name, data });
+      accepted.push({ name: file.name, data, text, raw, objectUrls });
       if (!libraryAvailable.value) {
         continue;
       }
       try {
-        await saveLibraryFile(file.name, text);
+        if (raw) {
+          await saveLibraryFileBinary(file.name, raw);
+        } else if (text != null) {
+          await saveLibraryFile(file.name, text);
+        }
         saved += 1;
       } catch {
         // 入库失败不影响本地预览，结束后在提示里说明。
@@ -751,10 +785,12 @@ async function loadFiles(input: File[]): Promise<void> {
   }
 
   if (accepted.length === 0) {
-    showToast(rejected > 0 ? `导入失败：${rejected} 个文件不是合法 JSON` : '没有可用的文件');
+    showToast(rejected > 0 ? `导入失败：${rejected} 个文件不是合法 Lottie（JSON 或 .lottie 归档）` : '没有可用的文件');
     return;
   }
 
+  releaseObjectUrls();
+  activeObjectUrls = accepted[0].objectUrls;
   await loadDocument(accepted[0].data, `lib:${accepted[0].name}`);
 
   const parts: string[] = [];
@@ -1115,6 +1151,7 @@ onBeforeUnmount(() => {
   }
   window.clearTimeout(toastTimer);
   window.clearTimeout(reconvertTimer);
+  releaseObjectUrls();
   disposeAnimation();
   stage?.dispose();
   stage = null;
@@ -1236,7 +1273,7 @@ onBeforeUnmount(() => {
   <div class="drop-overlay" :class="{ 'is-visible': dropVisible }">
     <div class="drop-card">
       <strong>释放以转换 Lottie</strong>
-      <span>支持 Bodymovin 导出的 .json · 可多选，自动存入 data/</span>
+      <span>支持 Bodymovin 导出的 .json 与 .lottie 归档 · 可多选，自动存入 data/</span>
     </div>
   </div>
 
@@ -1261,7 +1298,7 @@ onBeforeUnmount(() => {
   <input
     ref="fileInput"
     type="file"
-    accept=".json,application/json"
+    accept=".json,.lottie,.zip,application/json,application/zip"
     multiple
     hidden
     @change="onFileChange"
