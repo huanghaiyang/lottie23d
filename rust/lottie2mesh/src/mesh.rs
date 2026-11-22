@@ -137,10 +137,21 @@ pub fn build_surface(
 pub fn natural_k(contour: &Contour, spacing: f32) -> usize {
     let length = contour.length();
     if length < 1e-4 {
-        MIN_K
-    } else {
-        ((length / spacing).ceil() as usize).clamp(MIN_K, MAX_K)
+        return MIN_K;
     }
+    let by_length = ((length / spacing).ceil() as usize).clamp(MIN_K, MAX_K);
+    let point_count = contour.pts.len();
+    let avg_segment = length / point_count.max(1) as f32;
+    // 稀疏轮廓 = 长直边多边形（平均段长远大于采样间距）：直边没有曲线需要平滑，
+    // 按周长采样会把长直边切成上千共线顶点，三角化与挤出侧墙随之膨胀（钻石切面类
+    // 动画）。这类轮廓采样点数限为展平点数的 4 倍；曲线轮廓展平后段长接近间距，
+    // 平均段长不超阈值，这里不封顶，保留曲线原有密度。
+    let capped = if avg_segment > spacing * 2.0 {
+        by_length.min(point_count.max(MIN_K) * 4)
+    } else {
+        by_length
+    };
+    capped.clamp(MIN_K, MAX_K)
 }
 
 /// 为每个槽位生成采样计划（此时孔洞标记未知，统一置 `false`）。
