@@ -6,6 +6,16 @@ import type { Model, MeshModel, GradientModel } from '../../sdk/index.mjs';
 /** 渲染后端：默认 WebGL；可选 three/webgpu 的 WebGPURenderer（特性退化，见下）。 */
 export type RendererBackend = 'webgl' | 'webgpu';
 
+/** 相机视角快照：切换引擎 / 后端重建舞台时保留当前位置、观察目标与缩放。 */
+export interface ViewState {
+  /** 相机世界坐标。 */
+  position: [number, number, number];
+  /** 环绕观察目标（世界坐标）。 */
+  target: [number, number, number];
+  /** 正交相机缩放倍率。 */
+  zoom: number;
+}
+
 /**
  * 两种渲染器共用的最小接口。WebGLRenderer 与 WebGPURenderer 都实现这套
  * 方法签名；Stage 只依赖该结构，不引用具体后端类型。
@@ -1305,6 +1315,26 @@ export class Stage {
     this.controls.target.set(0, 0, 0);
     this.controls.update();
     this.updateGizmoSelection();
+    this.dirty = true;
+  }
+
+  /** 快照当前相机位置、观察目标与缩放，供重建舞台后还原。 */
+  getViewState(): ViewState {
+    return {
+      position: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+      target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
+      zoom: this.camera.zoom,
+    };
+  }
+
+  /** 还原相机位置、观察目标与缩放；清掉未完成的视角补间，避免下一帧把位姿覆盖回默认。 */
+  applyViewState(state: ViewState): void {
+    this.viewTween = null;
+    this.camera.position.set(state.position[0], state.position[1], state.position[2]);
+    this.controls.target.set(state.target[0], state.target[1], state.target[2]);
+    this.camera.zoom = state.zoom;
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
     this.dirty = true;
   }
 

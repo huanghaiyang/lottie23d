@@ -27,7 +27,7 @@ import {
   View3D,
 } from '@pixi/3d';
 import { OrbitCamera } from '@pixi/3d/extras';
-import type { RendererBackend, StageCallbacks } from './stage';
+import type { RendererBackend, StageCallbacks, ViewState } from './stage';
 import type { Model } from '../../sdk/index.mjs';
 
 /** 与 three 端一致的正交取景半高（世界单位）。 */
@@ -309,6 +309,28 @@ export class PixiStage {
 
   resetView(): void {
     this.orbit?.reset();
+  }
+
+  /** 快照当前相机位置、观察目标与缩放，供重建舞台后还原。 */
+  getViewState(): ViewState {
+    const cam = this.orbit?.camera;
+    const target = this.orbit?.target;
+    return {
+      position: cam ? [cam.position.x, cam.position.y, cam.position.z] : [0, 0, HOME_Z],
+      target: target ? [target.x, target.y, target.z] : [0, 0, 0],
+      zoom: cam?.zoom ?? 1,
+    };
+  }
+
+  /** 还原相机位置、观察目标与缩放。 */
+  applyViewState(state: ViewState): void {
+    if (this.orbit == null) {
+      return;
+    }
+    this.orbit.target.set(state.target[0], state.target[1], state.target[2]);
+    this.orbit.camera.position.set(state.position[0], state.position[1], state.position[2]);
+    this.orbit.camera.zoom = state.zoom;
+    this.orbit.update();
   }
 
   /** 分辨率自适应：Pixi 后端由 Application 自身 DPR 管理（退化）。 */

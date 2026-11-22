@@ -1077,6 +1077,8 @@ watch(pickMode, (enabled) => {
  */
 async function createStage(): Promise<void> {
   const previousOrder = nodes.value.map((node) => node.id);
+  // 重建舞台前先快照当前视角（位置 / 观察目标 / 缩放），避免切引擎或后端时复位到 home。
+  const viewState = stage != null ? stage.getViewState() : null;
   if (stage) {
     stage.dispose();
     stage = null;
@@ -1104,6 +1106,10 @@ async function createStage(): Promise<void> {
     restoreNodeOrder(previousOrder);
   }
   syncScene();
+  // 模型与节点回灌完成后还原重建前的视角；新舞台默认相机在 home，这里覆盖回去。
+  if (viewState != null) {
+    stage.applyViewState(viewState);
+  }
 }
 
 /** 渲染引擎下拉切换：重建舞台并沿用当前模型与播放进度。 */
