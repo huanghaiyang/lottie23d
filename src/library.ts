@@ -6,7 +6,7 @@
  */
 
 import type { LottieData } from './lottie/types';
-import { isLottieArchive, parseLottieArchive } from './lottie/lottieZip';
+import { isLottieArchive, parseLottieArchive, type ParsedLottie } from './lottie/lottieZip';
 
 /** 资源库中的一个文件；时间戳来自文件系统，单位毫秒。 */
 export interface LibraryFile {
@@ -60,8 +60,11 @@ export async function saveLibraryFileBinary(name: string, blob: Blob): Promise<v
   });
 }
 
-/** 读取资源库中的单个文件并解析为 Lottie 数据；`.lottie` 归档先在浏览器侧解压。 */
-export async function readLibraryFile(name: string): Promise<LottieData> {
+/**
+ * 读取资源库中的单个文件并解析为 Lottie 数据；`.lottie` 归档先在浏览器侧解压。
+ * 返回归档解出的 blob URL，供调用方在切换文档 / 销毁预览时释放。
+ */
+export async function readLibraryParsed(name: string): Promise<ParsedLottie> {
   const response = await fetch(endpoint(`/file?name=${encodeURIComponent(name)}`), {
     cache: 'no-store',
   });
@@ -69,10 +72,9 @@ export async function readLibraryFile(name: string): Promise<LottieData> {
     throw new Error(`无法读取 ${name}（HTTP ${response.status}）`);
   }
   if (isLottieArchive(name)) {
-    const parsed = await parseLottieArchive(await response.blob());
-    return parsed.data;
+    return parseLottieArchive(await response.blob());
   }
-  return (await response.json()) as LottieData;
+  return { data: (await response.json()) as LottieData, objectUrls: [] };
 }
 
 /** 从资源库删除文件。 */

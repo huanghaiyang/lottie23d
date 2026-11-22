@@ -10,7 +10,7 @@ import LibraryPanel from './components/LibraryPanel.vue';
 import {
   deleteLibraryFile,
   listLibrary,
-  readLibraryFile,
+  readLibraryParsed,
   renameLibraryFiles,
   saveLibraryFile,
   saveLibraryFileBinary,
@@ -814,8 +814,10 @@ async function loadLibraryEntry(name: string): Promise<void> {
     return;
   }
   try {
-    const data = await readLibraryFile(name);
-    await loadDocument(data, `lib:${name}`);
+    const parsed = await readLibraryParsed(name);
+    releaseObjectUrls();
+    activeObjectUrls = parsed.objectUrls;
+    await loadDocument(parsed.data, `lib:${name}`);
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error));
   }
@@ -873,16 +875,22 @@ async function checkLibrary(): Promise<void> {
   const options = convertOptions();
   let failed = 0;
   for (const file of libraryFiles.value) {
+    let parsed: { data: LottieData; objectUrls: string[] } | undefined;
     try {
-      const data = await readLibraryFile(file.name);
+      parsed = await readLibraryParsed(file.name);
       const started = performance.now();
-      const converted = converter.convert(data, options);
+      const converted = converter.convert(parsed.data, options);
       const elapsed = performance.now() - started;
       libraryStatus[file.name] =
         `${converted.meshCount} 网格 · ${(converted.totalIndices / 3).toLocaleString()} 三角形 · ${elapsed.toFixed(1)} ms`;
     } catch (error) {
       failed += 1;
       libraryStatus[file.name] = `失败：${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      // 批量校验只做离线转换，不建立贴图；归档解出的 blob URL 用完即释放。
+      for (const url of parsed?.objectUrls ?? []) {
+        URL.revokeObjectURL(url);
+      }
     }
     await new Promise((resolve) => window.setTimeout(resolve, 0));
   }

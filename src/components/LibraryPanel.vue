@@ -4,7 +4,7 @@
 // 这样切换选中项时不必让 App 参与，也不会影响正在播放的 3D 场景。
 import lottie, { type AnimationItem } from 'lottie-web';
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
-import { readLibraryFile, type LibraryFile } from '../library';
+import { readLibraryParsed, type LibraryFile } from '../library';
 
 const props = defineProps<{
   files: LibraryFile[];
@@ -180,12 +180,18 @@ const previewState = ref<'idle' | 'loading' | 'ready' | 'error'>('idle');
 const previewError = ref('');
 const previewMeta = ref('');
 let previewAnimation: AnimationItem | null = null;
+/** 当前预览文档由归档解出的 blob URL，销毁预览时释放。 */
+let previewObjectUrls: string[] = [];
 
 /** 释放预览实例；面板关闭、切换文件、文件被改名/删除时都要调用。 */
 function disposePreview(): void {
   previewAnimation?.destroy();
   previewAnimation = null;
   previewHost.value?.replaceChildren();
+  for (const url of previewObjectUrls) {
+    URL.revokeObjectURL(url);
+  }
+  previewObjectUrls = [];
 }
 
 /** 清空预览区，回到“未选择”状态。 */
@@ -205,11 +211,14 @@ async function selectPreview(name: string): Promise<void> {
   previewError.value = '';
   previewState.value = 'loading';
   try {
-    const data = await readLibraryFile(name);
+    const parsed = await readLibraryParsed(name);
     // 请求期间用户可能已切到别的文件或关闭面板。
     if (previewName.value !== name || previewHost.value == null) {
+      parsed.objectUrls.forEach((url) => URL.revokeObjectURL(url));
       return;
     }
+    const data = parsed.data;
+    previewObjectUrls = parsed.objectUrls;
     const layers = Array.isArray(data.layers) ? data.layers.length : 0;
     const fps = Math.max(1, Number(data.fr) || 30);
     const frames = Math.max(0, (Number(data.op) || 0) - (Number(data.ip) || 0));
