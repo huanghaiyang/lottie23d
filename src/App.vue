@@ -1211,7 +1211,7 @@ onBeforeUnmount(() => {
             </label>
             <label
               class="backend-select"
-              title="切换渲染后端；WebGPU 下渐变与柔光暂退化（仅 Three.js 引擎）"
+              title="切换渲染后端；WebGPU 为无光照平涂材质、渐变走顶点色兜底，颜色与 WebGL 不一致，柔光暂退化（仅 Three.js 引擎）"
               :class="{ 'is-disabled': engine === 'pixi' }"
             >
               <span>渲染</span>
@@ -1223,6 +1223,12 @@ onBeforeUnmount(() => {
             <span class="pane-meta">{{ rightMeta }}</span>
           </div>
         </div>
+        <p
+          v-if="engine === 'three' && backend === 'webgpu'"
+          class="backend-hint"
+        >
+          颜色差异说明：WebGPU 采用无光照平涂材质、渐变按顶点色兜底，缺少 WebGL 的三点布光明暗与片元级渐变，因此画面更平、偏原色。
+        </p>
         <div
           ref="threeHost"
           class="canvas-wrap canvas-three"
