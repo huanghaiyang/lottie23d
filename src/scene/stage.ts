@@ -23,6 +23,10 @@ interface StageRenderer {
   clear(depth?: boolean, color?: boolean, stencil?: boolean): void;
   clearDepth(): void;
   render(scene: THREE.Scene, camera: THREE.Camera): void;
+  /** 异步渲染：WebGPURenderer 后端就绪前会先 await init；WebGLRenderer 无此方法。 */
+  renderAsync?(scene: THREE.Scene, camera: THREE.Camera): Promise<void>;
+  /** 异步初始化后端；WebGPURenderer 后端在构造后才异步创建，WebGLRenderer 无此方法。 */
+  init?(): Promise<void>;
   dispose(): void;
 }
 
@@ -449,6 +453,8 @@ export class Stage {
   private frameIndex = -1;
   /** 脏标记：仅相机移动或有数据改动时才真正重绘（脏渲染）。 */
   private dirty = true;
+  /** 后端是否已初始化完成。WebGLRenderer 构造即就绪；WebGPURenderer 后端异步创建。 */
+  private backendReady: boolean;
   /** “层深”滑块倍率；实际只给矩阵 Z 平移追加增量。 */
   private depthAmount = 1;
   /** “厚度”滑块倍率；实际等价于矩阵后乘 scale(1, 1, thickness)。 */
@@ -586,6 +592,8 @@ export class Stage {
     this.callbacks = callbacks;
     this.backend = backend;
     this.isWebGPU = backend === 'webgpu';
+    // WebGL 后端在构造时即完成初始化；WebGPU 后端需异步 init，就绪前置 false。
+    this.backendReady = !this.isWebGPU;
     // alpha + 透明清屏色：让页面背景的渐变透出来。
     if (this.isWebGPU) {
       // WebGPU 后端：不支持 WebGL 专属的对数深度缓冲；渐变注入与柔光后处理
@@ -1006,12 +1014,31 @@ export class Stage {
     this.nodes.length = 0;
     this.nodes.push(...next);
 
+    // 默认（未拖拽重排）顺序：节点 id 与 entries 下标一致。此时直接保留烘焙层深，
+    // stackDelta 清零；否则重建舞台（切换后端/引擎）时 restoreNodeOrder 会把这套
+    // 未变动的顺序重新按名次分配层深，近共面交错图层被整体推偏。
+    const isDefaultOrder = ids.every((id, rank) => id === rank);
+    if (isDefaultOrder) {
+      for (const entry of this.entries) {
+        entry.stackDelta = 0;
+      }
+      this.applyFrame(Math.max(0, this.frameIndex));
+      this.dirty = true;
+      return;
+    }
+
     // 原始层深升序：默认列表中越靠上深度越小（越靠后）。
     const depths = this.entries.map((entry) => entry.data.depth).sort((a, b) => a - b);
+    // 平局打破只在“目标层深相同”的同组内按列表位置逐级前移 epsilon；
+    // 不按全局 rank 叠加——否则未发生重排的默认顺序，在重建舞台（切换后端/引擎）
+    // 后被 restoreNodeOrder 重新过一遍 setNodeOrder，整体 Z 被 rank*epsilon 推偏。
+    const tieSeen = new Map<number, number>();
     for (let rank = 0; rank < ids.length; rank += 1) {
       const entry = this.entries[ids[rank]];
-      const target = depths[rank] + rank * STACK_EPSILON;
-      entry.stackDelta = target - entry.data.depth;
+      const targetDepth = depths[rank];
+      const tie = tieSeen.get(targetDepth) ?? 0;
+      tieSeen.set(targetDepth, tie + 1);
+      entry.stackDelta = targetDepth + tie * STACK_EPSILON - entry.data.depth;
     }
 
     // 立即重放当前帧，让新层级即时生效。
@@ -1287,6 +1314,14 @@ export class Stage {
    * 暂停且视角静止时不产生任何 GPU 开销。
    */
   render(): void {
+    // WebGPU 后端尚在异步初始化：先触发 init，本帧跳过；就绪回调置脏后下一帧重绘。
+    // 就绪前同步调 render/clear 会被 three 丢弃（仅告警），后台 init 完成后若没有
+    // 脏标记触发重绘，画布会一直留空。
+    if (this.isWebGPU && !this.backendReady) {
+      void this.initBackend();
+      return;
+    }
+
     const now = performance.now();
     // 轴向切换补间：三次缓出，320ms 内插值到目标位置。
     if (this.viewTween) {
@@ -1314,7 +1349,7 @@ export class Stage {
     this.renderer.setViewport(0, 0, width, height);
     this.renderer.setScissorTest(false);
     this.renderer.clear();
-    this.renderer.render(this.scene, this.camera);
+    this.draw(this.scene, this.camera);
     this.renderGlow(width, height);
     this.renderGizmo(width, height);
     this.dirty = false;
@@ -1323,6 +1358,36 @@ export class Stage {
   /** 当前渲染后端标识（供 UI 展示）。 */
   getBackend(): RendererBackend {
     return this.backend;
+  }
+
+  /**
+   * 等待后端完成初始化。WebGPURenderer 的后端（含内部 WebGL2 回退）在构造后才
+   * 异步创建；就绪前调用 render/clear 会被 three 丢弃并告警。WebGLRenderer 构造时
+   * 即就绪，直接返回。就绪后置脏，确保下一帧把已写入的场景真正画出来。
+   */
+  async initBackend(): Promise<void> {
+    if (this.backendReady) {
+      return;
+    }
+    const init = this.renderer.init;
+    if (typeof init === 'function') {
+      try {
+        await init.call(this.renderer);
+      } catch {
+        // 回退后端已在 three 内部处理；即便初始化失败也继续，避免舞台卡死。
+      }
+    }
+    this.backendReady = true;
+    this.dirty = true;
+  }
+
+  /** 绘制一趟场景：WebGPU 走异步渲染（就绪前内部先 init），WebGL 走同步渲染。 */
+  private draw(scene: THREE.Scene, camera: THREE.Camera): void {
+    if (this.isWebGPU && typeof this.renderer.renderAsync === 'function') {
+      void this.renderer.renderAsync(scene, camera);
+    } else {
+      this.renderer.render(scene, camera);
+    }
   }
 
   /** 释放所有 GPU / DOM 资源；调用后 Stage 不可再用。 */
@@ -1337,7 +1402,11 @@ export class Stage {
     this.hoverBox.geometry.dispose();
     (this.hoverBox.material as THREE.Material).dispose();
     this.controls.dispose();
-    this.renderer.dispose();
+    // 未初始化的 WebGPU 后端内部对象仍为 null，此时调 dispose 会读空报错；
+    // 仅在后端就绪后释放 GPU 资源。
+    if (this.backendReady) {
+      this.renderer.dispose();
+    }
     this.renderer.domElement.remove();
   }
 
@@ -1994,7 +2063,7 @@ export class Stage {
     this.renderer.setScissor(margin, height - size - margin, size, size);
     this.renderer.setScissorTest(true);
     this.renderer.clearDepth();
-    this.renderer.render(this.gizmoScene, this.gizmoCamera);
+    this.draw(this.gizmoScene, this.gizmoCamera);
     this.renderer.setScissorTest(false);
     this.renderer.setViewport(0, 0, width, height);
   }

@@ -1087,6 +1087,8 @@ async function createStage(): Promise<void> {
     stage = await PixiStage.create(host, { onAxisPick });
   } else {
     stage = new Stage(host, { onAxisPick }, backend.value);
+    // WebGPURenderer 后端为异步初始化：必须 await 就绪后再回灌模型与首帧渲染。
+    await stage.initBackend();
   }
   (window as unknown as { __stage: unknown }).__stage = stage;
   stage.setDepthScale(depth.value);
