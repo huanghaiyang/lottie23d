@@ -32,6 +32,57 @@ export interface ParsedLottie {
 /** 动画 JSON 的候选文件名，按优先级匹配。 */
 const JSON_CANDIDATES = ['animation.json', 'lottie.json', 'data.json'];
 
+/** dotLottie v1 清单结构（只需动画 id 用于定位包内 JSON）。 */
+interface DotLottieManifest {
+  animations?: Array<{ id?: string }>;
+}
+
+/** 判断条目是否为清单文件本身（不能当作 Lottie 动画解析）。 */
+function isManifestEntry(name: string): boolean {
+  return normalizeZipPath(name) === 'manifest.json';
+}
+
+/**
+ * 在解压结果里定位 Lottie 动画 JSON：
+ * 1. dotLottie v1：读 `manifest.json`，按 `animations[0].id` 找 `animations/<id>.json`，
+ *    缺失时退回 `animations/` 目录下的第一个 JSON；
+ * 2. 标准归档：根目录 `animation.json / lottie.json / data.json`；
+ * 3. 兜底：包内任意 `.json`（排除 manifest）。
+ */
+function resolveAnimationJson(files: Record<string, Uint8Array>): string | undefined {
+  const manifestEntry = files['manifest.json'];
+  if (manifestEntry != null) {
+    try {
+      const manifest = JSON.parse(strFromU8(manifestEntry)) as DotLottieManifest;
+      const firstId = manifest.animations?.[0]?.id;
+      if (firstId != null) {
+        const byId = `animations/${firstId}.json`;
+        if (files[byId] != null) {
+          return byId;
+        }
+      }
+      const inAnimations = Object.keys(files).find(
+        (name) =>
+          normalizeZipPath(name).startsWith('animations/') &&
+          name.toLowerCase().endsWith('.json'),
+      );
+      if (inAnimations != null) {
+        return inAnimations;
+      }
+    } catch {
+      // 清单损坏时继续走通用候选，不阻断解析。
+    }
+  }
+
+  const standard = JSON_CANDIDATES.find((candidate) => files[candidate] != null);
+  if (standard != null) {
+    return standard;
+  }
+  return Object.keys(files).find(
+    (name) => name.toLowerCase().endsWith('.json') && !isManifestEntry(name),
+  );
+}
+
 /** 归一化 ZIP 内路径：反斜杠转正斜杠，去掉 `./` 与前导 `/`。 */
 function normalizeZipPath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
@@ -90,9 +141,7 @@ export async function parseLottieArchive(file: Blob): Promise<ParsedLottie> {
     );
   }
 
-  const jsonName =
-    JSON_CANDIDATES.find((candidate) => files[candidate] != null) ??
-    Object.keys(files).find((name) => name.toLowerCase().endsWith('.json'));
+  const jsonName = resolveAnimationJson(files);
   if (!jsonName) {
     throw new Error('归档内未找到 animation.json');
   }
